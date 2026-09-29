@@ -854,6 +854,21 @@ Notes:
 - `args_digest` stores a hash of sensitive arguments so the audit trail is useful without persisting secrets.
 - Messages are append-only; the `seq` counter is allocated inside the transaction that writes the message.
 
+**Migrations.** A forward-only list in `minion-store::migrate`, each entry applied once and recorded
+in `schema_migrations`. A database newer than this build understands is refused rather than read
+optimistically, and `PRAGMA quick_check` runs before any migration so a corrupt file fails loudly
+instead of half-initialising. Tables that later milestones own are created up front, with the FTS
+triggers that keep `memory_fts` in step — without those, `recall` would silently match nothing in M3.
+
+**Write semantics.** A turn is persisted as one transaction: the user message, every assistant and
+tool message, and the session's `updated_at` either all land or none do, so a transcript can never
+contain half a turn. A hard crash mid-turn loses that turn; nothing before it.
+
+**History windowing.** Reloading a long transcript trims to `agent.history_window`, but index 0 (the
+system prompt) is configuration rather than history and is always retained. The cut is advanced to a
+`user` message, and never left sitting on a `tool` result: an assistant `tool_calls` message whose
+results were dropped is rejected by the provider, so a turn must never be split.
+
 ### 5.9 MCP server
 
 The server task is started with `minion mcp serve` (stdio). It uses `rmcp`'s server trait and shares the same core loop, store, and policy engine.
@@ -916,15 +931,25 @@ Interaction details:
 | `!<cmd>` | Run locally in the shell, output to the terminal only (never enters model context) |
 | `/help`, `/?` | Slash command help |
 | `/model [name]` | Show or switch the model for the session |
-| `/new`, `/resume <id>`, `/sessions`, `/rename <title>` | Session management |
-| `/cron`, `/jobs` | Job table with next-run times |
+| `/new` | Start a fresh conversation, keeping the same session object |
+| `/sessions` | List stored conversations, newest first |
+| `/resume <id>` | Continue a stored conversation; accepts a full id, a unique prefix, or a position from `/sessions` |
+| `/rename <title>` | Set this conversation's title |
+| `/clear` | Forget the messages, keep the system prompt and the session id so the transcript stays resumable |
 | `/tools` | Enabled tools with risk classes and approval status |
-| `/allow <tool> <pattern>` / `/deny …` / `/approvals` | Inspect and edit policy |
-| `/compact` | Force history summarization |
+| `/session` | Show the conversation id sent to the provider in `${session}` headers |
+| `/where` | Show the database path |
 | `/cost` | Token and estimated cost for the session |
+| `/cron`, `/jobs` | Job table with next-run times (M4) |
+| `/allow <tool> <pattern>` / `/deny …` / `/approvals` | Inspect and edit policy (M2) |
+| `/compact` | Force history summarization |
 | `/quit`, Ctrl-D | Exit |
 | Ctrl-C | Cancel current turn; twice in a row exits |
 | Ctrl-L | Clear screen (local only; scrollback intact) |
+
+Resuming keeps the stored conversation's id, so the `${session}` header stays identical across the
+restart — that is the point of the header, and a fresh id would look like a new conversation to the
+gateway.
 
 Rendering rules:
 - Assistant text streams to stdout with no box drawing; tool activity goes to **stderr** as single dimmed lines, so `minion run ... > out.txt` yields clean output.
@@ -1035,17 +1060,17 @@ For each capability, an operator should be able to answer "who can trigger this?
 
 ## 10. Milestones
 
-| Milestone | Scope | Exit criteria |
-|---|---|---|
-| M0 — Skeleton | Workspace, config loading, provider client, `run` one-shot | A prompt returns streamed text from a compatible endpoint |
-| M0.5 — Provider init | `minion init` wizard, presets, `/models` discovery, `--check`, `--project`/`--force`, `--header`, session-id headers | A fresh machine reaches a working config in one command, an existing config is never clobbered, and a gateway requiring `${session}` headers works unmodified |
-| M1 — Session core | Store, migrations, sessions/messages, REPL with streaming | `/resume` restores a conversation |
-| M2 — Tools + policy | Registry, `read_file`/`write_file`/`edit_file`, `run_command`, approval engine, allowlist | A risky command cannot run without consent |
-| M3 — Memory + HTTP | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
-| M4 — Cron | Scheduler, job CRUD, run history, catch-up | A weekly job fires on a virtual clock test |
-| M5 — MCP client | External servers, namespaced tools, per-server policy | External tool callable with approval |
-| M6 — MCP server | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
-| M7 — Hardening | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
+| Milestone | Status | Scope | Exit criteria |
+|---|---|---|---|
+| M0 — Skeleton | done | Workspace, config loading, provider client, `run` one-shot | A prompt returns streamed text from a compatible endpoint |
+| M0.5 — Provider init | done | `minion init` wizard, presets, `/models` discovery, `--check`, `--project`/`--force`, `--header`, session-id headers | A fresh machine reaches a working config in one command, an existing config is never clobbered, and a gateway requiring `${session}` headers works unmodified |
+| M1 — Session core | done | Store, migrations, sessions/messages, REPL with streaming | `/resume` restores a conversation |
+| M2 — Tools + policy | next | Registry, `read_file`/`write_file`/`edit_file`, `run_command`, approval engine, allowlist | A risky command cannot run without consent |
+| M3 — Memory + HTTP | | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
+| M4 — Cron | | Scheduler, job CRUD, run history, catch-up | A weekly job fires on a virtual clock test |
+| M5 — MCP client | | External servers, namespaced tools, per-server policy | External tool callable with approval |
+| M6 — MCP server | | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
+| M7 — Hardening | | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
 
 ---
 

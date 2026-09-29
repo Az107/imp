@@ -1187,6 +1187,7 @@ dependencies = [
  "minion-core",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

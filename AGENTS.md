@@ -2,12 +2,14 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0 and M0.5 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0, M0.5 and M1 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
-agent loop, `read_file`, one-shot `run`, the REPL, and `minion init`. Branch is `main`.
+agent loop, `read_file`, one-shot `run`, the REPL, `minion init`, and a SQLite store with resumable
+sessions. Branch is `main`.
 
-`minion-store`, `minion-cron`, and `minion-mcp` are **empty stubs** for M4–M6. Their manifests
-list real dependencies (`rusqlite`, `rmcp`, `cron`), but there is no code behind them yet.
+`minion-cron` and `minion-mcp` are **empty stubs** for M4–M6. Their manifests list real dependencies
+(`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs`,
+`memory` and `audit_log` tables exist in the schema but nothing writes to them until M3/M4.
 
 ## Commands
 
@@ -98,9 +100,25 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   env-dependent behaviour, extract a pure function taking the value as a parameter, or set the
   variable on the *process* from the shell in a manual test.
 
+## Store rules
+
+- **Migrations are a forward-only list.** Append a new `&str` to `MIGRATIONS`; never edit an applied
+  one. The loop must run *that entry's* SQL, not the baseline.
+- **A `query_map` closure may only return `rusqlite::Result`.** Decode columns into a small local
+  struct and convert after `collect()`, or the `?` on a domain error fails to compile.
+- **All store I/O goes through `Store::blocking`** (a `spawn_blocking` hop). Calling rusqlite
+  inline would stall the async runtime for the duration of the query.
+- **A turn is persisted as one transaction.** Never append messages one at a time across statements:
+  a tool result without its assistant call is an invalid transcript.
+- **Trimming must never split a turn.** `apply_history_window` keeps index 0 and advances the cut
+  off a `tool` role. The invariant to test is "every `tool_calls` entry is answered", not "there
+  are no tool messages" — a paired result is legitimate.
+- `memory_fts` is an external-content FTS table; its triggers are what make `recall` work in M3.
+  Don't drop them.
+
 ## Known gaps (don't mistake these for bugs)
 
-- The CLI has `run` and `init` plus the default REPL. There is still no `doctor`, `session`, `cron`,
+- The CLI has `run`, `init`, `session`, and the default REPL. There is still no `doctor`, `cron`,
   `mcp`, or `config` subcommand, so §5.12's CLI surface is only partly built.
 - Tool calls execute **sequentially**; bounded concurrency is tracked as `FR-8` in `agent.rs`.
 - `usage` is advisory and may be zero; no turn is blocked on it.

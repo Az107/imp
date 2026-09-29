@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    /// Session database to use instead of the default state directory.
+    #[arg(long, global = true)]
+    pub db: Option<PathBuf>,
+
     /// Directory to treat as the workspace root.
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
@@ -56,6 +60,43 @@ pub enum Command {
 
     /// Configure the model backend and write a config file (§5.1.1).
     Init(InitArgs),
+
+    /// Inspect and manage stored conversations.
+    Session(SessionArgs),
+}
+
+/// Arguments for `minion session`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct SessionArgs {
+    /// The action to perform.
+    #[command(subcommand)]
+    pub action: SessionAction,
+}
+
+/// Session actions.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum SessionAction {
+    /// List stored conversations, newest first.
+    List {
+        /// How many to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Print a conversation's transcript.
+    Show {
+        /// Session id, or a numeric position from `list`.
+        id: String,
+    },
+    /// Delete a conversation and its messages.
+    Rm {
+        /// Session id.
+        id: String,
+    },
+    /// Continue a conversation in the REPL.
+    Resume {
+        /// Session id.
+        id: String,
+    },
 }
 
 /// Arguments for `minion init`.

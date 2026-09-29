@@ -67,6 +67,10 @@ pub enum Error {
     #[error("operation cancelled")]
     Cancelled,
 
+    /// The SQLite store could not be read or written.
+    #[error("store error: {0}")]
+    Store(String),
+
     /// Filesystem error.
     #[error(transparent)]
     Io(#[from] std::io::Error),

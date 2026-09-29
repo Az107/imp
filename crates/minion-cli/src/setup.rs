@@ -1,4 +1,4 @@
-//! Session assembly: provider, tools, options, and the system prompt.
+//! Session assembly: store, provider, tools, transcript, and the system prompt.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use minion_core::agent::AgentOptions;
 use minion_core::config::Config;
-use minion_core::message::Message;
+use minion_core::error::{Error, Result};
+use minion_core::message::{Message, Role};
 use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
-use minion_core::{Agent, Result};
+use minion_core::{Agent, new_session_id};
 use minion_provider::OpenAiProvider;
+use minion_store::{NewSession, SessionRow, Store};
 use minion_tools::default_registry;
 
 use crate::cli::Cli;
@@ -28,8 +30,36 @@ pub struct Session {
     pub history: Vec<Message>,
     /// Canonical workspace root.
     pub workspace_root: PathBuf,
-    /// Stable identifier for this conversation, sent to gateways that need it.
+    /// Identifier of the current conversation. Doubles as the `${session}`
+    /// value sent to gateways, so resuming keeps the same id.
     pub session_id: String,
+    /// Transcript store.
+    pub store: Arc<Store>,
+    /// How many trailing messages to keep when a transcript is reloaded.
+    pub history_window: usize,
+    /// Retained so the provider can be rebuilt when the conversation changes.
+    spec: ProviderSpec,
+}
+
+/// The parameters a provider was built from, kept to rebuild it later.
+struct ProviderSpec {
+    base_url: String,
+    api_key: Option<String>,
+    max_retries: u32,
+    request_timeout: Duration,
+    usage_in_stream: bool,
+    headers: Vec<(String, String)>,
+}
+
+impl ProviderSpec {
+    fn build(&self, session_id: &str) -> OpenAiProvider {
+        OpenAiProvider::new(&self.base_url, self.api_key.clone().unwrap_or_default())
+            .with_max_retries(self.max_retries)
+            .with_request_timeout(Some(self.request_timeout))
+            .with_usage_in_stream(self.usage_in_stream)
+            .with_headers(self.headers.clone())
+            .with_session_id(session_id.to_string())
+    }
 }
 
 impl Session {
@@ -41,37 +71,126 @@ impl Session {
             self.options.clone(),
         )
     }
+
+    /// Point this session at a different conversation.
+    ///
+    /// The provider is rebuilt so the `${session}` header matches the new
+    /// conversation; reusing the old one would make two conversations look
+    /// identical to the gateway and defeat prompt-cache routing.
+    pub fn adopt(&mut self, session_id: &str) {
+        self.provider = Arc::new(self.spec.build(session_id));
+        self.session_id = session_id.to_string();
+    }
+
+    /// Start a fresh conversation in the same session object.
+    pub async fn reset(&mut self) -> Result<()> {
+        let system = self.history.first().cloned();
+        self.adopt(&new_session_id());
+        self.store
+            .create_session(NewSession {
+                id: self.session_id.clone(),
+                cwd: self.workspace_root.display().to_string(),
+                model: Some(self.options.model.clone()),
+                provider: Some(self.spec.base_url.clone()),
+            })
+            .await?;
+        self.history = system.into_iter().collect();
+        self.persist_all().await
+    }
+
+    /// Persist everything from `start` onwards, and title on first prompt.
+    pub async fn persist_since(&self, start: usize) -> Result<()> {
+        if start >= self.history.len() {
+            return Ok(());
+        }
+        self.store
+            .append_messages(&self.session_id, &self.history[start..])
+            .await?;
+        if let Some(prompt) = self.first_user_text() {
+            self.store
+                .title_from_first_prompt(&self.session_id, &prompt)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Persist the whole transcript, for a freshly created session.
+    pub async fn persist_all(&self) -> Result<()> {
+        self.store
+            .append_messages(&self.session_id, &self.history)
+            .await
+    }
+
+    /// The text of the first user message, used to derive a title.
+    fn first_user_text(&self) -> Option<String> {
+        self.history
+            .iter()
+            .find(|message| message.role == Role::User)
+            .and_then(|message| message.content.clone())
+    }
 }
 
-/// Assemble a session from resolved configuration.
-pub fn build(cli: &Cli, config: &Config, cwd: &Path) -> Result<Session> {
+/// Assemble a session, optionally resuming a stored conversation.
+pub async fn build(
+    cli: &Cli,
+    config: &Config,
+    cwd: &Path,
+    resume: Option<&str>,
+) -> Result<Session> {
     // An empty `api_key_env` means the backend needs no credentials.
-    let api_key = config.api_key()?.unwrap_or_default();
-    let session_id = minion_core::new_session_id();
-
-    let provider = OpenAiProvider::new(&config.provider.base_url, api_key)
-        .with_max_retries(config.provider.max_retries)
-        .with_request_timeout(Some(Duration::from_secs(
-            config.provider.request_timeout_secs,
-        )))
-        .with_usage_in_stream(config.provider.supports_usage_in_stream)
-        .with_headers(config.request_headers())
-        .with_session_id(session_id.clone());
-
-    tracing::debug!(
-        session_id = %session_id,
-        base_url = %config.provider.base_url,
-        headers = config.provider.headers.len(),
-        "session started"
-    );
+    let api_key = config.api_key()?;
+    let spec = ProviderSpec {
+        base_url: config.provider.base_url.clone(),
+        api_key,
+        max_retries: config.provider.max_retries,
+        request_timeout: Duration::from_secs(config.provider.request_timeout_secs),
+        usage_in_stream: config.provider.supports_usage_in_stream,
+        headers: config.request_headers(),
+    };
 
     let workspace_root = config.workspace_root(cwd)?;
     let tools = Arc::new(default_registry(config.workspace.max_file_bytes));
-    let history = vec![Message::system(system_prompt(
-        config,
-        &workspace_root,
-        &tools,
-    ))];
+    let system = Message::system(system_prompt(config, &workspace_root, &tools));
+
+    let database = cli.db.clone().unwrap_or_else(|| config.database_path());
+    let store = Arc::new(Store::open(&database).await?);
+
+    let (session_id, mut history) = match resume {
+        Some(id) => {
+            let row = store
+                .session(id)
+                .await?
+                .ok_or_else(|| Error::Config(format!("no session `{id}` in the database")))?;
+            let mut history = store.load_messages(id).await?;
+            if history.is_empty() {
+                history.push(system);
+            }
+            (row.id, history)
+        }
+        None => {
+            let id = new_session_id();
+            store
+                .create_session(NewSession {
+                    id: id.clone(),
+                    cwd: workspace_root.display().to_string(),
+                    model: Some(config.provider.model.clone()),
+                    provider: Some(config.provider.base_url.clone()),
+                })
+                .await?;
+            (id, vec![system])
+        }
+    };
+
+    apply_history_window(&mut history, config.agent.history_window);
+    let history_window = config.agent.history_window;
+
+    let provider = Arc::new(spec.build(&session_id));
+    tracing::debug!(
+        session_id = %session_id,
+        base_url = %config.provider.base_url,
+        history = history.len(),
+        "session ready"
+    );
 
     let options = AgentOptions {
         model: config.provider.model.clone(),
@@ -83,14 +202,32 @@ pub fn build(cli: &Cli, config: &Config, cwd: &Path) -> Result<Session> {
         workspace_root: workspace_root.clone(),
     };
 
-    let _ = cli;
+    if resume.is_none() {
+        let session = Session {
+            provider,
+            tools,
+            options,
+            history,
+            workspace_root,
+            session_id,
+            store,
+            history_window,
+            spec,
+        };
+        session.persist_all().await?;
+        return Ok(session);
+    }
+
     Ok(Session {
-        provider: Arc::new(provider),
+        provider,
         tools,
         options,
         history,
         workspace_root,
         session_id,
+        store,
+        history_window,
+        spec,
     })
 }
 
@@ -146,12 +283,95 @@ fn builtin_persona() -> String {
         .to_string()
 }
 
+/// Drop old turns, keeping the system prompt and whole user→assistant groups.
+///
+/// Cutting on a message boundary alone can leave an assistant `tool_calls`
+/// message whose results were dropped, or a stray `tool` result, and the provider
+/// rejects that transcript outright. So the cut is moved forward to the next
+/// `user` message.
+pub fn apply_history_window(history: &mut Vec<Message>, window: usize) {
+    if window == 0 || history.len() <= 1 {
+        return;
+    }
+    // Only the conversation is windowed: index 0 is the system prompt, which is
+    // configuration rather than history and is always sent.
+    let body = history.len() - 1;
+    if body <= window {
+        return;
+    }
+
+    let target = 1 + (body - window);
+    let mut cut = (1..history.len())
+        .find(|index| *index >= target && history[*index].role == Role::User)
+        .unwrap_or(target);
+
+    // Never keep a tool result whose assistant call was cut away.
+    while cut < history.len() && history[cut].role == Role::Tool {
+        cut += 1;
+    }
+    if cut >= history.len() {
+        return;
+    }
+    history.drain(1..cut);
+}
+
+/// Every `tool_calls` entry in `history` is answered by a matching result.
+///
+/// This is the property that actually matters: a transcript that keeps an
+/// assistant tool call but drops its result is rejected outright by the
+/// provider, and it is easy to produce by trimming on a message boundary.
+#[cfg(test)]
+fn tool_calls_are_paired(history: &[Message]) -> bool {
+    for (index, message) in history.iter().enumerate() {
+        let Some(calls) = &message.tool_calls else {
+            continue;
+        };
+        for call in calls {
+            let answered = history[index + 1..].iter().any(|later| {
+                later.role == Role::Tool && later.tool_call_id.as_deref() == Some(call.id.as_str())
+            });
+            if !answered {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Render a session for `/sessions`.
+pub fn describe_session(row: &SessionRow) -> String {
+    let title = row
+        .title
+        .clone()
+        .unwrap_or_else(|| "(untitled)".to_string());
+    let model = row.model.clone().unwrap_or_else(|| "-".to_string());
+    format!(
+        "{}  {}  {}  {}",
+        &row.id[..8.min(row.id.len())],
+        row.updated_at,
+        model,
+        title
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn config() -> Config {
         Config::default()
+    }
+
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::system("sys"),
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+            Message::user("three"),
+            Message::assistant("a3"),
+        ]
     }
 
     #[test]
@@ -185,5 +405,83 @@ mod tests {
         let prompt = system_prompt(&config, Path::new("/tmp/ws"), &default_registry(1024));
 
         assert!(prompt.contains("minion"));
+    }
+
+    #[test]
+    fn a_short_history_is_left_alone() {
+        let mut history = conversation();
+        let before = history.len();
+
+        apply_history_window(&mut history, 100);
+
+        assert_eq!(history.len(), before);
+    }
+
+    #[test]
+    fn the_system_prompt_survives_trimming() {
+        let mut history = conversation();
+
+        apply_history_window(&mut history, 3);
+
+        assert_eq!(history[0].content.as_deref(), Some("sys"));
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn trimming_never_splits_a_turn() {
+        let mut history = conversation();
+
+        apply_history_window(&mut history, 4);
+
+        assert_eq!(history[0].role, minion_core::message::Role::System);
+        assert!(tool_calls_are_paired(&history));
+        assert_eq!(history[1].role, minion_core::message::Role::User);
+    }
+
+    #[test]
+    fn a_tool_result_is_never_orphaned() {
+        use minion_core::message::{FunctionCall, ToolCall};
+        let history = vec![
+            Message::system("sys"),
+            Message::user("one"),
+            Message::assistant_with_tool_calls(
+                None,
+                vec![ToolCall {
+                    id: "c1".to_string(),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+            ),
+            Message::tool_result("c1", "contents"),
+            Message::assistant("done"),
+        ];
+
+        for window in 1..8 {
+            let mut candidate = history.clone();
+            apply_history_window(&mut candidate, window);
+            assert_eq!(
+                candidate[0].content.as_deref(),
+                Some("sys"),
+                "window {window} dropped the system prompt"
+            );
+            assert!(
+                tool_calls_are_paired(&candidate),
+                "window {window} left a tool call unanswered: {:?}",
+                candidate.iter().map(|m| m.role).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_of_zero_keeps_everything() {
+        let mut history = conversation();
+        let before = history.len();
+
+        apply_history_window(&mut history, 0);
+
+        assert_eq!(history.len(), before, "0 means 'do not trim', not 'empty'");
     }
 }

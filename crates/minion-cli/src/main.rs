@@ -5,6 +5,7 @@ mod init;
 mod render;
 mod repl;
 mod run;
+mod session;
 mod setup;
 
 use std::path::PathBuf;
@@ -53,6 +54,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
 
     match &cli.command {
         Some(Command::Init(_)) => unreachable!("handled above"),
+        Some(Command::Session(args)) => session::run(&cli, &config, args.clone()).await,
         Some(Command::Run { prompt }) => {
             let prompt = resolve_prompt(prompt)?;
             let stop = run::one_shot(&cli, &config, &cwd, prompt).await?;
@@ -63,7 +65,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
             })
         }
         None => {
-            repl::interactive(&cli, &config, &cwd).await?;
+            repl::interactive(&cli, &config, &cwd, None).await?;
             Ok(ExitCode::SUCCESS)
         }
     }
