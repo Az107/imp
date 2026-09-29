@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use minion_core::error::{Error, Result};
-use minion_core::provider::{ChatEvent, ChatRequest, FinishReason, Provider, Usage};
+use minion_core::provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
 
 use crate::sse::SseDecoder;
 
@@ -201,7 +201,11 @@ impl OpenAiProvider {
             object.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         }
         if !request.tools.is_empty() {
-            object.insert("tools".to_string(), serde_json::json!(request.tools));
+            // Each entry must be the nested `{type, function}` shape, not the
+            // flattened struct: providers reject the flat form with a 400.
+            let tools: Vec<serde_json::Value> =
+                request.tools.iter().map(ToolSchema::to_wire).collect();
+            object.insert("tools".to_string(), serde_json::json!(tools));
             object.insert("tool_choice".to_string(), serde_json::json!("auto"));
         }
         if let Some(parallel) = request.parallel_tool_calls {
@@ -566,6 +570,39 @@ mod tests {
         let body = provider.body(&request);
         assert!(body.get("tools").is_some());
         assert_eq!(body.get("tool_choice").unwrap(), "auto");
+    }
+
+    #[test]
+    fn each_tool_is_wrapped_in_the_function_envelope() {
+        // The flat `{name, description, parameters}` form is rejected with a 400
+        // by compliant providers, so the nesting is asserted explicitly rather
+        // than left to whatever a permissive test double happens to accept.
+        let provider = OpenAiProvider::new("http://localhost/v1", "k");
+        let request = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![minion_core::provider::ToolSchema {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            temperature: None,
+            max_tokens: None,
+            parallel_tool_calls: None,
+            include_usage: false,
+        };
+
+        let body = provider.body(&request);
+        let entry = &body["tools"][0];
+
+        assert_eq!(entry["type"], "function");
+        assert_eq!(entry["function"]["name"], "read_file");
+        assert_eq!(entry["function"]["description"], "read");
+        assert_eq!(entry["function"]["parameters"]["type"], "object");
+        assert!(
+            entry.get("name").is_none(),
+            "the flat form must not leak alongside the envelope"
+        );
     }
 
     #[test]

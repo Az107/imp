@@ -18,6 +18,25 @@ pub struct ToolSchema {
     pub parameters: serde_json::Value,
 }
 
+impl ToolSchema {
+    /// The OpenAI Chat Completions wire shape for a single tool.
+    ///
+    /// The API requires each entry of `tools` to be
+    /// `{"type":"function","function":{"name":…,"description":…,"parameters":…}}`.
+    /// Serializing [`ToolSchema`] directly produces a flattened object that
+    /// compliant providers reject with a 400.
+    pub fn to_wire(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        })
+    }
+}
+
 /// Why the model stopped generating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {

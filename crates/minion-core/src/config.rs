@@ -280,10 +280,18 @@ impl Config {
     /// `explicit` is the `--config` path, which wins over everything except
     /// environment variables and CLI flags.
     pub fn load(explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
+        Self::load_with(user_config_path().as_deref(), explicit, cwd)
+    }
+
+    /// Load with every config path supplied, for tests and embedders.
+    ///
+    /// Exists so tests can opt out of the developer's real user config instead
+    /// of silently inheriting whatever `minion init` last wrote to it.
+    pub fn load_with(user: Option<&Path>, explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
         let mut merged = toml::Value::Table(toml::Table::new());
 
-        if let Some(path) = user_config_path() {
-            merge_file(&mut merged, &path)?;
+        if let Some(path) = user {
+            merge_file(&mut merged, path)?;
         }
         merge_file(&mut merged, &cwd.join("minion.toml"))?;
         if let Some(path) = explicit {
@@ -552,7 +560,7 @@ mod tests {
             "[provider]\nmodel = \"local-model\"\n",
         );
 
-        let config = Config::load(None, cwd).unwrap();
+        let config = Config::load_with(None, None, cwd).unwrap();
 
         assert_eq!(config.provider.model, "local-model");
         // Untouched keys keep their defaults.
@@ -571,7 +579,7 @@ mod tests {
         let explicit = cwd.join("elsewhere.toml");
         write(&explicit, "[provider]\nmodel = \"from-flag\"\n");
 
-        let config = Config::load(Some(&explicit), cwd).unwrap();
+        let config = Config::load_with(None, Some(&explicit), cwd).unwrap();
 
         assert_eq!(config.provider.model, "from-flag");
     }
@@ -585,7 +593,7 @@ mod tests {
             "[policy]\nnoninteractive = \"auto\"\n\n[[policy.allow]]\ntool = \"run_command\"\npattern = \"ls *\"\n",
         );
 
-        let config = Config::load(None, cwd).unwrap();
+        let config = Config::load_with(None, None, cwd).unwrap();
 
         assert_eq!(config.policy.noninteractive, Decision::Auto);
         // Sibling key under the same table survives the merge.
@@ -600,9 +608,46 @@ mod tests {
         let cwd = dir.path();
         write(&cwd.join("minion.toml"), "[agent]\nmax_iterations = 0\n");
 
-        let err = Config::load(None, cwd).unwrap_err();
+        let err = Config::load_with(None, None, cwd).unwrap_err();
 
         assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_user_config_is_layered_under_the_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let user = cwd.join("user.toml");
+        write(
+            &user,
+            "[provider]\nmodel = \"from-user\"\nbase_url = \"http://user/v1\"\n",
+        );
+        write(
+            &cwd.join("minion.toml"),
+            "[provider]\nmodel = \"from-project\"\n",
+        );
+
+        let config = Config::load_with(Some(&user), None, cwd).unwrap();
+
+        // The project file wins on the key both set...
+        assert_eq!(config.provider.model, "from-project");
+        // ...and the user file still supplies the rest.
+        assert_eq!(config.provider.base_url, "http://user/v1");
+    }
+
+    #[test]
+    fn tests_never_read_the_developers_real_user_config() {
+        // Regression guard: a test that passes `None` for the user path must not
+        // pick up whatever `minion init` last wrote to the real config location.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[provider]\nmodel = \"m\"\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.provider.base_url, ProviderConfig::default().base_url);
     }
 
     #[test]
@@ -611,7 +656,7 @@ mod tests {
         let cwd = dir.path();
         write(&cwd.join("minion.toml"), "[future]\nsome_key = true\n");
 
-        assert!(Config::load(None, cwd).is_ok());
+        assert!(Config::load_with(None, None, cwd).is_ok());
     }
 
     #[test]

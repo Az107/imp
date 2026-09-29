@@ -1070,25 +1070,38 @@ For each capability, an operator should be able to answer "who can trigger this?
 
 ---
 
-## Appendix A — Example tool schema (generated from Rust via `schemars`)
+## Appendix A — Tool schema on the wire
+
+`ToolSchema` is a domain value — `{name, description, parameters}`. It is **not** what goes on the
+wire. Each entry of the request's `tools` array is wrapped in the function envelope, and a compliant
+provider answers a flat entry with `400 invalid request`:
 
 ```json
 {
-  "name": "run_command",
-  "description": "Run a shell command in the workspace. Requires approval unless the command matches an allowlisted pattern. Output is captured and truncated.",
-  "parameters": {
-    "type": "object",
-    "properties": {
-      "command":    { "type": "string", "description": "Shell command line to execute." },
-      "cwd":        { "type": "string", "description": "Working directory, relative to a workspace root." },
-      "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 120000 },
-      "stdin":      { "type": "string", "description": "Optional stdin for the process." }
-    },
-    "required": ["command"],
-    "additionalProperties": false
+  "type": "function",
+  "function": {
+    "name": "run_command",
+    "description": "Run a shell command in the workspace. Requires approval unless the command matches an allowlisted pattern. Output is captured and truncated.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command":    { "type": "string", "description": "Shell command line to execute." },
+        "cwd":        { "type": "string", "description": "Working directory, relative to a workspace root." },
+        "timeout_ms": { "type": "integer", "minimum": 1, "maximum": 3600000, "default": 120000 },
+        "stdin":      { "type": "string", "description": "Optional stdin for the process." }
+      },
+      "required": ["command"],
+      "additionalProperties": false
+    }
   }
 }
 ```
+
+`schemars` supplies `parameters` from the Rust argument struct. Note that it also emits `$schema`,
+`title`, `format`, and — for `Option<T>` — a union such as `"type": ["integer", "null"]`. The
+OpenAI endpoint accepts these, but providers that translate the schema into another vendor's format
+may not; if a gateway ever rejects a tool, normalize the schema at the registry boundary rather
+than editing individual tools.
 
 ## Appendix B — Request/response shape used against the provider
 

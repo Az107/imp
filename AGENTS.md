@@ -66,12 +66,26 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 ## Toolchain gotchas
 
+- **`tools[]` must be the function envelope.** Each entry is
+  `{"type":"function","function":{"name","description","parameters"}}`, not the flat `ToolSchema`
+  struct. Serializing `ToolSchema` directly 400s on any compliant provider. A permissive test double
+  accepts the flat form happily, so assert the envelope in a test — this bug shipped once because
+  every test used a stub that ignored the request body.
+- **Config tests must not read the real user config.** Use `Config::load_with(user, explicit, cwd)`
+  and pass `None` for the user path. `Config::load` picks up
+  `~/Library/Application Support/minion/config.toml`, so a developer's own `minion init` breaks tests
+  on any machine that has one.
+- **A gateway saying "upstream request failed" is rejecting the request body.** Bisect the fields
+  against the live endpoint instead of guessing: capture the exact JSON, replay it, then remove one
+  key at a time. Cloudflare also blocks python `urllib`'s default signature with
+  `403 / error code 1010`, so a diagnostic script must send a normal `User-Agent`.
 - **reqwest 0.13**: TLS feature is `rustls`, not `rustls-tls`. We build it with
   `default-features = false`.
 - **Provider streams use `async_stream::stream!`, not `try_stream!`.** `?` inside `tokio::select!`
   does not compile under `try_stream!`; the stream yields `Result<ChatEvent>` explicitly.
 - **schemars 1.x**: tool argument schemas are derived with `schema_for!` and converted via
-  `serde_json::to_value`. That requires the `derive` feature.
+  `serde_json::to_value`. That requires the `derive` feature. It emits `$schema`, `title`, `format`,
+  and `"type": ["integer","null"]` for `Option<T>` — accepted by OpenAI, not by every gateway.
 - Retries happen **only before the first stream event** (in `OpenAiProvider::open`), so a retry can
   never duplicate text or re-run a tool. Don't move retry logic downstream.
 - **`${session}` cannot be written inside a `println!`/`format!` format string.** `{session}` is
