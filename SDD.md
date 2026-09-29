@@ -734,10 +734,14 @@ Policy resolution for each invocation:
 deny-rule match            → Deny
 allowlist match (any scope)→ Auto
 tool.risk == ReadOnly      → Auto
-!stdin.is_tty()            → policy.noninteractive (default Deny)
+!stdin.is_tty()            → policy.noninteractive (default Deny)   -- for everything else
 tool.risk == Execute|Write → Ask
 otherwise                  → policy.default
 ```
+
+`ReadOnly` is allowed before the TTY is consulted, so a piped process can still read. `Network` is
+gated with `Execute`/`Write` rather than with `ReadOnly`, because the request leaves the machine and
+can be induced by untrusted content. See D15.
 
 Deny rules always win; an explicit deny cannot be allowlisted away at runtime.
 
@@ -1138,12 +1142,18 @@ For each capability, an operator should be able to answer "who can trigger this?
 | R8 | Token/cost accounting differs per provider | Treat usage as advisory; never block a turn solely on a missing usage field |
 
 **Open questions for review:**
-1. Should `http_fetch` support an explicit `http://` for local dev servers via a named allowlist entry, or require HTTPS unconditionally?
+1. ~~Should `http_fetch` support an explicit `http://` for local dev servers via a named allowlist
+   entry, or require HTTPS unconditionally?~~ **Resolved — a named allowlist entry.** `https` is
+   required unless the exact host appears in `allowed_domains`, so a local dev server is reachable
+   without weakening the default. Matches §5.5 as already written. Not yet implemented.
 2. Should job prompts be able to opt into the interactive policy when minion is attached to a TTY, or always fail closed?
 3. ~~Is `edit_file`'s exact-match semantics sufficient, or is a patch-based tool wanted for large
    edits?~~ **Resolved — both are provided.** `edit_file` stays for a single surgical replacement;
    `apply_patch` handles multi-site and multi-file edits in one atomic call. See §5.5 and D13.
-4. Should memory be scoped per-workspace (proposed) or global with a namespace parameter?
+4. ~~Should memory be scoped per-workspace (proposed) or global with a namespace parameter?~~
+   **Resolved — per-workspace.** The `namespace` column is a hash of the canonical workspace root, so
+   no parameter is needed on either tool and facts cannot leak between projects. Matches §5.5.
+   Implemented.
 
 ---
 
@@ -1220,3 +1230,4 @@ than editing individual tools.
 | D12 | Terminal echo is disabled before the prompt is printed rather than by the library that reads the secret | `rpassword`-style helpers print first and disable second, which leaves a window where a pasted key is echoed into scrollback. Owning the termios guard is ~20 lines and closes it; `--no-store-token` keeps an escape hatch for anyone who does not want a secret on disk at all |
 | D13 | `apply_patch` takes structured JSON operations, and sits *alongside* `edit_file` rather than replacing it | Anchored operations are unambiguous: "anchor matched 2 times" is an exact, actionable error, where a fuzzy hunk match silently edits the wrong lines. `edit_file` stays because for a one-line change it is the smaller, less failure-prone request |
 | D14 | Assistant text is rendered as markdown on a terminal, per block, with the parser from `pulldown-cmark` and the renderer written in-tree | A terminal has no font sizes, so hierarchy is bold plus a colour that steps with the heading level; the scrollback rule is kept by emitting whole blocks and never revising text already on screen, which streaming token-by-token cannot do for a table. Rendering only when stdout is a terminal keeps `minion run ... > out.md` yielding markdown rather than ASCII art, and the split of layout from colour means `NO_COLOR` still gets aligned tables. The renderer is ours so the output is exactly the intended one and the dependency stays a single parser, which is what keeps the binary inside NFR-3 |
+| D15 | The non-interactive rule governs tools that *change* something; `ReadOnly` is allowed unattended and `Network` counts as a change | §5.6 lists `ReadOnly → Auto` above the `!stdin.is_tty()` branch, but the implementation checked the TTY first, so with the default `noninteractive = "deny"` a read was refused whenever stdin was piped — which breaks the `minion run ... > out.md` invocation this document advertises, for `read_file` as much as for `recall`. A missing terminal says something about *consent*, and a read cannot consume consent it never asks for; what it genuinely blocks is an unattended mutation. `Network` is deliberately on the mutation side: the request leaves the machine and can be induced by untrusted content in a transcript, so `http_fetch` is gated like a write and still needs `--yes` or an allowlist entry in a pipe. Deny rules, allowlists and the classifier are untouched and still run first, so this widens nothing that was explicitly refused. Recorded because it touches the rule order that the invariants call a security property, even though it only restores what §5.6 already specified |

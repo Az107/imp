@@ -144,16 +144,13 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 ## Policy rules
 
 - **Rule order in `PolicyEngine::check` is the security property.** Deny → allow → classifier →
-  non-interactive → ReadOnly → default. Reordering lets a later rule skip an earlier refusal.
-- **The non-interactive rule sits *above* the ReadOnly short-circuit, which contradicts SDD §5.6.**
-  The spec lists `tool.risk == ReadOnly → Auto` before `!stdin.is_tty()`, so a read-only call ought
-  to be allowed unattended; the implementation refuses it under the default
-  `noninteractive = "deny"`. Consequence: `minion run "..."` on a piped, non-TTY stdin cannot read
-  a file, write, or recall anything without `--yes` or an allowlist entry. This is **pre-existing**
-  (`read_file` is affected identically) and untriaged — `a_read_only_tool_follows_the_same_rule_as_
-  read_file` in `crates/minion-cli/tests/memory_gate.rs` pins the current behaviour rather than
-  asserting it is correct. Reordering is a change to the engine's security property, so it needs a
-  deliberate decision and a decision-log entry, not a drive-by fix.
+  ReadOnly → non-interactive → default. Reordering lets a later rule skip an earlier refusal.
+- **`ReadOnly` is checked *before* the non-interactive rule; `Network` is not.** D15, and it
+  deliberately does not match `Risk::requires_consent`. A piped `minion run ... > out.md` can read
+  and recall, but a write or an `http_fetch` still needs `--yes` or an allowlist entry. Use
+  `Risk::is_observation()` for the read/write line rather than matching `ReadOnly` — it keeps the
+  side that `Network` sits on stated once. If `Network` ever moves to the read side, that helper is
+  the only thing that needs changing, and it needs a new decision-log entry.
 - **`policy.default = "auto"` does not silence the classifier.** `rm -rf`, `sudo`, and `curl | sh`
   always prompt. That is the whole reason the classifier exists.
 - **Allowlist patterns are anchored at the start and exact unless they end in `*`.** `pattern = "echo"`

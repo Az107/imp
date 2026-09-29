@@ -8,9 +8,11 @@
 //! 2. A persistent or session allow rule skips the prompt.
 //! 3. A command the risk classifier flags always needs consent, even when the
 //!    default is `auto`.
-//! 4. Non-interactive processes take the `noninteractive` decision and never
-//!    prompt; the default for that is `deny`.
-//! 5. `ReadOnly` runs freely.
+//! 4. `ReadOnly` runs freely — it only observes, so a missing terminal does not
+//!    make it unsafe. This matches SDD §5.6; see D15.
+//! 5. Non-interactive processes take the `noninteractive` decision for anything
+//!    that *changes* something and never prompt; the default for that is
+//!    `deny`. `Network` counts as a change (D15), so it is gated here.
 //! 6. Otherwise `policy.default` decides, prompting when it is `ask`.
 
 use std::sync::Arc;
@@ -268,7 +270,27 @@ impl ToolGate for PolicyEngine {
             Vec::new()
         };
 
-        // 4. No one is there to ask.
+        // 4. Reading is free, and no one is there to ask about anything else.
+        //
+        // These two used to be separate rules with the non-interactive one
+        // first, which contradicted SDD §5.6: it lists `risk == ReadOnly →
+        // Auto` *above* the `!stdin.is_tty()` branch, so a read-only call was
+        // meant to survive a non-TTY. As written it did not — with the default
+        // `noninteractive = "deny"`, `minion run "..." > out.md` could not read
+        // a file, because piping makes stdin a non-TTY and AGENTS.md documents
+        // that exact invocation as supported.
+        //
+        // Folding them together states the intent directly: a missing terminal
+        // governs calls that *change* something, not calls that only observe.
+        // `Network` is deliberately on the side-effect side of the line — a
+        // request leaves the machine and can be induced by untrusted content,
+        // so it is treated like a write, not a read. See D15.
+        //
+        // Deny (1), allow (2) and the classifier (3) are untouched, and all
+        // three still run first.
+        if risk.is_observation() {
+            return Ok(());
+        }
         if !self.interactive {
             return match self.noninteractive {
                 Decision::Auto => Ok(()),
@@ -284,12 +306,7 @@ impl ToolGate for PolicyEngine {
             };
         }
 
-        // 5. Reading is free.
-        if risk == Risk::ReadOnly {
-            return Ok(());
-        }
-
-        // 6. The configured default, or a prompt.
+        // 5. The configured default, or a prompt.
         let decision = if flags.is_empty() {
             self.default
         } else {
@@ -496,6 +513,69 @@ mod tests {
 
         assert!(err.to_string().contains("non-interactive"), "was: {err}");
         assert!(ui.asked().is_empty(), "a non-TTY must not prompt");
+    }
+
+    /// D15: a read-only tool is allowed even with no one to ask, which is what
+    /// makes `minion run "..." > out.md` work when stdin is piped.
+    #[tokio::test]
+    async fn a_read_only_tool_survives_a_non_terminal() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Deny));
+        let engine = engine(false).with_ui(ui.clone());
+
+        engine
+            .check("read_file", Risk::ReadOnly, &serde_json::json!({}), None)
+            .await
+            .expect("reading only observes, so a missing terminal must not block it");
+
+        assert!(ui.asked().is_empty());
+    }
+
+    /// D15: `Network` is a side effect, so it is gated like a write. An outbound
+    /// request leaves the machine and can be induced by untrusted content.
+    #[tokio::test]
+    async fn a_network_call_is_gated_like_a_write_when_there_is_no_terminal() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Once));
+        let engine = engine(false).with_ui(ui.clone());
+
+        let err = engine
+            .check(
+                "http_fetch",
+                Risk::Network,
+                &serde_json::json!({ "url": "https://example.com" }),
+                Some("https://example.com"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("non-interactive"), "was: {err}");
+        assert!(ui.asked().is_empty());
+    }
+
+    /// Widening the read side must not let a deny rule be skipped. Deny is rule
+    /// 1; the `ReadOnly` short-circuit is rule 4.
+    #[tokio::test]
+    async fn a_deny_rule_still_wins_over_a_read_only_tool() {
+        let engine = PolicyEngine::new(
+            vec![("read_file".into(), "*".into())],
+            vec![("read_file".into(), "secret/*".into())],
+            Decision::Auto,
+            Decision::Auto,
+            "/workspace",
+            true,
+        );
+
+        // An allow rule for everything, plus a deny rule for one path: the deny
+        // must decide, and it must do so before the ReadOnly shortcut.
+        let err = engine
+            .check(
+                "read_file",
+                Risk::ReadOnly,
+                &serde_json::json!({ "path": "secret/keys" }),
+                Some("secret/keys"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deny rule"), "was: {err}");
     }
 
     #[tokio::test]

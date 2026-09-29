@@ -39,7 +39,17 @@ impl Risk {
 
     /// Whether this risk class requires consent by default.
     pub fn requires_consent(self) -> bool {
-        matches!(self, Risk::Write | Risk::Execute)
+        matches!(self, Risk::Write | Risk::Execute | Risk::Network)
+    }
+
+    /// Whether the class only observes, leaving the machine unchanged.
+    ///
+    /// This is the line the non-interactive rule draws: a missing terminal
+    /// governs calls that change something, not calls that only read. `Network`
+    /// is a change — the request leaves the machine and can be induced by
+    /// untrusted content — so it sits with `Write` and `Execute`. See D15.
+    pub fn is_observation(self) -> bool {
+        matches!(self, Risk::ReadOnly)
     }
 }
 

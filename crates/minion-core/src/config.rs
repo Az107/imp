@@ -182,6 +182,9 @@ pub struct PolicyConfig {
     /// Outcome when no other rule matches.
     pub default: Decision,
     /// Outcome when stdin is not a TTY. Defaults to deny: fail closed.
+    ///
+    /// Applies to tools that change something. `ReadOnly` tools are allowed
+    /// regardless, per SDD §5.6 and D14; `Network` counts as a change.
     pub noninteractive: Decision,
     /// Patterns that pre-approve a tool call.
     pub allow: Vec<AllowRule>,

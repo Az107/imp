@@ -140,8 +140,8 @@ impl ToolGate for PermissiveGate {
     }
 }
 
-/// The engine the CLI actually builds must not wave `remember` through
-/// unattended: a non-TTY has nobody to ask, so it fails closed.
+/// `remember` is a `Write`, so a non-TTY still refuses it: nobody is there to
+/// consent, and D15 keeps writes on the side-effect side of the line.
 #[tokio::test]
 async fn a_non_interactive_engine_refuses_remember() {
     let engine = PolicyEngine::new(
@@ -168,51 +168,98 @@ async fn a_non_interactive_engine_refuses_remember() {
     );
 }
 
-/// Pins how the engine treats a read-only tool with nobody at a prompt.
+/// A read-only tool must survive a non-TTY, so `minion run ... > out.md` works.
 ///
-/// SDD §5.6 lists `tool.risk == ReadOnly → Auto` *above* the
-/// `!stdin.is_tty()` rule, which would let `recall` through unattended. The
-/// implementation checks non-interactive first (§4 before §5 in
-/// `PolicyEngine::check`), so under the default `noninteractive = "deny"` a
-/// read-only call is refused. `read_file` behaves identically, so this is
-/// pre-existing and not specific to memory.
-///
-/// Asserted as-is rather than "fixed" here: reordering the rule is a change to
-/// the engine's security property, which AGENTS.md forbids doing incidentally.
-/// `recall` simply follows whatever `read_file` already does.
+/// This is SDD §5.6's `tool.risk == ReadOnly → Auto` and D15. The rule used to
+/// be checked *after* the non-interactive branch, which refused reads whenever
+/// stdin was piped.
 #[tokio::test]
-async fn a_read_only_tool_follows_the_same_rule_as_read_file() {
-    let engine = || {
-        PolicyEngine::new(
-            Vec::new(),
-            Vec::new(),
-            minion_core::config::Decision::Auto,
-            minion_core::config::Decision::Deny,
-            "session".to_string(),
-            false,
-        )
-    };
+async fn a_read_only_tool_is_allowed_on_a_non_tty() {
+    let engine = PolicyEngine::new(
+        Vec::new(),
+        Vec::new(),
+        minion_core::config::Decision::Auto,
+        minion_core::config::Decision::Deny,
+        "session".to_string(),
+        false,
+    );
 
-    let recall = engine()
-        .check(
-            "recall",
-            Risk::ReadOnly,
-            &serde_json::json!({ "query": "x" }),
-            None,
-        )
-        .await;
-    let read_file = engine()
+    for (tool, args) in [
+        ("recall", serde_json::json!({ "query": "x" })),
+        ("read_file", serde_json::json!({ "path": "a.txt" })),
+    ] {
+        let outcome = engine.check(tool, Risk::ReadOnly, &args, None).await;
+        assert!(
+            outcome.is_ok(),
+            "`{tool}` only observes, so a missing terminal must not refuse it: {outcome:?}"
+        );
+    }
+}
+
+/// The flip side: writes and network calls still need consent on a non-TTY.
+///
+/// Widening the read side must not have widened anything else.
+#[tokio::test]
+async fn writes_and_network_still_need_consent_on_a_non_tty() {
+    let engine = PolicyEngine::new(
+        Vec::new(),
+        Vec::new(),
+        minion_core::config::Decision::Auto,
+        minion_core::config::Decision::Deny,
+        "session".to_string(),
+        false,
+    );
+
+    for (tool, risk) in [
+        ("remember", Risk::Write),
+        ("write_file", Risk::Write),
+        ("run_command", Risk::Execute),
+        // D15: a request leaves the machine, so it counts as a side effect.
+        ("http_fetch", Risk::Network),
+    ] {
+        let outcome = engine
+            .check(tool, risk, &serde_json::json!({ "key": "k" }), Some("k"))
+            .await;
+        assert!(
+            outcome.is_err(),
+            "`{tool}` ({risk:?}) must still require consent on a non-TTY"
+        );
+    }
+}
+
+/// A deny rule must still beat the new read-only allowance.
+///
+/// The ordering property that matters: deny is rule 1 and the ReadOnly
+/// short-circuit is now rule 4, so widening the latter cannot resurrect a tool
+/// that was explicitly refused.
+#[tokio::test]
+async fn a_deny_rule_still_beats_the_read_only_allowance() {
+    let engine = PolicyEngine::new(
+        Vec::new(),
+        vec![("read_file".to_string(), "secret/*".to_string())],
+        minion_core::config::Decision::Auto,
+        minion_core::config::Decision::Auto,
+        "/ws".to_string(),
+        false,
+    );
+
+    let denied = engine
         .check(
             "read_file",
             Risk::ReadOnly,
-            &serde_json::json!({ "path": "a.txt" }),
-            None,
+            &serde_json::json!({ "path": "secret/keys" }),
+            Some("secret/keys"),
         )
         .await;
+    assert!(denied.is_err(), "a deny rule must win over ReadOnly");
 
-    assert_eq!(
-        recall.is_ok(),
-        read_file.is_ok(),
-        "recall must not be treated differently from the existing read-only tool"
-    );
+    let allowed = engine
+        .check(
+            "read_file",
+            Risk::ReadOnly,
+            &serde_json::json!({ "path": "src/main.rs" }),
+            Some("src/main.rs"),
+        )
+        .await;
+    assert!(allowed.is_ok(), "an unrelated read is still allowed");
 }
