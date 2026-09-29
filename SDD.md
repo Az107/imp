@@ -163,7 +163,7 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 | NFR-5 | Default command timeout | 120 s |
 | NFR-6 | Crash safety: no lost job or message on `SIGKILL` | SQLite WAL + write-before-ack |
 | NFR-7 | Offline unit/integration test suite | No network required |
-| NFR-8 | Accessibility | No color dependence; `NO_COLOR` honored; screen-reader-safe line output |
+| NFR-8 | Accessibility | No color dependence; `NO_COLOR` honored; screen-reader-safe line output. Markdown rendering is additive — it reflows plain text and adds table borders, and no meaning is carried by colour alone |
 | NFR-9 | Log redaction | API keys and env values never logged |
 | NFR-10 | `init` performs no network I/O unless `--check` is passed | Setup works offline (local backends, air-gapped machines) |
 
@@ -997,8 +997,12 @@ restart — that is the point of the header, and a fresh id would look like a ne
 gateway.
 
 Rendering rules:
-- Assistant text streams to stdout with no box drawing; tool activity goes to **stderr** as single dimmed lines, so `minion run ... > out.txt` yields clean output.
-- `--json` emits newline-delimited JSON events (`{"type":"text"…}`, `{"type":"tool_call"…}`, `{"type":"done"…}`) for scripting.
+- Assistant text streams to stdout; tool activity goes to **stderr** as single dimmed lines, so `minion run ... > out.txt` yields clean output.
+- On a terminal, assistant text is rendered as markdown: headings, bold/italic/strikethrough, inline and fenced code, lists, blockquotes, rules, and pipe tables with box-drawing borders and column alignment. Rendering is **per block**, not per token — a block is drawn as soon as it is complete and nothing already printed is ever revised, which is what keeps the scrollback intact. A table cannot be laid out until its last row arrives, so it waits for one.
+- **Piped output is not rendered.** When stdout is not a terminal the raw markdown is emitted, because the source is the more useful thing to capture and reformat later. `--markdown` does not override this.
+- Layout and colour are separate. `NO_COLOR` and `--no-color` suppress the ANSI escapes but keep table borders and list markers, since alignment carries meaning that colour does not. `--no-markdown` turns rendering off entirely.
+- Width comes from `--width`, then `$COLUMNS`, then 80. A table that cannot fit the width is emitted as plain rows rather than drawn into a mangled grid.
+- `--json` emits newline-delimited JSON events (`{"type":"text"…}`, `{"type":"tool_call"…}`, `{"type":"done"…}`) for scripting, and never renders markdown: a JSON consumer wants the model's own text, not a drawn table.
 - Piped stdin: `echo "..." | minion run -` reads the prompt from stdin; combined with a non-TTY, policy is enforced as non-interactive.
 - Colors via a tiny ANSI helper honoring `NO_COLOR` and `--no-color`; no truecolor dependency.
 
@@ -1025,6 +1029,7 @@ Global options:
   --yes                 # auto-approve policy.default == ask (dangerous; prints a warning)
   --deny                # force deny for everything not allowlisted
   --json                --no-color            --verbose|-v  --quiet|-q
+  --markdown  --no-markdown      --width <n>
   --cwd <DIR>           --resume <SESSION>    --max-iterations <N>
   --config <FILE>       --db <FILE>
 ```
@@ -1214,3 +1219,4 @@ than editing individual tools.
 | D11 | The API key is collected by prompt and stored in a separate `0600` credentials file, while the config keeps the `api_key_env` path | Removes the "find a variable name and export it yourself" step, which was the whole friction of the old flow, without putting a secret in a file people commit. A `netrc`/AWS-CLI style split: portable config, local secret. Resolution order keeps env var → file so a shell or CI job can still override |
 | D12 | Terminal echo is disabled before the prompt is printed rather than by the library that reads the secret | `rpassword`-style helpers print first and disable second, which leaves a window where a pasted key is echoed into scrollback. Owning the termios guard is ~20 lines and closes it; `--no-store-token` keeps an escape hatch for anyone who does not want a secret on disk at all |
 | D13 | `apply_patch` takes structured JSON operations, and sits *alongside* `edit_file` rather than replacing it | Anchored operations are unambiguous: "anchor matched 2 times" is an exact, actionable error, where a fuzzy hunk match silently edits the wrong lines. `edit_file` stays because for a one-line change it is the smaller, less failure-prone request |
+| D14 | Assistant text is rendered as markdown on a terminal, per block, with the parser from `pulldown-cmark` and the renderer written in-tree | A terminal has no font sizes, so hierarchy is bold plus a colour that steps with the heading level; the scrollback rule is kept by emitting whole blocks and never revising text already on screen, which streaming token-by-token cannot do for a table. Rendering only when stdout is a terminal keeps `minion run ... > out.md` yielding markdown rather than ASCII art, and the split of layout from colour means `NO_COLOR` still gets aligned tables. The renderer is ours so the output is exactly the intended one and the dependency stays a single parser, which is what keeps the binary inside NFR-3 |

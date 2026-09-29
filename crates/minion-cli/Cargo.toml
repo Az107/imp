@@ -17,6 +17,7 @@ minion-cron = { version = "0.1.0", path = "../minion-cron" }
 minion-provider = { version = "0.1.0", path = "../minion-provider" }
 minion-store = { version = "0.1.0", path = "../minion-store" }
 minion-tools = { version = "0.1.0", path = "../minion-tools" }
+pulldown-cmark = "0.13.4"
 rustyline = "18.0.1"
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync", "io-std", "io-util"] }

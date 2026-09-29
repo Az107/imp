@@ -45,9 +45,22 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Disable ANSI colour.
+    /// Disable ANSI colour. Layout such as table borders is kept.
     #[arg(long = "no-color", global = true)]
     pub no_color: bool,
+
+    /// Render markdown in the terminal. On by default when stdout is a
+    /// terminal; ignored when output is piped, where raw markdown is kept.
+    #[arg(long = "markdown", global = true, overrides_with = "no_markdown")]
+    pub markdown: bool,
+
+    /// Never render markdown, even on a terminal.
+    #[arg(long = "no-markdown", global = true)]
+    pub no_markdown: bool,
+
+    /// Wrap width in columns. Defaults to $COLUMNS, then 80.
+    #[arg(long, global = true)]
+    pub width: Option<usize>,
 
     /// Increase log verbosity (`-v`, `-vv`).
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]

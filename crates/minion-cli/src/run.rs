@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
+use crate::markdown::Style;
 use crate::render::Renderer;
 use crate::setup;
 
@@ -38,7 +39,12 @@ pub async fn one_shot(
     }
 
     let (sender, receiver) = mpsc::unbounded_channel();
-    let rendering = tokio::spawn(render_events(receiver, cli.json, colour_enabled(cli)));
+    let rendering = tokio::spawn(render_events(
+        receiver,
+        cli.json,
+        style_for(cli),
+        colour_enabled(cli),
+    ));
 
     let cancel = CancellationToken::new();
     let watcher = spawn_interrupt_watcher(cancel.clone());
@@ -73,9 +79,10 @@ fn short_id(id: &str) -> String {
 pub async fn render_events(
     mut receiver: mpsc::UnboundedReceiver<AgentEvent>,
     json: bool,
+    style: Style,
     colour: bool,
 ) {
-    let mut renderer = Renderer::new(json, colour);
+    let mut renderer = Renderer::new(json, style, colour);
     while let Some(event) = receiver.recv().await {
         renderer.handle(&event);
     }
@@ -94,4 +101,27 @@ pub fn spawn_interrupt_watcher(cancel: CancellationToken) -> tokio::task::JoinHa
 /// Whether ANSI colour should be used: not `--no-color`, not `NO_COLOR`, and a TTY.
 pub fn colour_enabled(cli: &Cli) -> bool {
     !cli.no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+}
+
+/// The markdown style to render with.
+///
+/// Rendering follows the terminal, not the flag alone: on a pipe the raw
+/// markdown is more useful than a drawn table, so `--markdown` cannot override
+/// it. Colour is separately refused by `NO_COLOR` and `--no-color`, but layout
+/// survives, so a `NO_COLOR` user still gets aligned tables.
+pub fn style_for(cli: &Cli) -> Style {
+    if cli.no_markdown || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return Style::plain();
+    }
+    let colour = !cli.no_color && std::env::var_os("NO_COLOR").is_none();
+    Style::rendered(colour, cli.width.unwrap_or_else(terminal_width))
+}
+
+/// Prefer an explicit width, then `COLUMNS`, then a sane default.
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|width| *width >= 20)
+        .unwrap_or(80)
 }

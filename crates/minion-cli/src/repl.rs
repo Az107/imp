@@ -102,6 +102,7 @@ pub async fn interactive(
         let rendering = tokio::spawn(run::render_events(
             receiver,
             cli.json,
+            run::style_for(cli),
             run::colour_enabled(cli),
         ));
 

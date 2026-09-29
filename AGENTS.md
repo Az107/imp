@@ -11,6 +11,10 @@ sessions, and `minion init`. Branch is `main`.
 (`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs`,
 `memory` and `audit_log` tables exist in the schema but nothing writes to them until M3/M4.
 
+Assistant text is rendered as markdown on a terminal (`crates/minion-cli/src/markdown.rs`):
+headings, emphasis, code, lists, quotes, rules, and pipe tables. It is rendered per block, so
+nothing already on screen is ever revised.
+
 ## Commands
 
 ```sh
@@ -35,6 +39,11 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   way — push I/O into `minion-provider`, `minion-tools`, or `minion-cli`.
 - Assistant text goes to **stdout**; tool activity, logs, and errors go to **stderr**. This is what
   makes `minion run ... > answer.txt` clean. Don't print diagnostics to stdout.
+- **Piped output is never rendered.** `run::style_for` checks `IsTerminal` *before* honouring
+  `--markdown`, so `minion run ... > out.md` still yields markdown source. If you make the flag win,
+  every user piping output gets ASCII tables.
+- **Layout and colour are separate.** `NO_COLOR` and `--no-color` drop the escapes but keep table
+  borders and list markers, because column alignment carries meaning and colour does not.
 - Config overlays are deep-merged on `toml::Value` trees, so a project `minion.toml` only restates
   the keys it changes. **Unknown keys are ignored on purpose** (forward compatibility) — do not add
   `deny_unknown_fields`.
@@ -44,6 +53,8 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   conversation** — regenerating it per request would break the prompt-cache routing it exists for.
 - `minion init` deliberately runs *before* config loading in `main.rs`, so a broken or missing
   config can still be repaired by it. Keep that ordering.
+- **Markdown rendering is a presentation concern and lives in `minion-cli`, not `minion-core`.**
+  `minion-core` still emits raw `TextDelta`. The parser is `pulldown-cmark`; the renderer is ours.
 
 ## Invariants that must not be relaxed
 
@@ -97,6 +108,18 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - **Do not use `rpassword` for the secret prompt.** It prints the prompt and *then* disables echo,
   which leaves a window where a pasted key is echoed into terminal scrollback. `ask_secret` in
   `init.rs` owns the termios guard so echo is off before anything is printed.
+- **`Options::empty()` in pulldown-cmark disables GFM tables.** The default is `Options::all()`, so
+  name the extensions you want explicitly. A table that renders as a paragraph of pipes is this.
+- **pulldown-cmark's `TableHead` has no `TableRow` wrapper.** Body rows do. Assign the header on
+  `End(TagEnd::TableHead)` or you get a blank heading line and column widths driven by the body.
+- **Match-arm order in `collect_blocks` is load-bearing.** `Start(Strong)` is both an inline mark
+  and a `Tag`, so the inline arm must come *before* the generic `Start(tag)` arm. Reversed, match
+  tries arms in order, `start_block` claims the emphasis, returns `None`, and the style is dropped.
+- **`collect_inlines` takes an explicit `consume_end`.** It stops at the *first* `End` it sees. A
+  block caller wants that consumed; a list-item caller must not, because the event it stops on is
+  the item's own `End` and the enclosing list is what has to see it. Get this wrong and the next
+  item is silently swallowed. `transparent` covers the same problem one level down for links and
+  images, whose `End` must not end the surrounding sentence.
 - `std::env::set_var` is `unsafe` on edition 2024 and racy under `cargo test`'s threads. To test
   env-dependent behaviour, extract a pure function taking the value as a parameter, or set the
   variable on the *process* from the shell in a manual test.
@@ -146,6 +169,10 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   yet applied by the loop.
 - The provider is only smoke-tested against a stub server. There is no recorded provider fixture
   suite yet (SDD §8).
+- **The markdown renderer is verified by unit tests and one manual pty pass, not fixtures.** Column
+  widths are measured with `chars().count()`, so CJK and emoji will be misaligned in tables. A
+  `unicode-width` dependency would fix it and would cost binary size; it is a deliberate deferral,
+  not an oversight.
 
 ## `SDD.md` is the source of truth
 

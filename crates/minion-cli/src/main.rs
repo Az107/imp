@@ -3,6 +3,7 @@
 mod approval;
 mod cli;
 mod init;
+mod markdown;
 mod render;
 mod repl;
 mod run;
