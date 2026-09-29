@@ -12,6 +12,7 @@ use minion_core::error::{Error, Result};
 use minion_core::message::{Message, Role};
 use rusqlite::{Connection, OptionalExtension};
 
+pub mod approvals;
 pub mod migrate;
 
 pub use migrate::SCHEMA_VERSION;

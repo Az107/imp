@@ -6,16 +6,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use minion_core::agent::AgentOptions;
-use minion_core::config::Config;
+use minion_core::config::{Config, Decision};
 use minion_core::error::{Error, Result};
 use minion_core::message::{Message, Role};
+use minion_core::policy::PolicyEngine;
 use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
 use minion_core::{Agent, new_session_id};
 use minion_provider::OpenAiProvider;
 use minion_store::{NewSession, SessionRow, Store};
-use minion_tools::default_registry;
+use minion_tools::{ToolConfig, default_registry};
 
+use crate::approval;
 use crate::cli::Cli;
 
 /// Everything one interactive or one-shot run needs.
@@ -39,6 +41,8 @@ pub struct Session {
     pub history_window: usize,
     /// Retained so the provider can be rebuilt when the conversation changes.
     spec: ProviderSpec,
+    /// The approval gate, shared so session-scoped allows accumulate.
+    gate: Arc<PolicyEngine>,
 }
 
 /// The parameters a provider was built from, kept to rebuild it later.
@@ -70,6 +74,7 @@ impl Session {
             self.tools.clone(),
             self.options.clone(),
         )
+        .with_gate(self.gate.clone())
     }
 
     /// Point this session at a different conversation.
@@ -149,7 +154,7 @@ pub async fn build(
     };
 
     let workspace_root = config.workspace_root(cwd)?;
-    let tools = Arc::new(default_registry(config.workspace.max_file_bytes));
+    let tools = Arc::new(default_registry(&tool_config(config)));
     let system = Message::system(system_prompt(config, &workspace_root, &tools));
 
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
@@ -202,23 +207,19 @@ pub async fn build(
         workspace_root: workspace_root.clone(),
     };
 
-    if resume.is_none() {
-        let session = Session {
-            provider,
-            tools,
-            options,
-            history,
-            workspace_root,
-            session_id,
-            store,
-            history_window,
-            spec,
-        };
-        session.persist_all().await?;
-        return Ok(session);
-    }
+    // Whether anyone can answer a prompt. `--yes` forces the permissive path;
+    // a non-TTY still cannot be prompted, so it falls back to `noninteractive`.
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let gate = build_gate(
+        config,
+        &store,
+        &workspace_root.display().to_string(),
+        tty,
+        cli.yes,
+        cli.deny,
+    );
 
-    Ok(Session {
+    let session = Session {
         provider,
         tools,
         options,
@@ -228,7 +229,80 @@ pub async fn build(
         store,
         history_window,
         spec,
-    })
+        gate,
+    };
+    if resume.is_none() {
+        session.persist_all().await?;
+    }
+    Ok(session)
+}
+
+/// The `[workspace]` and `[exec]` values that shape the tool set.
+fn tool_config(config: &Config) -> ToolConfig {
+    ToolConfig {
+        max_file_bytes: config.workspace.max_file_bytes,
+        shell: config.exec.shell.clone(),
+        default_timeout: Duration::from_secs(config.exec.default_timeout_secs),
+        max_timeout: Duration::from_secs(config.exec.max_timeout_secs),
+        output_cap_bytes: config.exec.output_cap_bytes,
+    }
+}
+
+/// The approval gate, wired from the policy config and the store.
+///
+/// `--yes` replaces the default decision rather than the whole engine, so deny
+/// rules and the command classifier keep applying: it means "do not ask me",
+/// not "do whatever you like".
+fn build_gate(
+    config: &Config,
+    store: &Arc<Store>,
+    scope: &str,
+    tty: bool,
+    yes: bool,
+    deny: bool,
+) -> Arc<PolicyEngine> {
+    let allow = config
+        .policy
+        .allow
+        .iter()
+        .map(|rule| (rule.tool.clone(), rule.pattern.clone()))
+        .collect();
+    let deny_rules = config
+        .policy
+        .deny
+        .iter()
+        .map(|rule| (rule.tool.clone(), rule.pattern.clone()))
+        .collect();
+
+    let default = if deny {
+        Decision::Deny
+    } else if yes {
+        Decision::Auto
+    } else {
+        config.policy.default
+    };
+    // A flag cannot conjure a prompt, so a non-TTY stays fail-closed unless
+    // the user explicitly passed --yes.
+    let noninteractive = if yes {
+        Decision::Auto
+    } else if deny {
+        Decision::Deny
+    } else {
+        config.policy.noninteractive
+    };
+
+    Arc::new(
+        PolicyEngine::new(
+            allow,
+            deny_rules,
+            default,
+            noninteractive,
+            scope.to_string(),
+            tty,
+        )
+        .with_ui(approval::ui_for(tty))
+        .with_store(store.approvals()),
+    )
 }
 
 /// The system prompt: persona plus a digest of what the agent is allowed to do.
@@ -362,6 +436,10 @@ mod tests {
         Config::default()
     }
 
+    fn tools() -> ToolRegistry {
+        default_registry(&tool_config(&Config::default()))
+    }
+
     fn conversation() -> Vec<Message> {
         vec![
             Message::system("sys"),
@@ -376,7 +454,7 @@ mod tests {
 
     #[test]
     fn prompt_states_the_workspace_and_every_tool() {
-        let tools = default_registry(1024);
+        let tools = tools();
         let prompt = system_prompt(&config(), Path::new("/tmp/ws"), &tools);
 
         assert!(prompt.contains("/tmp/ws"));
@@ -391,7 +469,7 @@ mod tests {
             pattern: "*sudo*".to_string(),
         });
 
-        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &default_registry(1024));
+        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools());
 
         assert!(prompt.contains("Always refused"));
         assert!(prompt.contains("*sudo*"));
@@ -402,7 +480,7 @@ mod tests {
         let mut config = config();
         config.agent.system_prompt_file = Some("/nonexistent/persona.md".to_string());
 
-        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &default_registry(1024));
+        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools());
 
         assert!(prompt.contains("minion"));
     }

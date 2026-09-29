@@ -32,6 +32,15 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub cwd: Option<PathBuf>,
 
+    /// Assume consent for anything policy would otherwise ask about, and never
+    /// prompt. Dangerous: it also means a non-interactive run may execute.
+    #[arg(long, global = true)]
+    pub yes: bool,
+
+    /// Refuse anything not explicitly allowlisted, prompting never.
+    #[arg(long, global = true, conflicts_with = "yes")]
+    pub deny: bool,
+
     /// Emit newline-delimited JSON events instead of prose.
     #[arg(long, global = true)]
     pub json: bool,

@@ -2,10 +2,10 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0, M0.5 and M1 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0 through M2 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
-agent loop, `read_file`, one-shot `run`, the REPL, `minion init`, and a SQLite store with resumable
-sessions. Branch is `main`.
+agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
+sessions, and `minion init`. Branch is `main`.
 
 `minion-cron` and `minion-mcp` are **empty stubs** for M4–M6. Their manifests list real dependencies
 (`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs`,
@@ -47,9 +47,10 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 ## Invariants that must not be relaxed
 
-- **Only read-only tools are registered.** `default_registry()` in `minion-tools` registers just
-  `read_file`. Do not add a `Write`/`Execute` tool (`write_file`, `run_command`) before the approval
-  engine exists — an unguarded write tool violates the fail-closed rule in the SDD.
+- **Every `Write` and `Execute` tool must go through the gate.** `default_registry()` now registers
+  `read_file`, `edit_file`, `apply_patch`, `write_file`, and `run_command`, and `setup::build_gate`
+  attaches a `PolicyEngine` to the agent. A registry built without a gate is only safe for read-only
+  use — if you add a tool, confirm the gate is wired, not that the tool "seems harmless".
 - Approval is fail-closed: non-TTY never prompts and defaults to `deny`; deny rules always beat
   allowlists.
 - The MCP server is read-only by default. `expose_exec`/`expose_write` stay `false`; `run_command`
@@ -100,6 +101,22 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   env-dependent behaviour, extract a pure function taking the value as a parameter, or set the
   variable on the *process* from the shell in a manual test.
 
+## Policy rules
+
+- **Rule order in `PolicyEngine::check` is the security property.** Deny → allow → classifier →
+  non-interactive → ReadOnly → default. Reordering lets a later rule skip an earlier refusal.
+- **`policy.default = "auto"` does not silence the classifier.** `rm -rf`, `sudo`, and `curl | sh`
+  always prompt. That is the whole reason the classifier exists.
+- **Allowlist patterns are anchored at the start and exact unless they end in `*`.** `pattern = "echo"`
+  matches only the bare command `echo`; `pattern = "echo *"` matches any echo. It fails closed, so
+  a mistake is a refusal, never a leak.
+- **`--yes` replaces the *default decision*, not the engine.** Deny rules and the classifier still
+  apply, and a non-TTY still cannot prompt.
+- **Persisted allows store the verb**, not the whole command, so approving one `cargo build` does
+  not approve every `cargo` invocation.
+- The approval prompt matches exact input only. First-character matching used to turn `sure` into
+  session scope; keep the strict match.
+
 ## Store rules
 
 - **Migrations are a forward-only list.** Append a new `&str` to `MIGRATIONS`; never edit an applied
@@ -120,6 +137,9 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 - The CLI has `run`, `init`, `session`, and the default REPL. There is still no `doctor`, `cron`,
   `mcp`, or `config` subcommand, so §5.12's CLI surface is only partly built.
+- **The interactive approval keystroke path is not machine-tested.** The prompt renders correctly and
+  `parse_choice` plus all four engine outcomes are unit-tested, but a pty harness kept
+  desynchronising, so no test drives a real keypress end to end. Treat it as unverified.
 - Tool calls execute **sequentially**; bounded concurrency is tracked as `FR-8` in `agent.rs`.
 - `usage` is advisory and may be zero; no turn is blocked on it.
 - History trimming / summarization (`history_window`, `summarize_on_truncate`) is configured but not

@@ -149,6 +149,8 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 | FR-38 | Arbitrary extra headers for the provider are configurable under `[provider.headers]`, and `init --header` records them |
 | FR-39 | A header value may reference `${session}`, expanded to the stable per-conversation id so gateways can pin routing and reuse prompt caches |
 | FR-40 | An empty `provider.api_key_env` *and* an empty `provider.api_key_file` means the backend needs no credentials, and no `Authorization` header is sent |
+| FR-41 | `apply_patch` applies a set of anchored operations across one or more files atomically, failing the whole patch if any operation is ambiguous or absent |
+| FR-42 | A file-writing or command-executing tool never runs without a resolved decision; a denied or unattributable call returns an error to the model instead of executing |
 
 ### 2.2 Non-functional requirements
 
@@ -621,12 +623,13 @@ Invariants enforced by the registry, not by individual tools:
 | Field | Spec |
 |---|---|
 | Risk | Execute |
-| Params | `command: string` (required), `cwd?: string`, `timeout_ms?: int`, `stdin?: string`, `env?: map` (allowlisted keys only) |
+| Params | `command: string` (required), `cwd?: string`, `timeout_ms?: int`, `stdin?: string` |
 | Execution | `<shell> -c <command>` (or `-lc` if `login_shell`); new process group so the whole tree can be killed |
 | Returns | `{ exit_code, stdout, stderr, duration_ms, truncated }` |
-| Caps | `output_cap_bytes` per stream; `max_timeout_secs` |
+| Caps | `output_cap_bytes` per stream; `max_timeout_secs` clamps whatever the model asks for |
 | Kill | On timeout or cancel: `SIGTERM` to the process group, then `SIGKILL` after 5 s |
-| Approval | Always at least `ask` unless an allowlist pattern matches |
+| Env | Not settable by the model. A free-form `env` map is a way to smuggle values into a child; a fixed allowlist can come later if something needs it. |
+| Approval | At least `ask` unless an allowlist pattern matches. Destructive, privileged, and network-pipe commands stay at `ask` even when `policy.default = "auto"`. |
 | Notes | Streaming output options: `--stream` shows live output to stderr without entering model context |
 
 #### `read_file` / `write_file` / `edit_file`
@@ -640,6 +643,48 @@ Invariants enforced by the registry, not by individual tools:
 | `edit_file` | Params `path`, `old_string`, `new_string`, `replace_all?: bool`; exact-match, must be unique unless `replace_all`; returns a unified diff |
 | Atomicity | Write to temp file in the same directory, `fsync`, then `rename` |
 | Approval | Writes `ask` by default; in-workspace writes may be allowlisted |
+
+#### `apply_patch`
+
+`edit_file` asks the model to reproduce one small snippet verbatim. For a change spread over several
+sites, or across several files, that is both verbose and the most common way a model goes wrong. So
+`apply_patch` exists alongside it: a set of *anchored operations* applied in one atomic call.
+
+The format is structured JSON rather than a textual diff, so every operation is self-describing and
+failures are exact instead of "patch did not apply":
+
+```json
+{
+  "files": [
+    {
+      "path": "src/store.rs",
+      "operations": [
+        { "op": "replace",       "old": "let x = 1;", "new": "let x = 2;" },
+        { "op": "insert_before", "anchor": "fn main() {", "new": "    setup()?;\n" },
+        { "op": "insert_after",  "anchor": "use std::io;", "new": "use std::path::Path;" },
+        { "op": "delete",        "old": "    // TODO: remove\n" }
+      ]
+    },
+    { "path": "tests/store.rs", "operations": [ ... ] }
+  ]
+}
+```
+
+| Rule | Behaviour |
+|---|---|
+| Anchor | The operation's `old`/`anchor` snippet must match **exactly once**. A unique anchor is required; guessing between several matches is how a patch corrupts a file. |
+| `count` | Optional. When given, the snippet must match exactly `count` times and all are replaced. Any other number is an error. |
+| `replace` | Swap `old` for `new`. |
+| `insert_before` / `insert_after` | Insert `new` relative to a unique anchor. |
+| `delete` | Remove `old`. |
+| Atomicity | Every operation is computed against the original text, and files are written only if **all** operations across **all** files succeed. A failure in operation 3 of 5 leaves every file untouched. |
+| Ordering | Operations apply in order to the accumulating result, so a later operation may anchor on text an earlier one inserted. |
+| Existence | Target files must already exist; creating a file is `write_file`'s job. |
+| Guards | Same path guard and `max_file_bytes` cap as `write_file`. |
+| Returns | A unified diff per file, plus the count of operations applied. |
+| Approval | `Write`. One approval covers the whole patch, not one per operation. |
+
+`edit_file` is retained: for a one-line change it is a smaller, less error-prone request than a patch.
 
 #### `cron_add` / `cron_list` / `cron_remove`
 
@@ -1065,8 +1110,8 @@ For each capability, an operator should be able to answer "who can trigger this?
 | M0 — Skeleton | done | Workspace, config loading, provider client, `run` one-shot | A prompt returns streamed text from a compatible endpoint |
 | M0.5 — Provider init | done | `minion init` wizard, presets, `/models` discovery, `--check`, `--project`/`--force`, `--header`, session-id headers | A fresh machine reaches a working config in one command, an existing config is never clobbered, and a gateway requiring `${session}` headers works unmodified |
 | M1 — Session core | done | Store, migrations, sessions/messages, REPL with streaming | `/resume` restores a conversation |
-| M2 — Tools + policy | next | Registry, `read_file`/`write_file`/`edit_file`, `run_command`, approval engine, allowlist | A risky command cannot run without consent |
-| M3 — Memory + HTTP | | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
+| M2 — Tools + policy | done | Registry, `read_file`/`write_file`/`edit_file`, `run_command`, approval engine, allowlist | A risky command cannot run without consent |
+| M3 — Memory + HTTP | next | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
 | M4 — Cron | | Scheduler, job CRUD, run history, catch-up | A weekly job fires on a virtual clock test |
 | M5 — MCP client | | External servers, namespaced tools, per-server policy | External tool callable with approval |
 | M6 — MCP server | | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
@@ -1090,7 +1135,9 @@ For each capability, an operator should be able to answer "who can trigger this?
 **Open questions for review:**
 1. Should `http_fetch` support an explicit `http://` for local dev servers via a named allowlist entry, or require HTTPS unconditionally?
 2. Should job prompts be able to opt into the interactive policy when minion is attached to a TTY, or always fail closed?
-3. Is `edit_file`'s exact-match semantics sufficient, or is a patch-based `apply_patch` tool wanted for large edits?
+3. ~~Is `edit_file`'s exact-match semantics sufficient, or is a patch-based tool wanted for large
+   edits?~~ **Resolved — both are provided.** `edit_file` stays for a single surgical replacement;
+   `apply_patch` handles multi-site and multi-file edits in one atomic call. See §5.5 and D13.
 4. Should memory be scoped per-workspace (proposed) or global with a namespace parameter?
 
 ---
@@ -1166,3 +1213,4 @@ than editing individual tools.
 | D10 | One generic `[provider.headers]` table with a `${session}` placeholder, instead of a built-in OpenCode-Go-specific header | Any gateway requirement is expressible in config; no provider-specific branches in the client. The placeholder is the only way an id can reach a header, so a stable per-conversation id cannot be accidentally re-generated per request |
 | D11 | The API key is collected by prompt and stored in a separate `0600` credentials file, while the config keeps the `api_key_env` path | Removes the "find a variable name and export it yourself" step, which was the whole friction of the old flow, without putting a secret in a file people commit. A `netrc`/AWS-CLI style split: portable config, local secret. Resolution order keeps env var → file so a shell or CI job can still override |
 | D12 | Terminal echo is disabled before the prompt is printed rather than by the library that reads the secret | `rpassword`-style helpers print first and disable second, which leaves a window where a pasted key is echoed into scrollback. Owning the termios guard is ~20 lines and closes it; `--no-store-token` keeps an escape hatch for anyone who does not want a secret on disk at all |
+| D13 | `apply_patch` takes structured JSON operations, and sits *alongside* `edit_file` rather than replacing it | Anchored operations are unambiguous: "anchor matched 2 times" is an exact, actionable error, where a fuzzy hunk match silently edits the wrong lines. `edit_file` stays because for a one-line change it is the smaller, less failure-prone request |

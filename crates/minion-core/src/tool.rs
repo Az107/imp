@@ -160,6 +160,14 @@ pub trait Tool: Send + Sync {
     fn schema(&self) -> serde_json::Value;
     /// How dangerous this tool is.
     fn risk(&self) -> Risk;
+    /// What allow and deny rules are matched against, usually the path or
+    /// command. `None` falls back to a value derived from the arguments.
+    ///
+    /// This is the only place a tool influences policy, and it chooses the
+    /// *subject* of a match rather than the outcome.
+    fn approval_subject(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
     /// Wall-clock budget for a single invocation.
     fn timeout(&self) -> Duration {
         Duration::from_secs(30)

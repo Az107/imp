@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 use crate::message::{FunctionCall, Message, ToolCall};
+use crate::policy::ToolGate;
 use crate::provider::{ChatEvent, ChatRequest, Provider, Usage};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 
@@ -100,6 +101,7 @@ pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
     options: AgentOptions,
+    gate: Option<Arc<dyn ToolGate>>,
 }
 
 impl Agent {
@@ -113,7 +115,17 @@ impl Agent {
             provider,
             tools,
             options,
+            gate: None,
         }
+    }
+
+    /// Install the approval gate every tool call must pass.
+    ///
+    /// Without one, `Write` and `Execute` tools run unchecked, so any caller
+    /// registering them is expected to set this.
+    pub fn with_gate(mut self, gate: Arc<dyn ToolGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Tools advertised to the model.
@@ -264,6 +276,14 @@ impl Agent {
                 message: err.to_string(),
             })?
         };
+
+        // Ask before running, and before spending the timeout budget. A refusal
+        // surfaces to the model as a tool error it can read and react to.
+        if let Some(gate) = &self.gate {
+            let subject = tool.approval_subject(&args);
+            gate.check(name, tool.risk(), &args, subject.as_deref())
+                .await?;
+        }
 
         let ctx = ToolCtx {
             workspace_root: self.options.workspace_root.clone(),

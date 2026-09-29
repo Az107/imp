@@ -1,5 +1,6 @@
 //! `minion`: a minimal, Unix-native AI agent harness.
 
+mod approval;
 mod cli;
 mod init;
 mod render;

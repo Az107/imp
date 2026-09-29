@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
 chrono = { version = "0.4.45", features = ["serde"] }
 minion-core = { version = "0.1.0", path = "../minion-core" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
