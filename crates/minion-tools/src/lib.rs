@@ -5,26 +5,33 @@
 //! A tool is only registered here once that gate exists, so nothing unguarded
 //! can be reached from a model.
 
+pub mod memory;
 pub mod patch;
 pub mod read_file;
 pub mod run_command;
 pub mod write_file;
 
+pub use memory::{Recall, Remember};
 pub use patch::{ApplyPatch, EditFile, Operation};
 pub use read_file::ReadFile;
 pub use run_command::RunCommand;
 pub use write_file::WriteFile;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use minion_core::tool::ToolRegistry;
+use minion_store::Store;
 
 /// Register the tools available at this milestone.
 ///
 /// Every `Write` and `Execute` tool here requires a gate; see
 /// [`minion_core::PolicyEngine`]. A registry built without one is only safe for
 /// read-only use.
-pub fn default_registry(config: &ToolConfig) -> ToolRegistry {
+///
+/// `store` backs the memory tools. It is the same handle the session persists
+/// through, so a fact written by a tool is in the transcript's database.
+pub fn default_registry(config: &ToolConfig, store: Arc<Store>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFile::new(config.max_file_bytes));
     registry.register(EditFile::new(config.max_file_bytes));
@@ -36,6 +43,8 @@ pub fn default_registry(config: &ToolConfig) -> ToolRegistry {
         config.max_timeout,
         config.output_cap_bytes,
     ));
+    registry.register(Remember::new(store.clone()));
+    registry.register(Recall::new(store));
     registry
 }
 

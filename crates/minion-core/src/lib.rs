@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod fs;
 pub mod glob;
+pub mod memory;
 pub mod message;
 pub mod policy;
 pub mod provider;
@@ -21,6 +22,7 @@ pub use config::{Config, Credentials};
 pub use error::{Error, Result};
 pub use fs::write_private_file;
 pub use glob::glob_match;
+pub use memory::namespace_for;
 pub use message::{Message, Role, ToolCall};
 pub use policy::{
     ApprovalChoice, ApprovalRequest, ApprovalStore, ApprovalUi, PolicyEngine, ToolGate,

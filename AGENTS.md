@@ -7,9 +7,20 @@ credential resolution, an OpenAI-compatible streaming provider with `${session}`
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
 sessions, and `minion init`. Branch is `main`.
 
+**M3 is half done — memory only.** `remember`/`recall` are built, registered, and tested: the store
+upsert and FTS query in `minion-store/src/memory.rs`, the tools in
+`minion-tools/src/memory.rs`, and the namespace helper in `minion-core/src/memory.rs`. `http_fetch`
+and the SSRF guard are **not started**, so M3 is not finished and the milestone table in `SDD.md`
+still correctly reads "next". The `[http_fetch]` config section does not exist yet either.
+
 `minion-cron` and `minion-mcp` are **empty stubs** for M4–M6. Their manifests list real dependencies
-(`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs`,
-`memory` and `audit_log` tables exist in the schema but nothing writes to them until M3/M4.
+(`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs` and
+`audit_log` tables exist in the schema but nothing writes to them until M4. The `memory` table is now
+written and read.
+
+`default_registry` takes a second argument, an `Arc<Store>`, because the memory tools need one. This
+is why `minion-tools` depends on `minion-store`; the store is opened *before* the registry in
+`setup::build` so the system prompt can still be built from the finished tool list.
 
 Assistant text is rendered as markdown on a terminal (`crates/minion-cli/src/markdown.rs`):
 headings, emphasis, code, lists, quotes, rules, and pipe tables. It is rendered per block, so
@@ -18,14 +29,20 @@ nothing already on screen is ever revised.
 ## Commands
 
 ```sh
-cargo build                       # whole workspace
-cargo test --workspace             # all tests; offline, no network, no API key needed
-cargo test -p minion-core          # one crate
-cargo test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
-cargo clippy --all-targets -- -D warnings    # lint gate; currently clean
-cargo fmt --all
+cargo +1.89.0 build                # whole workspace
+cargo +1.89.0 test --workspace     # all tests; offline, no network, no API key needed
+cargo +1.89.0 test -p minion-core   # one crate
+cargo +1.89.0 test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
+cargo +1.89.0 clippy --all-targets -- -D warnings    # lint gate; currently clean
+cargo +1.89.0 fmt --all
 ./target/debug/minion --help
 ```
+
+**Invoke cargo as `cargo +1.89.0`.** The installed `default` toolchain on this machine is 1.88.0,
+which is below the workspace's `rust-version = "1.89"` and cannot build it at all — cargo refuses
+before compiling a crate. 1.89.0 is installed as a side toolchain rather than as `default`, so
+other projects keep the version they expect. If `rustup default 1.89.0` is ever set, the `+1.89.0`
+prefix becomes redundant but stays harmless.
 
 Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 (`if let Some(x) = a && let Ok(y) = b`), which need edition 2024.
@@ -128,6 +145,15 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 - **Rule order in `PolicyEngine::check` is the security property.** Deny → allow → classifier →
   non-interactive → ReadOnly → default. Reordering lets a later rule skip an earlier refusal.
+- **The non-interactive rule sits *above* the ReadOnly short-circuit, which contradicts SDD §5.6.**
+  The spec lists `tool.risk == ReadOnly → Auto` before `!stdin.is_tty()`, so a read-only call ought
+  to be allowed unattended; the implementation refuses it under the default
+  `noninteractive = "deny"`. Consequence: `minion run "..."` on a piped, non-TTY stdin cannot read
+  a file, write, or recall anything without `--yes` or an allowlist entry. This is **pre-existing**
+  (`read_file` is affected identically) and untriaged — `a_read_only_tool_follows_the_same_rule_as_
+  read_file` in `crates/minion-cli/tests/memory_gate.rs` pins the current behaviour rather than
+  asserting it is correct. Reordering is a change to the engine's security property, so it needs a
+  deliberate decision and a decision-log entry, not a drive-by fix.
 - **`policy.default = "auto"` does not silence the classifier.** `rm -rf`, `sudo`, and `curl | sh`
   always prompt. That is the whole reason the classifier exists.
 - **Allowlist patterns are anchored at the start and exact unless they end in `*`.** `pattern = "echo"`
@@ -139,6 +165,27 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   not approve every `cargo` invocation.
 - The approval prompt matches exact input only. First-character matching used to turn `sure` into
   session scope; keep the strict match.
+
+## Memory rules
+
+- **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and
+  FTS5 reads a bareword `OR`/`AND`/`NOT` as an operator. Unquoted, a query like `alpha OR beta`
+  silently *widens* from "both words" to "either word" and returns rows the caller never asked for.
+  `search_terms` reduces each word to alphanumerics and wraps it in quotes; the phrases are then
+  implicitly `AND`ed. Don't "simplify" that away.
+- **A `Transaction` must be committed explicitly** — it rolls back on drop. Omitting the `commit()`
+  after an upsert makes `remember` report success while `recall` matches nothing, which is exactly
+  the silent failure the FTS triggers exist to prevent. `crates/minion-cli/tests/memory_gate.rs`
+  and the store tests catch this; if you touch the write path, expect them to fail first.
+- **The namespace is a hash, not a path.** `namespace_for` uses FNV-1a rather than a digest
+  dependency, and `the_label_is_sixteen_hex_digits` pins the algorithm. A test asserts known
+  constants on purpose: if the hash changes, every workspace's memory becomes unreachable.
+  Canonicalize the root before hashing, or `/ws` and `/ws/` become two namespaces.
+- **A no-match `recall` is a plain answer, not a tool error.** The model asks vague questions; an
+  error there reads as a broken tool. Same for a query with nothing searchable in it.
+- `remember` is `Risk::Write` even though it cannot touch the workspace. The class describes what
+  changes, and that is what puts it behind the gate. `crates/minion-cli/tests/memory_gate.rs`
+  asserts a denied `remember` leaves the database untouched.
 
 ## Store rules
 

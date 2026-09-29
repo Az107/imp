@@ -154,11 +154,15 @@ pub async fn build(
     };
 
     let workspace_root = config.workspace_root(cwd)?;
-    let tools = Arc::new(default_registry(&tool_config(config)));
-    let system = Message::system(system_prompt(config, &workspace_root, &tools));
 
+    // The store is opened before the registry because the memory tools need a
+    // handle on it, and the system prompt advertises the registered tools, so
+    // the order is store -> tools -> prompt.
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let store = Arc::new(Store::open(&database).await?);
+
+    let tools = Arc::new(default_registry(&tool_config(config), store.clone()));
+    let system = Message::system(system_prompt(config, &workspace_root, &tools));
 
     let (session_id, mut history) = match resume {
         Some(id) => {
@@ -436,8 +440,11 @@ mod tests {
         Config::default()
     }
 
-    fn tools() -> ToolRegistry {
-        default_registry(&tool_config(&Config::default()))
+    /// The prompt only reads tool names and descriptions, so a registry over a
+    /// throwaway in-memory store is enough. Async because opening the store is.
+    async fn tools() -> ToolRegistry {
+        let store = Arc::new(Store::open_in_memory().await.expect("in-memory store"));
+        default_registry(&tool_config(&Config::default()), store)
     }
 
     fn conversation() -> Vec<Message> {
@@ -452,35 +459,39 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn prompt_states_the_workspace_and_every_tool() {
-        let tools = tools();
+    #[tokio::test]
+    async fn prompt_states_the_workspace_and_every_tool() {
+        let tools = tools().await;
         let prompt = system_prompt(&config(), Path::new("/tmp/ws"), &tools);
 
         assert!(prompt.contains("/tmp/ws"));
         assert!(prompt.contains("read_file"));
+        assert!(
+            prompt.contains("remember") && prompt.contains("recall"),
+            "the memory tools are registered, so the prompt must advertise them"
+        );
     }
 
-    #[test]
-    fn prompt_surfaces_deny_rules() {
+    #[tokio::test]
+    async fn prompt_surfaces_deny_rules() {
         let mut config = config();
         config.policy.deny.push(minion_core::config::DenyRule {
             tool: "run_command".to_string(),
             pattern: "*sudo*".to_string(),
         });
 
-        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools());
+        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools().await);
 
         assert!(prompt.contains("Always refused"));
         assert!(prompt.contains("*sudo*"));
     }
 
-    #[test]
-    fn a_missing_prompt_file_falls_back_instead_of_failing() {
+    #[tokio::test]
+    async fn a_missing_prompt_file_falls_back_instead_of_failing() {
         let mut config = config();
         config.agent.system_prompt_file = Some("/nonexistent/persona.md".to_string());
 
-        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools());
+        let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools().await);
 
         assert!(prompt.contains("minion"));
     }

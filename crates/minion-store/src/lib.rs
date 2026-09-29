@@ -13,8 +13,10 @@ use minion_core::message::{Message, Role};
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod approvals;
+pub mod memory;
 pub mod migrate;
 
+pub use memory::{MemoryEntry, Written};
 pub use migrate::SCHEMA_VERSION;
 
 /// A session as stored.
