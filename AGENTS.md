@@ -204,6 +204,12 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 - The CLI has `run`, `init`, `session`, and the default REPL. There is still no `doctor`, `cron`,
   `mcp`, or `config` subcommand, so §5.12's CLI surface is only partly built.
+- **M3.5 (the System One guard, D16) is specified but not written.** `SDD.md` has FR-43–FR-47,
+  the D16 entry, a T14 threat row and an R9 risk row for it, and no code exists. If you are reading
+  this expecting a `[guard]` block in `config.rs` or a `minion-guard` crate, neither is there. The
+  design constraints that matter when it gets written: the guard may only narrow prompts, never
+  widen permissions; `privilege`/`remote-execution`/`destructive` never reach the model; every
+  failure path resolves to the existing prompt; only the command string is sent as `state`.
 - **The interactive approval keystroke path is not machine-tested.** The prompt renders correctly and
   `parse_choice` plus all four engine outcomes are unit-tested, but a pty harness kept
   desynchronising, so no test drives a real keypress end to end. Treat it as unverified.

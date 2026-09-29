@@ -111,6 +111,11 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 | FR-15 | Interactive approval prompt with one-shot, session, and persistent allowlist options |
 | FR-16 | Persistent allowlist entries are scoped (tool + pattern + workspace) and revocable |
 | FR-17 | Non-interactive mode never prompts: config decides, default `deny` for side effects |
+| FR-43 | Optional System One guard (`POST {base}/v1/systemone`) may resolve a flagged `run_command` prompt when the category is eligible and the model is confident; it may never widen what the static rules allow |
+| FR-44 | Guard eligibility is a floor: `privilege`, `remote-execution` and `destructive` never reach the model and always prompt |
+| FR-45 | Every guard failure — network, timeout, rate limit, unparseable body, withdrawn model — falls back to prompting, never to allowing |
+| FR-46 | Only the command string is sent as System One `state`; the transcript, tool output and file contents are never included |
+| FR-47 | Two thresholds with a human in the middle: a verdict above `deny_threshold` or between the thresholds prompts; only at or below `allow_threshold` resolves silently, and every verdict is audited |
 
 **Cron**
 
@@ -743,6 +748,18 @@ otherwise                  → policy.default
 gated with `Execute`/`Write` rather than with `ReadOnly`, because the request leaves the machine and
 can be induced by untrusted content. See D15.
 
+**Optional System One guard (M3.5, D16).** When `[guard].enabled` is set and a flagged `run_command`
+falls in an eligible category, the engine may consult a `/v1/systemone` model before deciding to
+prompt. It sits between rule 3 and rule 4 and can only convert a prompt into a silent allow:
+
+```
+classifier flags an ineligible category   → Ask, with no network call
+classifier flags an eligible category    → guard; allow at/below allow_threshold, else Ask
+```
+
+Deny rules and allowlists are unaffected and still run first, and a guard error resolves to `Ask`
+rather than `Ok`. FR-43 through FR-47 are the normative statement.
+
 Deny rules always win; an explicit deny cannot be allowlisted away at runtime.
 
 Interactive prompt:
@@ -1053,6 +1070,7 @@ API keys; filesystem contents; shell access; the SQLite store (may contain sensi
 | ID | Threat | Mitigation |
 |---|---|---|
 | T1 | Prompt injection in fetched content drives `run_command` | Approval gate + risk classifier + never auto-`--yes` in a TTY; fetched content is tagged as untrusted in the system prompt |
+| T14 | The System One guard is steered by the same injected content it exists to catch | The guard may only narrow prompts, never widen permissions (FR-43); the static category list is a floor the model cannot cross (FR-44), so an ineligible command is never sent at all; `state` is the command string alone (FR-46); every failure falls back to prompting (FR-45) |
 | T2 | Path traversal / symlink escape | Canonicalize and prefix-check against workspace roots; `follow_symlinks = false`; re-check after open where feasible |
 | T3 | SSRF via `http_fetch` | Domain allowlist, private-IP block, no cross-domain redirects, response cap, scheme restriction |
 | T4 | Secret exfiltration via tools or logs | Keys never in the model context unless a tool explicitly returns them; env redaction in logs; audit stores digests |
@@ -1121,6 +1139,7 @@ For each capability, an operator should be able to answer "who can trigger this?
 | M1 — Session core | done | Store, migrations, sessions/messages, REPL with streaming | `/resume` restores a conversation |
 | M2 — Tools + policy | done | Registry, `read_file`/`write_file`/`edit_file`, `run_command`, approval engine, allowlist | A risky command cannot run without consent |
 | M3 — Memory + HTTP | next | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
+| M3.5 — System One guard | planned | Optional `/v1/systemone` judge for flagged `run_command`, two thresholds, category floor, audited verdicts | An ineligible command never reaches the model; every failure path prompts; a guard that returns `Err` cannot produce an allow |
 | M4 — Cron | | Scheduler, job CRUD, run history, catch-up | A weekly job fires on a virtual clock test |
 | M5 — MCP client | | External servers, namespaced tools, per-server policy | External tool callable with approval |
 | M6 — MCP server | | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
@@ -1133,6 +1152,7 @@ For each capability, an operator should be able to answer "who can trigger this?
 | ID | Risk / question | Proposed handling |
 |---|---|---|
 | R1 | Command risk classification will both over- and under-block | Keep the classifier small, documented, and testable; make it easy to override with allowlist entries; log every classification |
+| R9 | A model-based judge inherits the injection surface it guards (T14) | Treat the guard as a noise filter inside a boundary that static code drew without it: it resolves prompts, never permissions. Disabled by default, and a vendor-documented adversarial-content failure mode is assumed rather than disproved |
 | R2 | `run_command` is inherently unsandboxable in-process | Ship v1 with approval + allowlist; add optional `sandbox-exec`/`bwrap` execution mode later behind config |
 | R3 | History summarization can lose critical detail | Mark summaries explicitly; keep the full transcript in SQLite; allow `/compact off` |
 | R4 | Provider drift across OpenAI-compatible endpoints | Keep the client thin, expose quirk flags, and add a compatibility test matrix |
@@ -1231,3 +1251,4 @@ than editing individual tools.
 | D13 | `apply_patch` takes structured JSON operations, and sits *alongside* `edit_file` rather than replacing it | Anchored operations are unambiguous: "anchor matched 2 times" is an exact, actionable error, where a fuzzy hunk match silently edits the wrong lines. `edit_file` stays because for a one-line change it is the smaller, less failure-prone request |
 | D14 | Assistant text is rendered as markdown on a terminal, per block, with the parser from `pulldown-cmark` and the renderer written in-tree | A terminal has no font sizes, so hierarchy is bold plus a colour that steps with the heading level; the scrollback rule is kept by emitting whole blocks and never revising text already on screen, which streaming token-by-token cannot do for a table. Rendering only when stdout is a terminal keeps `minion run ... > out.md` yielding markdown rather than ASCII art, and the split of layout from colour means `NO_COLOR` still gets aligned tables. The renderer is ours so the output is exactly the intended one and the dependency stays a single parser, which is what keeps the binary inside NFR-3 |
 | D15 | The non-interactive rule governs tools that *change* something; `ReadOnly` is allowed unattended and `Network` counts as a change | §5.6 lists `ReadOnly → Auto` above the `!stdin.is_tty()` branch, but the implementation checked the TTY first, so with the default `noninteractive = "deny"` a read was refused whenever stdin was piped — which breaks the `minion run ... > out.md` invocation this document advertises, for `read_file` as much as for `recall`. A missing terminal says something about *consent*, and a read cannot consume consent it never asks for; what it genuinely blocks is an unattended mutation. `Network` is deliberately on the mutation side: the request leaves the machine and can be induced by untrusted content in a transcript, so `http_fetch` is gated like a write and still needs `--yes` or an allowlist entry in a pipe. Deny rules, allowlists and the classifier are untouched and still run first, so this widens nothing that was explicitly refused. Recorded because it touches the rule order that the invariants call a security property, even though it only restores what §5.6 already specified |
+| D16 | A System One model may resolve a flagged `run_command` prompt, but only for categories the static classifier found *reversible*; it can narrow prompts and never widen permissions | The static classifier cannot distinguish a plain `curl` from a `git push --force`: both are one tag, so both always ask. That is safe but noisy, and noise trains a user into approving without reading. A typed-probability model separates them — `POST {base}/v1/systemone` returns calibrated numbers rather than text, so the decision is a threshold applied in our code and cannot be talked into by a model that simply asserts it is safe. The model is explicitly *not* a new authority. TypeSafe's own notes for `jev-1.13` state that adversarial content in `state` "can move the answer", and the command being judged may itself have come from injected content (T1, T14), so the boundary is inverted: the heuristic category list is a floor that ineligible commands never cross, and the model only ever operates strictly inside it. `privilege`, `remote-execution` and `destructive` are resolved before any network call, so `sudo rm -rf /` has no code path to a model verdict. Two thresholds rather than one, because a single cut discards the middle band where a sceptical model is saying something worth hearing, and every failure — timeout, `429`, withdrawn free tier, unparseable body — falls back to the existing prompt. Only the command string is sent as `state`, both because the vendor documents context rot on unrelated detail and because a minimal `state` shrinks the injection surface. Disabled by default: it is a network call carrying command text to a third party, and it is opt-in until it has been seen behaving. Specified against the `/v1/systemone` protocol rather than one vendor, since Jev, Laya, Kev, Decider, Von and OpenThai-SystemOne all speak it and a client only changes `base_url` — noting that Laya's state budget is ~320–512 tokens against Jev's 32k and its `confidence` is computed differently, so thresholds do not transfer between them |
