@@ -192,8 +192,18 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   whatever policy says. `[policy.allow]` is what pre-approves, and `http_fetch` reports the URL
   *host* as its `approval_subject`, so an allow rule names a domain
   (`{ tool = "http_fetch", pattern = "docs.rs" }`). An allowlisted domain still prompts on a TTY and
-  is still refused in a pipe until it has a policy allow rule; neither list widens the other. See
-  D17.
+  is still refused in a pipe until it has a policy allow rule; neither list widens the other. This
+  is a deliberate deviation from §5.5's "`auto` if domain allowlisted" approval row — see D17, which
+  records it for the spec owner to confirm.
+- **`http` is granted only by an *exact* entry, never by a wildcard.** `https` is the default; a
+  plain `http://` URL is accepted only when an entry with no `*` names the host exactly
+  (`allowed_domains = ["localhost"]`), because §5.5 and §11.1 both say "explicitly allowlisted".
+  `local*` reaches `localhost` over https, not over http: a glob is a reachability rule, not a
+  waiver of the scheme. A test would not have caught this from an exact-entry case alone, which is
+  why `a_wildcard_entry_grants_https_but_never_plain_http` exists.
+- **Hosts are compared lowercased and with the IPv6 brackets stripped**, so an entry `::1` names
+  `http://[::1]/…`, which is how `Url::host_str` renders it. Both `host_allowed` and
+  `host_named_exactly` go through the same normalisation, so the two agree on what a host is.
 - **The guard fails closed.** An empty `allowed_domains` reaches nothing. `block_private_ips`
   defaults on and refuses private, loopback, link-local, unique-local, CGNAT, unspecified and
   multicast ranges, the cloud-metadata `169.254.169.254` included. Loopback is refused *even when the

@@ -256,7 +256,9 @@ pub struct DenyRule {
 pub struct HttpFetchConfig {
     /// Hosts the tool may reach, as exact names or globs (`*.example.com`).
     ///
-    /// Empty means nothing is fetchable: the guard fails closed.
+    /// A plain `http://` URL is granted only by an exact, non-glob entry — a
+    /// wildcard raises reachability, not the scheme (SDD §5.5, §11.1). Empty
+    /// means nothing is fetchable: the guard fails closed.
     pub allowed_domains: Vec<String>,
     /// Refuse a host that resolves to a private, loopback, link-local,
     /// unique-local or otherwise non-public address.

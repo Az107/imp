@@ -4,9 +4,9 @@
 //! checks stand between a model-supplied URL and a socket:
 //!
 //! 1. **Scheme and host.** The host must match `[http_fetch].allowed_domains`,
-//!    and `https` is required unless the host is allowlisted — `http` is the
-//!    exception a local dev server needs, and it is granted only by naming the
-//!    host (SDD §11.1).
+//!    and `https` is required unless the host is *named* by an exact entry —
+//!    `http` is the exception a local dev server needs, and it is granted only
+//!    by naming the host, never by a wildcard (SDD §5.5, §11.1).
 //! 2. **Address.** With `block_private_ips` on, every address the host resolves
 //!    to is rejected when it is private, loopback, link-local or otherwise
 //!    non-public, so `169.254.169.254` and the rest of the metadata surface
@@ -138,11 +138,24 @@ impl HttpFetch {
     /// sides. An entry without a wildcard is exact, so `example.com` does not
     /// admit `evil.example.com`; `*.example.com` does.
     fn host_allowed(&self, host: &str) -> bool {
-        let host = host.to_ascii_lowercase();
+        let host = normalize_host(host);
         self.allowed_domains.iter().any(|entry| {
             let pattern = entry.trim().to_ascii_lowercase();
             !pattern.is_empty() && glob_match(&pattern, &host)
         })
+    }
+
+    /// Whether `host` is *named* by an entry, with no wildcard.
+    ///
+    /// This is the stricter test the scheme check asks for: a glob says a host
+    /// is reachable, it does not name one. `http` is granted only to a host an
+    /// exact entry names (SDD §5.5, §11.1), so `local*` admits `https` for
+    /// `localhost` but never plain `http`.
+    fn host_named_exactly(&self, host: &str) -> bool {
+        let host = normalize_host(host);
+        self.allowed_domains
+            .iter()
+            .any(|entry| !entry.contains('*') && entry.trim().to_ascii_lowercase() == host)
     }
 
     /// Scheme and host, without touching the network.
@@ -156,9 +169,16 @@ impl HttpFetch {
             )));
         }
         match url.scheme() {
-            // https is the default; http is granted only because the host above
-            // was explicitly named.
-            "https" | "http" => Ok(()),
+            // https is the default and the only scheme a wildcard can grant.
+            "https" => Ok(()),
+            // Plain http is the local-dev-server exception, and it is granted
+            // only by *naming* the host: a glob widens reachability, not the
+            // scheme. SDD §5.5 and §11.1 both say "explicitly allowlisted".
+            "http" if self.host_named_exactly(host) => Ok(()),
+            "http" => Err(Error::Denied(format!(
+                "scheme `http` needs `{host}` named exactly in [http_fetch].allowed_domains; \
+                 a wildcard entry only grants https"
+            ))),
             other => Err(Error::Denied(format!(
                 "scheme `{other}` is not allowed; use https (or http for an allowlisted host)"
             ))),
@@ -419,6 +439,20 @@ fn sanitize_headers(headers: Option<BTreeMap<String, String>>) -> Vec<(String, S
     out
 }
 
+/// Canonical form of a URL host for matching.
+///
+/// Lowercased, and IPv6 brackets removed, so `[::1]` and `::1` are the same
+/// host. `Url::host_str` hands back an IPv6 host with its brackets, while a
+/// user writing an allowlist entry almost always writes the bare form; folding
+/// them here closes that gap. Both `host_allowed` and `host_named_exactly` go
+/// through this, so the two agree on what a host is.
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
 /// The address in a URL host, if it is an IP literal rather than a name.
 ///
 /// `Url::host_str` hands back IPv6 without the brackets, but accepting both
@@ -651,6 +685,52 @@ mod tests {
         let ftp = Url::parse("ftp://example.com/x").unwrap();
         let err = tool.check_scheme_and_host(&ftp).expect_err("ftp refused");
         assert!(err.to_string().contains("scheme"), "was: {err}");
+    }
+
+    #[test]
+    fn a_wildcard_entry_grants_https_but_never_plain_http() {
+        // Regression for the reviewing pass: the scheme check used to accept
+        // `http` on *any* allowlist match, so a glob like `local*` reached a
+        // local dev server in the clear. §5.5 and §11.1 both require the
+        // *exact* host for `http`, so a wildcard is https-only.
+        let tool = fetcher(&["local*"], false);
+        assert!(tool.host_allowed("localhost"), "the glob is reachable");
+
+        let https = Url::parse("https://localhost/").unwrap();
+        assert!(
+            tool.check_scheme_and_host(&https).is_ok(),
+            "a wildcard admits https"
+        );
+
+        let http = Url::parse("http://localhost/").unwrap();
+        let err = tool
+            .check_scheme_and_host(&http)
+            .expect_err("a wildcard must not grant plain http");
+        assert!(err.to_string().contains("exactly"), "was: {err}");
+    }
+
+    #[test]
+    fn an_exact_entry_grants_plain_http() {
+        // The other side of the same rule: naming the host is what buys `http`,
+        // which is the local-dev-server exception §11.1 resolves.
+        let tool = fetcher(&["localhost"], false);
+        let http = Url::parse("http://localhost/").unwrap();
+        assert!(tool.check_scheme_and_host(&http).is_ok());
+    }
+
+    #[test]
+    fn an_ipv6_allowlist_entry_matches_the_bracketed_host() {
+        // `Url::host_str` returns `[::1]`, while a user writes `::1`; if the two
+        // are not folded together, an exact entry never matches its own literal.
+        let tool = fetcher(&["::1"], false);
+        assert!(tool.host_allowed("[::1]"));
+        assert!(tool.host_named_exactly("[::1]"));
+
+        let http = Url::parse("http://[::1]:8000/").unwrap();
+        assert!(
+            tool.check_scheme_and_host(&http).is_ok(),
+            "an exact `::1` entry should name the host"
+        );
     }
 
     // ----------------------------------------------------------- fetching

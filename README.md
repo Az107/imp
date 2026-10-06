@@ -20,8 +20,9 @@ Milestones M0 through M3 are done. What works today:
   non-interactive path
 - **Workspace memory** — `remember`/`recall` over SQLite FTS5, scoped to the
   canonical workspace root
-- **Guarded HTTP** — `http_fetch` with a domain allowlist, a private/loopback/
-  metadata address block, no cross-domain redirects, and a response cap
+- **Guarded HTTP** — `http_fetch` with a domain allowlist (`https` unless an
+  exact entry names the host), a private/loopback/metadata address block, no
+  cross-domain redirects, and a response cap
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
 - **`minion init`** — one command from a bare machine to a working config
 - **Markdown rendering** on a terminal, including tables
