@@ -109,6 +109,7 @@ fn registry(store: Arc<Store>) -> minion_core::ToolRegistry {
             default_timeout: std::time::Duration::from_secs(5),
             max_timeout: std::time::Duration::from_secs(10),
             output_cap_bytes: 1 << 16,
+            http_fetch: minion_core::HttpFetchConfig::default(),
         },
         store,
     )

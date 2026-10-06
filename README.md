@@ -10,20 +10,24 @@ already cost time, for anyone (human or agent) working on this next.
 
 ## Status
 
-Milestones M0 through M2 are done; M3 is next. What works today:
+Milestones M0 through M3 are done. What works today:
 
 - **Streaming agent loop** against any OpenAI-compatible endpoint
-- **Five tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
-  `run_command`
-- **Approval engine** — every write and exec is gated by a policy engine, with
-  an allowlist, persisted approvals, and a fail-closed non-interactive path
+- **Eight tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
+  `run_command`, `remember`, `recall`, `http_fetch`
+- **Approval engine** — every write, exec, and network call is gated by a policy
+  engine, with an allowlist, persisted approvals, and a fail-closed
+  non-interactive path
+- **Workspace memory** — `remember`/`recall` over SQLite FTS5, scoped to the
+  canonical workspace root
+- **Guarded HTTP** — `http_fetch` with a domain allowlist, a private/loopback/
+  metadata address block, no cross-domain redirects, and a response cap
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
 - **`minion init`** — one command from a bare machine to a working config
 - **Markdown rendering** on a terminal, including tables
 
-Not built yet: `remember`/`recall`, `http_fetch`, cron, and MCP in either
-direction. The CLI surface in §5.12 of the SDD is only partly present, and
-`minion-cron` and `minion-mcp` are empty stubs.
+Not built yet: cron and MCP in either direction. The CLI surface in §5.12 of the
+SDD is only partly present, and `minion-cron` and `minion-mcp` are empty stubs.
 
 ## Install
 
@@ -94,6 +98,9 @@ writes or executes goes through a policy engine that decides *before* the call:
 - `--yes` replaces the default *decision*, not the engine. Deny rules and the
   classifier still apply.
 - Path-taking tools are confined to the workspace root.
+- `http_fetch` reaches only hosts in its `[http_fetch]` allowlist, refuses
+  private, loopback, link-local and cloud-metadata addresses, and does not
+  follow a redirect off an allowed host.
 - Approval is remembered by **verb**, so approving one `cargo build` does not
   approve every `cargo` invocation.
 

@@ -1224,6 +1224,7 @@ dependencies = [
  "libc",
  "minion-core",
  "minion-store",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",

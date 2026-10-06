@@ -2,16 +2,15 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0 through M2 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0 through M3 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
-sessions, and `minion init`. Branch is `main`.
+sessions, keyword memory, `http_fetch` with its SSRF guard, and `minion init`. Branch is `main`.
 
-**M3 is half done — memory only.** `remember`/`recall` are built, registered, and tested: the store
-upsert and FTS query in `minion-store/src/memory.rs`, the tools in
-`minion-tools/src/memory.rs`, and the namespace helper in `minion-core/src/memory.rs`. `http_fetch`
-and the SSRF guard are **not started**, so M3 is not finished and the milestone table in `SDD.md`
-still correctly reads "next". The `[http_fetch]` config section does not exist yet either.
+**M3 is done.** `remember`/`recall` live in `minion-store/src/memory.rs`,
+`minion-tools/src/memory.rs` and `minion-core/src/memory.rs`; `http_fetch` and its guard are
+`minion-tools/src/http_fetch.rs`, and the `[http_fetch]` config section is
+`HttpFetchConfig` in `minion-core/src/config.rs`. The milestone table in `SDD.md` reads `done`.
 
 `minion-cron` and `minion-mcp` are **empty stubs** for M4–M6. Their manifests list real dependencies
 (`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs` and
@@ -76,9 +75,11 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 ## Invariants that must not be relaxed
 
 - **Every `Write` and `Execute` tool must go through the gate.** `default_registry()` now registers
-  `read_file`, `edit_file`, `apply_patch`, `write_file`, and `run_command`, and `setup::build_gate`
-  attaches a `PolicyEngine` to the agent. A registry built without a gate is only safe for read-only
-  use — if you add a tool, confirm the gate is wired, not that the tool "seems harmless".
+  `read_file`, `edit_file`, `apply_patch`, `write_file`, `run_command`, `remember`, `recall`, and
+  `http_fetch`, and `setup::build_gate` attaches a `PolicyEngine` to the agent. A registry built
+  without a gate is only safe for read-only use — if you add a tool, confirm the gate is wired, not
+  that the tool "seems harmless". `http_fetch` is `Risk::Network`, which is gated with the writes
+  (D15), so a non-TTY refuses it too.
 - Approval is fail-closed: non-TTY never prompts and defaults to `deny`; deny rules always beat
   allowlists.
 - The MCP server is read-only by default. `expose_exec`/`expose_write` stay `false`; `run_command`
@@ -183,6 +184,35 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - `remember` is `Risk::Write` even though it cannot touch the workspace. The class describes what
   changes, and that is what puts it behind the gate. `crates/minion-cli/tests/memory_gate.rs`
   asserts a denied `remember` leaves the database untouched.
+
+## HTTP rules
+
+- **The domain allowlist and the approval allowlist are two different lists.** `[http_fetch]
+  .allowed_domains` is the SSRF boundary: a host that does not match is refused by the tool itself,
+  whatever policy says. `[policy.allow]` is what pre-approves, and `http_fetch` reports the URL
+  *host* as its `approval_subject`, so an allow rule names a domain
+  (`{ tool = "http_fetch", pattern = "docs.rs" }`). An allowlisted domain still prompts on a TTY and
+  is still refused in a pipe until it has a policy allow rule; neither list widens the other. See
+  D17.
+- **The guard fails closed.** An empty `allowed_domains` reaches nothing. `block_private_ips`
+  defaults on and refuses private, loopback, link-local, unique-local, CGNAT, unspecified and
+  multicast ranges, the cloud-metadata `169.254.169.254` included. Loopback is refused *even when the
+  host is allowlisted*, because the two lists narrow independently.
+- **Redirects are followed by hand, one hop at a time**, with `Policy::none()` on the client, because
+  each hop has to be re-checked. A hop to a host outside the allowlist fails as
+  `redirect refused: …` rather than being followed. `301/302/303` rewrite a non-GET to `GET` and drop
+  the body; `307/308` preserve both.
+- **DNS is resolved before the request and every returned address is checked.** This is a pre-flight
+  check, not a connection-time one, so a resolver that answers differently between the check and the
+  connect (DNS rebinding) is not closed by it. Closing that needs a custom `reqwest::dns::Resolve`;
+  it is a known limit, not an oversight.
+- **`http_fetch` is why `minion-tools` depends on `reqwest`.** It is the same crate and version
+  `minion-provider` already links, so it adds one edge to `Cargo.lock`, not a second HTTP stack.
+- The body is read up to `max_bytes` (clamped per call) and non-UTF-8 is decoded lossily. The result
+  the model sees is JSON — `status`, `url`, `redirects`, `headers`, `body`, `truncated` — matching
+  §5.5; the tool `metadata` mirrors the status and the kept byte count.
+- Model-supplied headers are dropped when they do not parse or are client-owned (`host`,
+  `content-length`, `connection`, `transfer-encoding`).
 
 ## Store rules
 

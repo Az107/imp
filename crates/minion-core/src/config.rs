@@ -32,6 +32,8 @@ pub struct Config {
     pub exec: ExecConfig,
     /// Approval policy.
     pub policy: PolicyConfig,
+    /// Outbound HTTP limits and the SSRF guard for `http_fetch`.
+    pub http_fetch: HttpFetchConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -241,6 +243,41 @@ pub struct DenyRule {
     pub pattern: String,
 }
 
+/// Limits and the SSRF guard for the `http_fetch` tool (SDD §5.5, threat T3).
+///
+/// Two separate lists gate an outbound request, and they mean different things:
+/// this `allowed_domains` is the *guard* — a host that does not match it cannot
+/// be fetched at all, whatever the approval policy says. Approval is the
+/// ordinary `[policy.allow]` mechanism, matched against the URL's host because
+/// `http_fetch` names the host as its approval subject. Keeping the two apart is
+/// what lets `allowed_domains` be a security boundary rather than a convenience.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpFetchConfig {
+    /// Hosts the tool may reach, as exact names or globs (`*.example.com`).
+    ///
+    /// Empty means nothing is fetchable: the guard fails closed.
+    pub allowed_domains: Vec<String>,
+    /// Refuse a host that resolves to a private, loopback, link-local,
+    /// unique-local or otherwise non-public address.
+    pub block_private_ips: bool,
+    /// Largest response body kept, in bytes.
+    pub max_bytes: u64,
+    /// Wall-clock budget for one request, in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for HttpFetchConfig {
+    fn default() -> Self {
+        Self {
+            allowed_domains: Vec::new(),
+            block_private_ips: true,
+            max_bytes: 1_048_576,
+            timeout_secs: 20,
+        }
+    }
+}
+
 /// Log destination and verbosity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -357,6 +394,16 @@ impl Config {
         }
         if self.exec.shell.trim().is_empty() {
             return Err(Error::Config("exec.shell must not be empty".to_string()));
+        }
+        if self.http_fetch.max_bytes == 0 {
+            return Err(Error::Config(
+                "http_fetch.max_bytes must be at least 1".to_string(),
+            ));
+        }
+        if self.http_fetch.timeout_secs == 0 {
+            return Err(Error::Config(
+                "http_fetch.timeout_secs must be at least 1".to_string(),
+            ));
         }
         Ok(())
     }
@@ -552,6 +599,54 @@ mod tests {
         assert_eq!(config.policy.default, Decision::Ask);
         assert_eq!(config.policy.noninteractive, Decision::Deny);
         assert!(!config.workspace.follow_symlinks);
+    }
+
+    #[test]
+    fn http_fetch_defaults_to_a_closed_guard() {
+        let config = Config::default();
+        assert!(
+            config.http_fetch.allowed_domains.is_empty(),
+            "an empty allowlist means nothing is fetchable until it is configured"
+        );
+        assert!(
+            config.http_fetch.block_private_ips,
+            "the private-IP block must default on; it is the SSRF mitigation"
+        );
+        assert_eq!(config.http_fetch.max_bytes, 1_048_576);
+        assert_eq!(config.http_fetch.timeout_secs, 20);
+    }
+
+    #[test]
+    fn the_http_fetch_section_is_read_from_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[http_fetch]\nallowed_domains = [\"docs.rs\", \"*.github.com\"]\n\
+             block_private_ips = false\nmax_bytes = 4096\ntimeout_secs = 3\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(
+            config.http_fetch.allowed_domains,
+            vec!["docs.rs".to_string(), "*.github.com".to_string()]
+        );
+        assert!(!config.http_fetch.block_private_ips);
+        assert_eq!(config.http_fetch.max_bytes, 4096);
+        assert_eq!(config.http_fetch.timeout_secs, 3);
+    }
+
+    #[test]
+    fn an_unusable_http_fetch_cap_is_rejected_before_use() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[http_fetch]\nmax_bytes = 0\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
     }
 
     #[test]

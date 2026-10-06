@@ -5,12 +5,14 @@
 //! A tool is only registered here once that gate exists, so nothing unguarded
 //! can be reached from a model.
 
+pub mod http_fetch;
 pub mod memory;
 pub mod patch;
 pub mod read_file;
 pub mod run_command;
 pub mod write_file;
 
+pub use http_fetch::HttpFetch;
 pub use memory::{Recall, Remember};
 pub use patch::{ApplyPatch, EditFile, Operation};
 pub use read_file::ReadFile;
@@ -20,6 +22,7 @@ pub use write_file::WriteFile;
 use std::sync::Arc;
 use std::time::Duration;
 
+use minion_core::config::HttpFetchConfig;
 use minion_core::tool::ToolRegistry;
 use minion_store::Store;
 
@@ -45,10 +48,12 @@ pub fn default_registry(config: &ToolConfig, store: Arc<Store>) -> ToolRegistry 
     ));
     registry.register(Remember::new(store.clone()));
     registry.register(Recall::new(store));
+    registry.register(HttpFetch::new(&config.http_fetch));
     registry
 }
 
-/// The subset of `[workspace]` and `[exec]` that shapes the tool set.
+/// The subset of `[workspace]`, `[exec]` and `[http_fetch]` that shapes the
+/// tool set.
 #[derive(Debug, Clone)]
 pub struct ToolConfig {
     /// Largest file a read or write may touch.
@@ -61,4 +66,6 @@ pub struct ToolConfig {
     pub max_timeout: Duration,
     /// Bytes retained per output stream.
     pub output_cap_bytes: u64,
+    /// `[http_fetch]`: the domain allowlist and the SSRF guard's limits.
+    pub http_fetch: HttpFetchConfig,
 }

@@ -241,7 +241,7 @@ pub async fn build(
     Ok(session)
 }
 
-/// The `[workspace]` and `[exec]` values that shape the tool set.
+/// The `[workspace]`, `[exec]` and `[http_fetch]` values that shape the tool set.
 fn tool_config(config: &Config) -> ToolConfig {
     ToolConfig {
         max_file_bytes: config.workspace.max_file_bytes,
@@ -249,6 +249,7 @@ fn tool_config(config: &Config) -> ToolConfig {
         default_timeout: Duration::from_secs(config.exec.default_timeout_secs),
         max_timeout: Duration::from_secs(config.exec.max_timeout_secs),
         output_cap_bytes: config.exec.output_cap_bytes,
+        http_fetch: config.http_fetch.clone(),
     }
 }
 
@@ -469,6 +470,10 @@ mod tests {
         assert!(
             prompt.contains("remember") && prompt.contains("recall"),
             "the memory tools are registered, so the prompt must advertise them"
+        );
+        assert!(
+            prompt.contains("http_fetch"),
+            "http_fetch is registered, so the prompt must advertise it"
         );
     }
 

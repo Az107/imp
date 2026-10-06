@@ -18,7 +18,7 @@ pub mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome};
 pub use classify::classify_command;
-pub use config::{Config, Credentials};
+pub use config::{Config, Credentials, HttpFetchConfig};
 pub use error::{Error, Result};
 pub use fs::write_private_file;
 pub use glob::glob_match;

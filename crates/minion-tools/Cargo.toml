@@ -11,12 +11,16 @@ async-trait = "0.1.92"
 libc = "0.2.189"
 minion-core = { version = "0.1.0", path = "../minion-core" }
 minion-store = { version = "0.1.0", path = "../minion-store" }
+# `http_fetch` needs a client. `reqwest` is already in the build for
+# `minion-provider`, so this adds an edge, not a dependency tree; the feature
+# set is trimmed to what the tool uses (TLS + HTTP/2, no JSON or streaming).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
 schemars = { version = "1.2.2", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 similar = "3.2.0"
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "fs", "io-util", "process"] }
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "fs", "io-util", "process", "net"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"
 
