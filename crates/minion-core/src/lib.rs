@@ -22,7 +22,10 @@ pub mod tool;
 pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome};
 pub use classify::classify_command;
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use config::{Config, Credentials, CronConfig, GuardConfig, HttpFetchConfig, MissedRunPolicy};
+pub use config::{
+    Config, Credentials, CronConfig, GuardConfig, HttpFetchConfig, McpClientConfig, McpConfig,
+    McpServerConfig, MissedRunPolicy,
+};
 pub use error::{Error, Result};
 pub use fs::write_private_file;
 pub use glob::glob_match;
@@ -33,8 +36,9 @@ pub use job::{
 pub use memory::namespace_for;
 pub use message::{Message, Role, ToolCall};
 pub use policy::{
-    ApprovalChoice, ApprovalRequest, ApprovalStore, ApprovalUi, PolicyEngine, ToolGate,
+    ApprovalChoice, ApprovalRequest, ApprovalStore, ApprovalUi, PolicyEngine, RecordingGate,
+    ToolGate, ToolPolicy, subject_for,
 };
 pub use provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
 pub use session::new_session_id;
-pub use tool::{Risk, Tool, ToolCtx, ToolOutput, ToolRegistry};
+pub use tool::{Risk, Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry};

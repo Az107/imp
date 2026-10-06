@@ -38,6 +38,8 @@ pub struct Config {
     pub guard: GuardConfig,
     /// In-process cron scheduler settings.
     pub cron: CronConfig,
+    /// Consuming external MCP servers (SDD §5.10).
+    pub mcp: McpConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -370,6 +372,89 @@ pub enum MissedRunPolicy {
     RunAll,
 }
 
+/// Outbound MCP client settings (SDD §5.10).
+///
+/// Each entry under `[mcp.client.servers.<name>]` is an external MCP server that
+/// minion spawns over stdio and consumes the tools of. The table key namespaces
+/// everything about it: its tools reach the model as `mcp__<name>__<tool>`, and
+/// the approval policy for those tools is derived from that same name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// The client half: external servers minion calls.
+    pub client: McpClientConfig,
+}
+
+/// `[mcp.client]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpClientConfig {
+    /// External servers, keyed by the namespace their tools are published under.
+    ///
+    /// The key must be non-empty and must not contain `__`: the flattened name
+    /// `mcp__<server>__<tool>` has to identify one tool on one server, and a key
+    /// carrying the separator would make two servers collide on a single name.
+    /// `Config::validate` rejects such a key rather than letting the ambiguity
+    /// reach the catalogue.
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// One external server, `[mcp.client.servers.<name>]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    /// Program to spawn. Executed directly, never through a shell, so an
+    /// argument cannot become a command.
+    pub command: String,
+    /// Arguments passed to `command`, verbatim.
+    pub args: Vec<String>,
+    /// Contact this server at the start of the first turn instead of while the
+    /// session is assembled. A session that is opened and closed without a turn
+    /// then never spawns it.
+    pub lazy: bool,
+    /// Which of the server's tools the model may see and call.
+    ///
+    /// Glob syntax ([`crate::glob::glob_match`]), matched against the tool's own
+    /// name, anchored at both ends. **An empty list allows nothing**: a server is
+    /// fail-closed until a pattern names something, and `["*"]` is how an
+    /// operator says "every tool this server has". A tool that is not listed is
+    /// absent from the catalogue and cannot be invoked — an unknown tool is an
+    /// unknown tool whoever asks.
+    pub tool_allow: Vec<String>,
+    /// Approval decision for this server's tools, substituting the global
+    /// `policy.default` (and `policy.noninteractive`) for them.
+    ///
+    /// `None` leaves the server under the global policy. Deny rules, allow rules
+    /// and the command classifier still run first, so this moves only the
+    /// default a call would otherwise inherit: a trusted local server can be
+    /// `auto` while a server reached over the network stays `ask`. See D21.
+    pub approval: Option<Decision>,
+}
+
+impl McpServerConfig {
+    /// Whether `tool` — the server's own name for it, not the flattened one —
+    /// may reach the model.
+    pub fn allows(&self, tool: &str) -> bool {
+        self.tool_allow
+            .iter()
+            .any(|pattern| crate::glob::glob_match(pattern, tool))
+    }
+
+    /// The prefix every flattened tool of this server carries.
+    ///
+    /// It is also the family key the approval policy is keyed on, so the one
+    /// function is what keeps `mcp__a__b` from being read as server `a` tool
+    /// `b` in one place and something else in another.
+    pub fn tool_prefix(server: &str) -> String {
+        format!("mcp__{server}__")
+    }
+
+    /// The name `tool` is published under.
+    pub fn flattened(server: &str, tool: &str) -> String {
+        format!("{}{tool}", Self::tool_prefix(server))
+    }
+}
+
 /// Log destination and verbosity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -539,6 +624,28 @@ impl Config {
             return Err(Error::Config(
                 "cron.missed_run_cap must be at least 1".to_string(),
             ));
+        }
+        // An MCP server is spawned by its `command`, and its table key is half of
+        // every tool name it publishes. Both are checked here rather than at
+        // first use, so a typo is a startup error and not a server that quietly
+        // never contributes a tool (§5.10).
+        for (name, server) in &self.mcp.client.servers {
+            if name.trim().is_empty() {
+                return Err(Error::Config(
+                    "an mcp.client.servers key must not be empty".to_string(),
+                ));
+            }
+            if name.contains("__") {
+                return Err(Error::Config(format!(
+                    "mcp.client.servers.{name}: a server name must not contain `__`, \
+                     which is the separator in `mcp__<server>__<tool>`"
+                )));
+            }
+            if server.command.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "mcp.client.servers.{name}.command must not be empty"
+                )));
+            }
         }
         Ok(())
     }
@@ -868,6 +975,92 @@ mod tests {
 
         assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
         assert!(err.to_string().contains("base_url"), "was: {err}");
+    }
+
+    #[test]
+    fn mcp_servers_are_read_from_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[mcp.client.servers.files]\n\
+             command = \"mcp-server-files\"\n\
+             args = [\"--root\", \"/srv\"]\n\
+             lazy = true\n\
+             tool_allow = [\"read_*\", \"list\"]\n\
+             approval = \"auto\"\n\
+             \n\
+             [mcp.client.servers.web]\n\
+             command = \"mcp-server-web\"\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        let files = &config.mcp.client.servers["files"];
+        assert_eq!(files.command, "mcp-server-files");
+        assert_eq!(files.args, vec!["--root".to_string(), "/srv".to_string()]);
+        assert!(files.lazy);
+        assert_eq!(files.approval, Some(Decision::Auto));
+        assert!(files.allows("read_file"), "`read_*` must name `read_file`");
+        assert!(files.allows("list"));
+        assert!(!files.allows("write_file"));
+
+        let web = &config.mcp.client.servers["web"];
+        assert_eq!(web.command, "mcp-server-web");
+        assert!(web.args.is_empty());
+        assert!(!web.lazy, "a server is eager unless it says otherwise");
+        assert_eq!(web.approval, None);
+        assert!(
+            !web.allows("anything"),
+            "an empty tool_allow must allow nothing; the server is fail-closed"
+        );
+    }
+
+    #[test]
+    fn an_empty_tool_allow_is_not_a_wildcard() {
+        let server = McpServerConfig {
+            command: "x".to_string(),
+            ..McpServerConfig::default()
+        };
+        assert!(!server.allows("read_file"));
+
+        let wildcard = McpServerConfig {
+            tool_allow: vec!["*".to_string()],
+            ..server
+        };
+        assert!(wildcard.allows("read_file"));
+        assert!(wildcard.allows("anything_at_all"));
+    }
+
+    #[test]
+    fn flattened_names_come_from_one_place() {
+        assert_eq!(
+            McpServerConfig::flattened("files", "read_file"),
+            "mcp__files__read_file"
+        );
+        assert_eq!(McpServerConfig::tool_prefix("files"), "mcp__files__");
+    }
+
+    #[test]
+    fn a_server_name_that_breaks_the_namespace_is_rejected() {
+        for (name, body) in [
+            ("a__b", "[mcp.client.servers.a__b]\ncommand = \"x\"\n"),
+            ("empty", "[mcp.client.servers.\"\"]\ncommand = \"x\"\n"),
+            ("nocommand", "[mcp.client.servers.b]\nargs = [\"x\"]\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("minion.toml"), body);
+            let err = Config::load_with(None, None, dir.path()).unwrap_err();
+            assert!(
+                matches!(err, Error::Config(_)),
+                "{name} was accepted: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_mcp_servers_is_the_default() {
+        let config = Config::default();
+        assert!(config.mcp.client.servers.is_empty());
     }
 
     #[test]

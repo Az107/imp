@@ -106,11 +106,111 @@ pub trait ToolGate: Send + Sync {
     ) -> Result<()>;
 }
 
+/// The text a rule is matched against when the tool did not name one.
+pub fn subject_for(tool: &str, args: &Value) -> String {
+    if tool == "run_command"
+        && let Some(command) = args.get("command").and_then(Value::as_str)
+    {
+        return command.trim().to_string();
+    }
+    for field in ["path", "file"] {
+        if let Some(value) = args.get(field).and_then(Value::as_str) {
+            return value.to_string();
+        }
+    }
+    tool.to_string()
+}
+
+/// A gate that records every decision it delegates.
+///
+/// §7 asks for an audit row per tool decision, and the engine writes one only
+/// where a guard verdict was involved — so a plain allow or deny, which is the
+/// overwhelming majority of calls and *every* external MCP call, used to leave
+/// no trace at all. This decorator closes that gap without moving a rule: it
+/// asks the engine, then writes `allow` or `deny` to the same audit trail with
+/// the tool, its risk class and the subject the rules saw.
+///
+/// It is a decorator and not a change to [`PolicyEngine`] on purpose: the order
+/// of the rules is the security property (see the invariants), and wrapping is
+/// the one way to add a record per call without touching it. A recording
+/// failure is swallowed by [`ApprovalStore::audit`], so it can never fail the
+/// call it describes.
+pub struct RecordingGate {
+    inner: Arc<dyn ToolGate>,
+    store: Arc<dyn ApprovalStore>,
+}
+
+impl RecordingGate {
+    /// Wrap `inner`, recording into `store`.
+    pub fn new(inner: Arc<dyn ToolGate>, store: Arc<dyn ApprovalStore>) -> Self {
+        Self { inner, store }
+    }
+
+    /// Wrap `inner` in the `Arc<dyn ToolGate>` an [`crate::Agent`] takes.
+    pub fn arc(inner: Arc<dyn ToolGate>, store: Arc<dyn ApprovalStore>) -> Arc<dyn ToolGate> {
+        Arc::new(Self::new(inner, store))
+    }
+}
+
+#[async_trait]
+impl ToolGate for RecordingGate {
+    async fn check(
+        &self,
+        tool: &str,
+        risk: Risk,
+        args: &Value,
+        subject: Option<&str>,
+    ) -> Result<()> {
+        let outcome = self.inner.check(tool, risk, args, subject).await;
+
+        let subject = match subject {
+            Some(value) if !value.is_empty() => value.to_string(),
+            _ => subject_for(tool, args),
+        };
+        self.store
+            .audit(AuditEntry {
+                tool: tool.to_string(),
+                risk: risk.as_str(),
+                decision: if outcome.is_ok() { "allow" } else { "deny" },
+                subject,
+            })
+            .await;
+
+        outcome
+    }
+}
+
 /// An allow rule for this process only.
 #[derive(Debug, Clone)]
 struct SessionAllow {
     tool: String,
     pattern: String,
+}
+
+/// A decision that substitutes the global default for a family of tools.
+///
+/// The MCP client uses this to give an external server its own approval policy
+/// (SDD §5.10): a trusted local server can be `auto` while a server reached over
+/// the network stays `ask`, without the operator restating the whole policy in a
+/// second allowlist. It moves the *fallback* only — deny rules, allow rules and
+/// the command classifier all still run, and still run first — so a family
+/// marked `auto` cannot override a refusal that already happened. See D21.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolPolicy {
+    /// Every tool whose name starts with this is governed by `decision`.
+    pub prefix: String,
+    /// What those tools resolve to.
+    pub decision: Decision,
+}
+
+impl ToolPolicy {
+    /// A policy for every tool whose name starts with `prefix`.
+    pub fn new(prefix: impl Into<String>, decision: Decision) -> Self {
+        Self {
+            prefix: prefix.into(),
+            decision,
+        }
+    }
 }
 
 /// The policy engine.
@@ -119,6 +219,8 @@ pub struct PolicyEngine {
     deny: Vec<(String, String)>,
     default: Decision,
     noninteractive: Decision,
+    /// Families of tools whose fallback decision differs from the global one.
+    policies: Vec<ToolPolicy>,
     /// The workspace that scopes stored rules, and the subject of relative
     /// patterns.
     scope: String,
@@ -148,6 +250,7 @@ impl PolicyEngine {
             deny,
             default,
             noninteractive,
+            policies: Vec::new(),
             scope: scope.into(),
             interactive,
             ui: None,
@@ -184,6 +287,27 @@ impl PolicyEngine {
         self
     }
 
+    /// Give a family of tools its own fallback decision (SDD §5.10, D21).
+    ///
+    /// The MCP client calls this once per configured server, keyed on the
+    /// `mcp__<server>__` prefix every one of its tools carries. The longest
+    /// matching prefix wins, so a narrow policy always beats a broader one and
+    /// the result does not depend on the order the servers were configured in.
+    pub fn with_tool_policies(mut self, policies: Vec<ToolPolicy>) -> Self {
+        self.policies = policies;
+        self
+    }
+
+    /// The fallback decision for `tool`, honouring a per-family override.
+    fn fallback_for(&self, tool: &str, global: Decision) -> Decision {
+        self.policies
+            .iter()
+            .filter(|policy| !policy.prefix.is_empty() && tool.starts_with(&policy.prefix))
+            .max_by_key(|policy| policy.prefix.len())
+            .map(|policy| policy.decision)
+            .unwrap_or(global)
+    }
+
     /// Record a decision, best effort: an audit failure never fails a turn.
     async fn audit(&self, entry: AuditEntry) {
         if let Some(store) = &self.store {
@@ -208,17 +332,7 @@ impl PolicyEngine {
 
     /// The text a rule is matched against when the tool did not name one.
     fn subject_for(&self, tool: &str, args: &Value) -> String {
-        if tool == "run_command"
-            && let Some(command) = args.get("command").and_then(Value::as_str)
-        {
-            return command.trim().to_string();
-        }
-        for field in ["path", "file"] {
-            if let Some(value) = args.get(field).and_then(Value::as_str) {
-                return value.to_string();
-            }
-        }
-        tool.to_string()
+        subject_for(tool, args)
     }
 
     fn matches(rules: &[(String, String)], tool: &str, subject: &str, scope: &str) -> bool {
@@ -319,7 +433,10 @@ impl ToolGate for PolicyEngine {
             return Ok(());
         }
         if !self.interactive {
-            return match self.noninteractive {
+            // A family policy substitutes the global non-interactive decision
+            // for its own tools (D21), which is how a trusted local server can
+            // run a turn unattended while everything else still fails closed.
+            return match self.fallback_for(tool, self.noninteractive) {
                 Decision::Auto => Ok(()),
                 Decision::Ask => Err(Error::Denied(format!(
                     "`{tool}` needs approval but nothing can answer a prompt: {subject}. \
@@ -335,7 +452,7 @@ impl ToolGate for PolicyEngine {
 
         // 5. The configured default, or a prompt.
         let decision = if flags.is_empty() {
-            self.default
+            self.fallback_for(tool, self.default)
         } else {
             Decision::Ask
         };
@@ -1095,6 +1212,208 @@ mod tests {
     fn an_empty_pattern_matches_only_an_empty_subject() {
         assert!(glob_match("", ""));
         assert!(!glob_match("", "anything"));
+    }
+
+    // ------------------------------------------------------- family policies
+
+    /// D21: an MCP server's policy substitutes the global default for its own
+    /// tools, so a trusted local server can be `auto` while a network one asks.
+    #[tokio::test]
+    async fn a_family_policy_replaces_the_global_default() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Deny));
+        let engine = engine(true)
+            .with_tool_policies(vec![ToolPolicy::new("mcp__files__", Decision::Auto)])
+            .with_ui(ui.clone());
+
+        engine
+            .check(
+                "mcp__files__read_file",
+                Risk::Network,
+                &serde_json::json!({ "path": "a" }),
+                None,
+            )
+            .await
+            .expect("the server is trusted, so its tools need no prompt");
+        assert!(ui.asked().is_empty());
+
+        // Anything outside the family still takes the global `ask`.
+        engine
+            .check(
+                "mcp__web__fetch",
+                Risk::Network,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(ui.asked().len(), 1, "the other server must still prompt");
+    }
+
+    /// The family policy moves the fallback, never an explicit refusal.
+    #[tokio::test]
+    async fn a_family_policy_cannot_resurrect_a_denied_tool() {
+        let engine = PolicyEngine::new(
+            Vec::new(),
+            vec![("mcp__files__write_file".into(), "*".into())],
+            Decision::Ask,
+            Decision::Deny,
+            "/workspace",
+            true,
+        )
+        .with_tool_policies(vec![ToolPolicy::new("mcp__files__", Decision::Auto)]);
+
+        let err = engine
+            .check(
+                "mcp__files__write_file",
+                Risk::Network,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("deny rule"), "was: {err}");
+    }
+
+    /// The longest matching prefix wins, so the answer does not depend on the
+    /// order the policies were collected in.
+    #[tokio::test]
+    async fn the_most_specific_family_policy_wins() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Deny));
+        let engine = engine(true)
+            .with_tool_policies(vec![
+                ToolPolicy::new("mcp__", Decision::Deny),
+                ToolPolicy::new("mcp__files__", Decision::Auto),
+            ])
+            .with_ui(ui.clone());
+
+        engine
+            .check(
+                "mcp__files__read",
+                Risk::Network,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .expect("the narrower policy wins");
+        assert!(ui.asked().is_empty());
+
+        let err = engine
+            .check(
+                "mcp__other__read",
+                Risk::Network,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("denied"), "was: {err}");
+    }
+
+    /// A family marked `auto` is an explicit statement about one server, so it
+    /// also decides the unattended case (D21).
+    #[tokio::test]
+    async fn a_family_policy_decides_a_non_interactive_run() {
+        let engine =
+            engine(false).with_tool_policies(vec![ToolPolicy::new("mcp__files__", Decision::Auto)]);
+
+        engine
+            .check(
+                "mcp__files__read",
+                Risk::Network,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .expect("the server is trusted and needs no terminal");
+
+        let err = engine
+            .check(
+                "mcp__web__fetch",
+                Risk::Network,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-interactive"), "was: {err}");
+    }
+
+    /// A read-only tool is still decided before the family policy is consulted,
+    /// so a family cannot turn a free read into a refusal.
+    #[tokio::test]
+    async fn a_denying_family_policy_does_not_touch_read_only_tools() {
+        let engine =
+            engine(true).with_tool_policies(vec![ToolPolicy::new("mcp__", Decision::Deny)]);
+
+        engine
+            .check("read_file", Risk::ReadOnly, &serde_json::json!({}), None)
+            .await
+            .expect("rule 4 runs before the fallback");
+    }
+
+    // ------------------------------------------------------- recording gate
+
+    /// §7: every decision gets a row, allowed ones included. Without this a
+    /// successful call — every external MCP call among them — left no trace.
+    #[tokio::test]
+    async fn every_decision_is_recorded() {
+        let store = Arc::new(MemoryStore::default());
+        let gate = RecordingGate::arc(
+            Arc::new(engine(false)),
+            store.clone() as Arc<dyn ApprovalStore>,
+        );
+
+        gate.check(
+            "read_file",
+            Risk::ReadOnly,
+            &serde_json::json!({ "path": "a" }),
+            None,
+        )
+        .await
+        .unwrap();
+        gate.check(
+            "mcp__files__write",
+            Risk::Network,
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let audits = store.audits.lock().unwrap().clone();
+        assert_eq!(audits.len(), 2, "one row per call");
+        assert_eq!(audits[0].tool, "read_file");
+        assert_eq!(audits[0].decision, "allow");
+        assert_eq!(audits[0].subject, "a", "the subject the rules saw");
+        assert_eq!(audits[1].tool, "mcp__files__write");
+        assert_eq!(audits[1].decision, "deny");
+        assert_eq!(audits[1].risk, "network");
+    }
+
+    /// The decorator is transparent: it cannot turn a refusal into an allow.
+    #[tokio::test]
+    async fn recording_preserves_the_verdict() {
+        let store = Arc::new(MemoryStore::default());
+        let gate = RecordingGate::arc(
+            Arc::new(PolicyEngine::new(
+                Vec::new(),
+                vec![("run_command".into(), "*rm*".into())],
+                Decision::Auto,
+                Decision::Auto,
+                "/workspace",
+                true,
+            )),
+            store.clone() as Arc<dyn ApprovalStore>,
+        );
+
+        let err = gate
+            .check("run_command", Risk::Execute, &command("rm -rf build"), None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("deny rule"), "was: {err}");
+        assert_eq!(store.audits.lock().unwrap()[0].decision, "deny");
     }
 
     // --------------------------------------------------------- classifier
