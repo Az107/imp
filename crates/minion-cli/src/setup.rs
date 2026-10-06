@@ -15,11 +15,12 @@ use minion_core::guard::GuardThresholds;
 use minion_core::job::{Job, SessionMode};
 use minion_core::message::{Message, Role};
 use minion_core::new_session_id;
-use minion_core::policy::PolicyEngine;
+use minion_core::policy::{PolicyEngine, RecordingGate, ToolGate};
 use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
 use minion_cron::RunReport;
 use minion_guard::HttpSystemOneGuard;
+use minion_mcp::{McpServers, OnStart};
 use minion_provider::OpenAiProvider;
 use minion_store::{NewSession, SessionRow, Store};
 use minion_tools::{CronContext, ToolConfig, default_registry};
@@ -54,7 +55,10 @@ pub struct Session {
     /// Retained so the provider can be rebuilt when the conversation changes.
     spec: ProviderSpec,
     /// The approval gate, shared so session-scoped allows accumulate.
-    gate: Arc<PolicyEngine>,
+    gate: Arc<dyn ToolGate>,
+    /// The external servers this session consumes, shared so a turn can retry
+    /// one that was down and the catalogue follows.
+    mcp: Arc<McpServers>,
 }
 
 /// The parameters a provider was built from, kept to rebuild it later.
@@ -139,6 +143,25 @@ impl Session {
             .await
     }
 
+    /// Contact every configured MCP server, and return a `system` notice for
+    /// each one whose state changed.
+    ///
+    /// Called at the start of every turn, which is both how a server that came
+    /// up reaches the catalogue and how one that fell over leaves it (§5.10).
+    /// A turn that changes nothing produces no notice, so the transcript does
+    /// not repeat itself.
+    pub async fn refresh_mcp(&self) -> Vec<String> {
+        // A configured-but-lazy server is contacted here too: the first turn is
+        // the "first use" its config deferred to, and this is where the tools
+        // it publishes join the catalogue.
+        self.mcp.refresh(OnStart::All).await
+    }
+
+    /// Close the external servers on the way out.
+    pub async fn shutdown(&self) {
+        self.mcp.shutdown().await;
+    }
+
     /// The text of the first user message, used to derive a title.
     fn first_user_text(&self) -> Option<String> {
         self.history
@@ -174,11 +197,16 @@ pub async fn build(
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let store = Arc::new(Store::open(&database).await?);
 
-    let tools = Arc::new(default_registry(
-        &tool_config(config),
-        store.clone(),
-        cron_context(config),
-    ));
+    // External servers are contacted before the prompt is built so an eager one
+    // is advertised in it, and before the gate so their approval policies are
+    // part of the engine rather than bolted on afterwards.
+    let mcp = McpServers::new(&config.mcp.client, config.exec.output_cap_bytes);
+
+    let mut registry = default_registry(&tool_config(config), store.clone(), cron_context(config));
+    registry.attach_catalog(mcp.clone());
+    let tools = Arc::new(registry);
+
+    let mcp_notices = mcp.refresh(OnStart::Eager).await;
     let system = Message::system(system_prompt(config, &workspace_root, &tools));
 
     let (session_id, mut history) = match resume {
@@ -210,6 +238,12 @@ pub async fn build(
     apply_history_window(&mut history, config.agent.history_window);
     let history_window = config.agent.history_window;
 
+    // A server that could not be contacted is explained as a `system` message,
+    // after the prompt so index 0 stays the prompt (§5.10).
+    for notice in mcp_notices {
+        history.push(Message::system(notice));
+    }
+
     let provider = Arc::new(spec.build(&session_id));
     tracing::debug!(
         session_id = %session_id,
@@ -231,13 +265,17 @@ pub async fn build(
     // Whether anyone can answer a prompt. `--yes` forces the permissive path;
     // a non-TTY still cannot be prompted, so it falls back to `noninteractive`.
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let gate = build_gate(
-        config,
+    let gate = recording(
+        build_gate(
+            config,
+            &store,
+            &workspace_root.display().to_string(),
+            tty,
+            cli.yes,
+            cli.deny,
+            mcp.policy_families(),
+        ),
         &store,
-        &workspace_root.display().to_string(),
-        tty,
-        cli.yes,
-        cli.deny,
     );
 
     // Cron runs through a *different* gate, on purpose: a job prompt has no
@@ -246,10 +284,19 @@ pub async fn build(
     let cron_runner: Arc<dyn minion_cron::JobRunner> = Arc::new(JobAgentRunner {
         spec: spec.clone(),
         tools: tools.clone(),
-        gate: build_cron_gate(config, &store, &workspace_root.display().to_string()),
+        gate: recording(
+            build_cron_gate(
+                config,
+                &store,
+                &workspace_root.display().to_string(),
+                mcp.policy_families(),
+            ),
+            &store,
+        ),
         config: config.clone(),
         store: store.clone(),
         history_window,
+        mcp: mcp.clone(),
     });
 
     let session = Session {
@@ -264,11 +311,21 @@ pub async fn build(
         cron_runner,
         spec,
         gate,
+        mcp,
     };
     if resume.is_none() {
         session.persist_all().await?;
     }
     Ok(session)
+}
+
+/// Wrap an engine so every decision it makes is written to the audit trail.
+///
+/// §7 asks for a row per tool decision, and the engine writes one only where a
+/// guard verdict was involved. The decorator is applied here rather than inside
+/// the engine so the rule order stays untouched — see [`RecordingGate`].
+fn recording(engine: Arc<PolicyEngine>, store: &Arc<Store>) -> Arc<dyn ToolGate> {
+    RecordingGate::arc(engine, store.approvals())
 }
 
 /// The `[workspace]`, `[exec]` and `[http_fetch]` values that shape the tool set.
@@ -303,6 +360,7 @@ fn build_gate(
     tty: bool,
     yes: bool,
     deny: bool,
+    policies: Vec<minion_core::policy::ToolPolicy>,
 ) -> Arc<PolicyEngine> {
     let allow = config
         .policy
@@ -343,7 +401,8 @@ fn build_gate(
         tty,
     )
     .with_ui(approval::ui_for(tty))
-    .with_store(store.approvals());
+    .with_store(store.approvals())
+    .with_tool_policies(policies);
 
     // The optional System One guard (SDD §5.6, D16). Disabled by default; when
     // enabled it can only shorten a prompt into a silent allow, and it is never
@@ -372,7 +431,12 @@ fn build_gate(
 /// Deny rules and allow rules still apply first, so an allowlisted command runs
 /// and a denied one is still denied: this narrows nothing and widens nothing
 /// except the absence of a human.
-pub fn build_cron_gate(config: &Config, store: &Arc<Store>, scope: &str) -> Arc<PolicyEngine> {
+pub fn build_cron_gate(
+    config: &Config,
+    store: &Arc<Store>,
+    scope: &str,
+    policies: Vec<minion_core::policy::ToolPolicy>,
+) -> Arc<PolicyEngine> {
     let allow = config
         .policy
         .allow
@@ -395,7 +459,8 @@ pub fn build_cron_gate(config: &Config, store: &Arc<Store>, scope: &str) -> Arc<
             scope.to_string(),
             false,
         )
-        .with_store(store.approvals()),
+        .with_store(store.approvals())
+        .with_tool_policies(policies),
     )
 }
 
@@ -408,10 +473,13 @@ pub fn build_cron_gate(config: &Config, store: &Arc<Store>, scope: &str) -> Arc<
 struct JobAgentRunner {
     spec: ProviderSpec,
     tools: Arc<ToolRegistry>,
-    gate: Arc<PolicyEngine>,
+    gate: Arc<dyn ToolGate>,
     config: Config,
     store: Arc<Store>,
     history_window: usize,
+    /// Shared with the session, so a job sees the servers a turn would and can
+    /// revive one that was down.
+    mcp: Arc<McpServers>,
 }
 
 impl JobAgentRunner {
@@ -440,6 +508,12 @@ impl JobAgentRunner {
     }
 
     async fn execute(&self, job: &Job) -> Result<RunReport> {
+        // A job runs unattended, so a server that was down when the session
+        // started gets another chance here rather than being lost for good.
+        for notice in self.mcp.refresh(OnStart::All).await {
+            tracing::info!(job = %job.label(), "{notice}");
+        }
+
         let workspace = PathBuf::from(&job.cwd);
         let system = Message::system(system_prompt(&self.config, &workspace, &self.tools));
         let (session_id, mut history) = self.conversation(job).await?;
@@ -830,7 +904,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.policy.default, Decision::Ask);
         assert_eq!(config.policy.noninteractive, Decision::Deny);
-        let gate = build_cron_gate(&config, &store, "/workspace");
+        let gate = build_cron_gate(&config, &store, "/workspace", Vec::new());
 
         // `cron_add` is `Write`: with a terminal this would prompt.
         let err = gate
@@ -877,7 +951,7 @@ mod tests {
             tool: "run_command".to_string(),
             pattern: "*sudo*".to_string(),
         });
-        let gate = build_cron_gate(&config, &store, "/workspace");
+        let gate = build_cron_gate(&config, &store, "/workspace", Vec::new());
 
         gate.check(
             "run_command",

@@ -95,7 +95,16 @@ pub async fn interactive(
         }
 
         let turn_start = state.history.len();
+        // Retry the external servers before the turn they would serve, and give
+        // a `system` message to anything that changed (§5.10).
+        for notice in state.refresh_mcp().await {
+            eprintln!("… {notice}");
+            state.history.push(Message::system(notice));
+        }
         state.history.push(Message::user(trimmed));
+        // Where the reply will begin. Taken from the length rather than assumed
+        // to be `turn_start + 1`, because a notice may have been pushed too.
+        let reply_start = state.history.len();
         if let Err(err) = state.persist_since(turn_start).await {
             // Losing the turn is bad, but so is losing the user's prompt; say so
             // and keep going rather than exiting.
@@ -119,7 +128,7 @@ pub async fn interactive(
         let _ = rendering.await;
 
         // Persist what the turn added, including a partial turn after Ctrl-C.
-        if let Err(err) = state.persist_since(turn_start + 1).await {
+        if let Err(err) = state.persist_since(reply_start).await {
             eprintln!("minion: could not save the assistant reply: {err}");
         }
 
@@ -128,6 +137,8 @@ pub async fn interactive(
         }
     }
 
+    // The external servers belong to the session, so they go with it.
+    state.shutdown().await;
     Ok(())
 }
 

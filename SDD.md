@@ -733,6 +733,10 @@ failures are exact instead of "patch did not apply":
 
 #### `mcp_call`
 
+> **Not implemented (M5).** The flattened `mcp__<server>__<tool>` tools below are the surface that
+> ships; `mcp_call` is deferred because the per-server approval policy keys on a tool name and this
+> tool would have to be special-cased to read `args.server` for its decision. See §5.10.
+
 | Field | Spec |
 |---|---|
 | Risk | Inherited from the target tool's declared risk, minimum `Network` |
@@ -769,6 +773,13 @@ classifier flags an eligible category    → guard; allow at/below allow_thresho
 
 Deny rules and allowlists are unaffected and still run first, and a guard error resolves to `Ask`
 rather than `Ok`. FR-43 through FR-47 are the normative statement.
+
+**Per-family fallbacks (M5, D21).** The engine can also carry a list of `ToolPolicy { prefix, decision }`
+that substitutes the *fallback* rules 5 and 6 for a family of tools. It is how an MCP server gets its
+own approval policy: the client registers one entry per server, keyed on the `mcp__<server>__` prefix
+its tools carry, so a trusted local server can be `auto` while a network server stays `ask`. Only the
+fallback moves — deny rules, allow rules and the classifier still run first, and the longest matching
+prefix wins so the outcome does not depend on the order the servers were configured in.
 
 The guard is consulted only where a prompt would otherwise be shown. A non-interactive run has no
 prompt to resolve, so it never reaches the model and still takes `policy.noninteractive` (D15): a
@@ -993,6 +1004,58 @@ The server task is started with `minion mcp serve` (stdio). It uses `rmcp`'s ser
 - Server failures degrade gracefully: the tools are removed from the catalog and a `system` notice explains why. They are retried on the next turn.
 - Tool name collisions with built-ins are resolved by prefixing, never shadowing: built-ins always win.
 
+**Configuration.** Each `[mcp.client.servers.<name>]` entry is `command`, `args`, `lazy`, `tool_allow`
+and `approval`. The table key is the namespace: it names every tool of that server, and a key containing
+`__` is rejected at load time rather than left to collide with another server's. `command` is spawned
+directly, never through a shell, so an argument cannot become a second command.
+
+```toml
+[mcp.client.servers.files]
+command = "mcp-server-files"
+args = ["--root", "/srv"]
+lazy = true                       # contact it on the first turn, not at startup
+tool_allow = ["read_*", "list"]   # empty allows nothing; ["*"] allows everything
+approval = "auto"                 # this server's tools substitute the global default
+```
+
+**What is published, and what is gated (as implemented, M5).** An external tool is an ordinary `Tool`:
+the same registry, the same `Agent::dispatch`, and the same approval gate as `run_command`. There is no
+path from the model to a server that skips a policy decision. Its risk class is always `Network` —
+`§5.5` says "inherited from the target tool's declared risk, minimum `Network`", and since MCP states
+risk only in `ToolAnnotations`, which are *hints from a server minion does not vouch for*, an inherited
+hint could only ever lower the class. With the floor at `Network` the honest reading is the floor
+itself (D21, T6). `tool_allow` is applied before the catalogue is built, so a tool the operator did not
+name is absent from the schemas the model receives *and* unresolvable by name; there is one thing the
+operator has to write to widen it, and it is in the config.
+
+**The catalogue is live, not a snapshot.** `minion-core` exposes a `ToolCatalog` trait, and the
+registry consults it on every read of the tool list. That is what makes §5.10's "retried on the next
+turn" real: at the start of each turn the client re-attempts every server that is not up, and a server
+that answers publishes its tools into the catalogue the model is about to be offered — through the
+same frozen `Arc<ToolRegistry>` the session was built with. Ordering is the shadowing rule: registered
+tools come first and a name already taken is skipped, so an `mcp__…` tool can never displace a
+built-in, whatever a server calls itself.
+
+**`lazy`.** A lazy server is not contacted while the session is assembled; the first turn does it
+(`OnStart::Eager` versus `OnStart::All`). Its tools still reach the catalogue from that point, because
+a tool list cannot be discovered without a connection — `lazy` buys a cheaper session start, not a
+hidden tool set. `minion mcp list` and `minion mcp tools <server>` are explicit uses and start a lazy
+server immediately, which is also how an operator inspects one.
+
+**Failure.** A server that cannot be started costs its tools and nothing else: the turn completes, the
+tools are gone from the catalogue, and the reason arrives as a `system` message. Notices are emitted on
+*transitions* only, so a server that stays down is explained once rather than on every turn.
+
+**Shutdown.** `minion` closes its MCP connections on the way out of both the REPL and a one-shot run,
+so a session does not leave server processes behind. A hard kill (SIGKILL) can still orphan a child;
+that is documented rather than hidden.
+
+**`mcp_call` is not implemented.** §5.5 lists it as a generic escape hatch for models that prefer a
+compact tool list. The flattened tools are the primary surface this milestone delivers, and a generic
+`mcp_call(server, tool, …)` would need a policy decision that the per-server policy cannot express —
+the gate decides on a tool name, and `mcp_call` would have to be special-cased to read `args.server`.
+Deferred rather than half-gated; see AGENTS.md's known gaps.
+
 ### 5.11 Frontend (fx-like REPL)
 
 **Philosophy:** the terminal is a scrollback, not a canvas. No alternate screen, no full redraw, no mouse capture.
@@ -1168,7 +1231,7 @@ For each capability, an operator should be able to answer "who can trigger this?
 | M3 — Memory + HTTP | done | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
 | M3.5 — System One guard | done | Optional `/v1/systemone` judge for flagged `run_command`, two thresholds, category floor, audited verdicts | An ineligible command never reaches the model; every failure path prompts; a guard that returns `Err` cannot produce an allow |
 | M4 — Cron | done | Scheduler, job CRUD, run history, catch-up | A weekly job fires on a virtual clock test |
-| M5 — MCP client | | External servers, namespaced tools, per-server policy | External tool callable with approval |
+| M5 — MCP client | done | External servers, namespaced tools, per-server policy | External tool callable with approval |
 | M6 — MCP server | | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
 | M7 — Hardening | | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
 
@@ -1284,3 +1347,5 @@ than editing individual tools.
 | D17 | `[http_fetch].allowed_domains` is the reachability guard, kept separate from the approval allowlist — a deliberate deviation from §5.5's approval row, pending the spec owner's confirmation | §5.5 states the guard ("domain must match `allowed_domains`") and the approval rule ("`auto` if domain allowlisted, otherwise `ask`") as if one list drove both. Read as one list, the approval row's `otherwise ask` clause can never fire — the guard refuses a host outside the list before approval is reached — so the only operative rule would be "`auto` if allowlisted". This implementation keeps the two mechanisms apart: `allowed_domains` is the reachability boundary and the SSRF mitigation T3 names, while `[policy.allow]` is what skips the prompt, matched against the URL host because the tool reports the host as its approval subject. The result is stricter than §5.5's row, not looser: an allowlisted domain still prompts on a TTY and is still refused in a pipe (D15) until it is given a policy allow rule or `--yes`, and nothing added for reachability is silently auto-approved. The alternative — letting the guard's list also drive approval — would either reduce the SSRF boundary to a mere prompt or auto-approve every domain added to `allowed_domains`, including in a non-interactive run. Recorded as a deviation from §5.5's approval row for the spec owner to confirm or overrule. |
 | D18 | A job's `schedule` is a five-field **Vixie** cron expression, translated into the parser's six-field Quartz grammar before it is parsed | The `cron` crate's grammar is Quartz-flavoured in two ways that silently change what an expression means. It puts seconds first, so a five-field string is prefixed with `0 ` — every SDD expression fires on the zeroth second of its minute, which is what a five-field cron means everywhere else, and a user who types six fields is told so rather than quietly getting a different schedule. And it numbers the days of the week `1` = Sunday, where every other cron numbers them `0`/`7` = Sunday and `1` = Monday: left alone, `0 9 * * 1` fires on Sunday, a day out from what the user wrote. The day-of-week field is therefore rewritten element by element (plain numbers, ranges, lists, and stepped forms), a bare `*` or `*/n` is left alone because a wildcard's offset is uniform so the set of days is identical in either numbering, and names (`mon`) pass through because both conventions agree on them. A range that would wrap (`6-1`) is refused instead of being silently reordered. One further deviation is documented rather than fixed: when *both* day-of-month and day-of-week are restricted, the parser ANDs them where Vixie ORs them, so `0 9 1 * 1` means "the 1st, if it is a Monday" — an expression that rare is better left explicit, and pretending otherwise would need a scheduler of our own |
 | D19 | A cron run always takes the non-interactive policy, and a fire consumes its occurrence | §11's open question 2 is settled as fail-closed, and the reason is the same one D15 gives: consent requires a person who is being asked. A job prompt has no terminal even when the scheduler is ticking inside a REPL that has one, so its gate is built with `interactive = false` **and no approval UI**, which makes `policy.noninteractive` the deciding rule for anything that changes something and leaves deny rules and allowlists in front of it untouched. A job cannot promote an `ask` tool to `auto`, cannot reach the System One guard (there is no prompt for it to resolve), and cannot create or delete other jobs unless an allow rule names it — the three properties the milestone's tests pin. The fire path is the other half: the occurrence is consumed when it fires, not when it finishes, because `next_run_at` recomputed only on completion would leave a job whose run outlasts its own interval looking due on every tick, and every tick would then record an overlap. Completion recomputes from the cron expression and the completion instant, which can only move the value later, so the "on completion" sentence in §5.7 and the fire-time advance agree instead of fighting. `missed_run_policy` stays a `[cron]` setting rather than a per-job column, since the schema has none and inventing one means a migration for a knob nobody has asked to vary per job; catch-up replays occurrences without the overlap check, because a replayed occurrence never ran and there is no live run to collide with, while `max_concurrent_jobs` and `missed_run_cap` still bound the burst. A `reuse` job's session is adopted in a *separate* statement from the run's terminal status, because `jobs.session_id` is a foreign key and an adoption that fails must not roll back the record that the run finished |
+| D20 | The tool catalogue the model sees is read live from a `ToolCatalog`, and `lazy` defers a server's spawn to the first turn rather than hiding its tools | §5.10 asks for two things that a registry frozen at session assembly cannot both have: the servers are "spawned at startup", and a server that failed is "retried on the next turn". A `Vec<Box<dyn Tool>>` built once can do neither — a retry that cannot re-add a tool is not a retry. So the registry keeps its registered tools and *consults* a catalogue on every read of the tool list; an MCP failure adds or removes entries in a structure that changes under the frozen `Arc<ToolRegistry>` every caller already holds. That also settles shadowing by construction rather than by convention: registered tools are enumerated first and a name already present is skipped, so a server cannot publish a name a built-in owns, and two servers cannot fight over one. `lazy` is the one place where a literal reading had to be traded for a useful one. "Spawned lazily on first use" cannot mean "hidden until a tool is called", because a tool cannot be called before it is listed and a server cannot list tools before it is spawned — the two requirements would deadlock. It therefore means the spawn is deferred from session assembly to the first turn: opening a session (or `minion mcp list`, which is an explicit ask) does not start a process, and the tools reach the catalogue from that point rather than being invisible. The alternative — lazy servers reachable only through a generic `mcp_call` — was rejected because it moves the policy decision off the tool name the per-server policy keys on. `mcp_call` itself is deferred for that reason; the flattened tools are the surface §5.10 describes as primary |
+| D21 | An external tool is always `Risk::Network`, and a server's `policy` substitutes the global default *and* the non-interactive decision for its own tools | §5.5 says an external tool inherits the target's declared risk with `Network` as a floor. MCP declares risk only in `ToolAnnotations`, and the protocol's own documentation says a client must not make tool-use decisions from them — they come from a server the operator has not vouched for (T6). Since the floor is `Network`, an inherited hint could only ever *lower* the class, never raise it, so the floor is the whole rule and the annotations are ignored. The consequence is deliberate: every external call is gated at least as strictly as an outbound HTTP request, and D15 puts `Network` on the side of the line that a missing terminal refuses. The per-server policy then has to mean something for an unattended run, or "a trusted local server can be `auto`" would be false the moment a pipe is involved. It therefore substitutes both fallbacks — `policy.default` and `policy.noninteractive` — and nothing else: deny rules, allow rules and the command classifier still run first and still win, so a family marked `auto` cannot resurrect a refusal that already happened, and a family marked `deny` refuses its tools outright. This is the trust boundary §6.3 describes applied literally: each MCP client is its own entry point, and the config states its policy in one place |

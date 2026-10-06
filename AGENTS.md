@@ -2,12 +2,13 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0 through M4 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0 through M5 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
 sessions, keyword memory, `http_fetch` with its SSRF guard, `minion init`, the optional System One
-guard for the approval gate, and the in-process cron scheduler with job CRUD, run history and
-catch-up. The work for M4 landed on branch `m4-cron`, cut from `m3.5-systemone`.
+guard for the approval gate, the in-process cron scheduler with job CRUD, run history and catch-up, and
+the **MCP client** that consumes external servers as gated tools. The work for M5 landed on branch
+`m5-mcp-client`, cut from `m4-cron`.
 
 **M3 is done.** `remember`/`recall` live in `minion-store/src/memory.rs`,
 `minion-tools/src/memory.rs` and `minion-core/src/memory.rs`; `http_fetch` and its guard are
@@ -27,8 +28,17 @@ and run types plus the `JobStore` boundary are `minion-core/src/job.rs` and the 
 `minion-cli/src/setup.rs`. `[cron]` is `CronConfig` in `minion-core/src/config.rs`. The `jobs`,
 `job_runs` and `audit_log` tables were created by the baseline migration and now have writers.
 
-`minion-mcp` is still an **empty stub** for M5–M6. Its manifest lists real dependencies (`rmcp`),
-but there is no code behind it yet.
+**M5 is done.** The client is `minion-mcp`: `client.rs` wraps one `rmcp` stdio connection, `servers.rs`
+owns the configured set and implements `minion_core::tool::ToolCatalog`, and `tool.rs` is the external
+tool's `Tool` implementation. `[mcp.client.servers.*]` is `McpConfig` / `McpClientConfig` /
+`McpServerConfig` in `minion-core/src/config.rs`; the live catalogue seam is `ToolCatalog` and the
+registry in `minion-core/src/tool.rs`; the per-server approval fallback is `ToolPolicy` in
+`minion-core/src/policy.rs`; the subcommand is `minion-cli/src/mcp.rs` and the wiring is in
+`setup.rs`, `run.rs` and `repl.rs`. `src/bin/mcp_stub_server.rs` is a real MCP server used as the test
+fixture, so the tests exercise a process boundary rather than a mock.
+
+`minion-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. The
+**server** half (`mcp serve`, §5.9) is still M6.
 
 `default_registry` takes a second argument, an `Arc<Store>`, because the memory and cron tools need
 one, and a third, a `CronContext`, carrying the clock and default timezone the `cron_*` tools use.
@@ -46,11 +56,18 @@ cargo +1.89.0 build                # whole workspace
 cargo +1.89.0 test --workspace     # all tests; offline, no network, no API key needed
 cargo +1.89.0 test -p minion-core   # one crate
 cargo +1.89.0 test -p minion-cron   # the scheduler: virtual clock, no sleeps, no network
+cargo +1.89.0 test -p minion-mcp    # the MCP client: spawns the stub server, no network
 cargo +1.89.0 test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
 cargo +1.89.0 clippy --all-targets -- -D warnings    # lint gate; currently clean
 cargo +1.89.0 fmt --all
 ./target/debug/minion --help
 ```
+
+`cargo test -p minion-mcp` needs no network, but it *does* spawn processes: the tests run
+`target/debug/mcp-stub-server`, the fixture binary in that crate, over a real stdio pipe. That is the
+point — the plumbing (spawning, listing, filtering, surviving a dead server) cannot be tested against
+an in-process mock. A snapshot went stale? `INSTA_UPDATE=always cargo +1.89.0 test -p minion-mcp`
+rewrites `tests/snapshots/*.snap`, and the diff is the review.
 
 **Invoke cargo as `cargo +1.89.0`.** The installed `default` toolchain on this machine is 1.88.0,
 which is below the workspace's `rust-version = "1.89"` and cannot build it at all — cargo refuses
@@ -94,7 +111,15 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   `http_fetch`, and `setup::build_gate` attaches a `PolicyEngine` to the agent. A registry built
   without a gate is only safe for read-only use — if you add a tool, confirm the gate is wired, not
   that the tool "seems harmless". `http_fetch` is `Risk::Network`, which is gated with the writes
-  (D15), so a non-TTY refuses it too.
+  (D15), so a non-TTY refuses it too. **An external MCP tool is no different**: it is an ordinary
+  `Tool`, dispatched by the same `Agent::dispatch`, so there is no second path to a server and nothing
+  to wire separately.
+- **A catalogue tool never shadows a registered one.** The registry enumerates registered tools first
+  and skips a name already taken, so `mcp__…` cannot displace a built-in whatever a server calls
+  itself. Don't "fix" that by letting a catalogue override a name — the ordering *is* the guarantee.
+- **`tool_allow` is fail-closed.** An empty list allows nothing; `["*"]` is how an operator says
+  everything. It is applied before the catalogue is built, so a tool that is not listed is absent from
+  the schemas *and* unresolvable by name.
 - Approval is fail-closed: non-TTY never prompts and defaults to `deny`; deny rules always beat
   allowlists.
 - The MCP server is read-only by default. `expose_exec`/`expose_write` stay `false`; `run_command`
@@ -258,6 +283,55 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   and the prompt behind `minion_cron::JobRunner`. Keep it that way — it is what lets the firing rules
   be tested against an in-memory fake and a `ManualClock`.
 
+## MCP client rules (M5)
+
+- **An external tool is a `Tool`, and that is the whole security story.** It goes through
+  `ToolRegistry` and `Agent::dispatch` like `run_command`, so it passes `ToolGate::check` before it is
+  invoked. If you ever add a way to reach a server that is not a registered tool, you have added a
+  path around the gate — `mcp_call` was left unimplemented for exactly that reason (see the known
+  gaps).
+- **External tools are always `Risk::Network`, and the annotations are ignored.** MCP states risk in
+  `ToolAnnotations`, which are hints from a server the operator has not vouched for; the protocol's own
+  docs say a client must not make tool-use decisions from them. With `Network` as the floor, honouring
+  a hint could only ever *lower* the class. Don't "use `readOnlyHint` to skip the prompt" — that hands
+  the decision to the thing being decided about (D21, T6).
+- **The catalogue is read live, from a frozen registry.** `ToolRegistry` holds registered tools plus
+  any number of `ToolCatalog`s, and `all()` is consulted on every `get`/`schemas`/`risks`. That is what
+  lets a server that came up mid-session be offered on the *next turn* without rebuilding anything the
+  session already holds. `crate::tool::tests` pins the dedup order; `McpServers` is the only
+  implementation today.
+- **`Tool::name()` is `&'static str`, so runtime names are interned, not leaked per reconnect.**
+  `McpServers` keeps one `Box::leak` per distinct name and description (`Interner`). A server that
+  flaps must not allocate a fresh copy every turn. Changing `Tool::name` to `&str` would remove the
+  leak, and would touch every tool — not worth it for this.
+- **`refresh(OnStart::Eager)` while assembling, `refresh(OnStart::All)` per turn.** The first skips
+  `lazy` servers (that is what `lazy` means: don't spawn a process for a session that never takes a
+  turn); the second is the retry §5.10 promises and must run before the turn's first provider call, or
+  a server that came back is not in the catalogue the model is offered. `setup::Session::refresh_mcp`
+  is the entry point; `JobAgentRunner::execute` calls it too, because a cron run is a turn.
+- **Notices are emitted on transitions only.** `refresh` compares the new state against the previous
+  one and stays quiet when nothing changed, so a server that is down for ten turns produces one
+  `system` message, not ten. Keep the comparison in the notice path — the WARN log is separate and
+  repeats on every attempt on purpose.
+- **A `system` notice goes into the transcript, after the prompt.** Index 0 of `history` is the system
+  prompt and must stay there; notices are appended after it (`setup::build`, `run.rs`, `repl.rs`).
+- **The REPL's second `persist_since` takes an explicit index.** It used to be `turn_start + 1`, which
+  was correct only while exactly one message was pushed before the turn. A notice makes that two, and
+  the off-by-one duplicated the user's prompt in the database. `reply_start` is now captured from
+  `history.len()`.
+- **`minion` closes its MCP connections on the way out.** `Session::shutdown` → `McpServers::shutdown`
+  → `McpClient::close`, called from `run::one_shot` and `repl::interactive`. Without it a REPL exit
+  can leave a server process behind, because the transport's kill runs from a spawned task that a
+  shutting-down runtime may never schedule. The short sleep in `shutdown` is there for the same reason.
+- **`rmcp` is quieted at the default verbosity.** `init_logging` appends `,rmcp=warn` when `-v` was not
+  passed; the library logs an INFO line per service init, cancellation and shutdown, and stderr is the
+  channel the REPL uses for tool activity. `-v` leaves it alone so a protocol problem is still
+  debuggable.
+- **`minion-cli::setup::recording` wraps every gate in a `RecordingGate`.** §7 asks for an audit row
+  per tool decision, and the engine only wrote one where a guard verdict was involved — so an allowed
+  `read_file`, or any external call at all, left no trace. It is a decorator on purpose: the rule order
+  in `PolicyEngine::check` is the security property, and wrapping records without touching it.
+
 ## Memory rules
 
 - **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and
@@ -336,8 +410,21 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 ## Known gaps (don't mistake these for bugs)
 
-- The CLI has `run`, `init`, `session`, `cron`, and the default REPL. There is still no `doctor`,
-  `mcp`, or `config` subcommand, so §5.12's CLI surface is only partly built.
+- The CLI has `run`, `init`, `session`, `cron`, `mcp list` / `mcp tools`, and the default REPL. There
+  is still no `doctor`, no `config` subcommand and no `mcp serve` (that is M6), so §5.12's CLI surface
+  is only partly built.
+- **`mcp_call` is not implemented.** §5.5 lists a generic `mcp_call(server, tool, arguments)` escape
+  hatch. The per-server approval policy keys on a tool *name*, so a generic tool would either have to
+  be special-cased to read `args.server` for its decision, or would let a server marked `deny` be
+  reached anyway. The flattened `mcp__<server>__<tool>` tools are the surface that ships; a caller who
+  wants the compact form needs a decision about how it is gated first (D20).
+- **A `lazy` server's tools are not in `/tools` until the first turn.** Laziness defers the spawn to
+  the first turn, and tools cannot be discovered without a connection, so a REPL shows only the
+  built-in tools until someone asks for something. `minion mcp list`/`mcp tools <server>` start it
+  immediately.
+- **The per-server policy is only enforced on the flattened tools.** A server whose `approval` is
+  `deny` refuses `mcp__<server>__*`; nothing else can reach it, because `mcp_call` does not exist. If
+  that tool is ever added, it has to honour the same family policy or the `deny` becomes decorative.
 - **The cron tick loop is verified by unit tests on a virtual clock and by one manual end-to-end
   run, not by an automated integration test against a real clock.** `scheduler.rs` drives every
   firing rule through `tick()`/`catch_up()` directly with a `ManualClock`, and
@@ -443,3 +530,55 @@ What to check, and what was checked:
 
 `python3` and `sqlite3` are enough to inspect the database; the throwaway helper used for this is a
 three-line `sqlite3.connect` plus a `SELECT * FROM jobs` / `SELECT * FROM job_runs`.
+
+### MCP client end to end
+
+The client's unit tests spawn the stub server themselves, so this recipe is for the *binary* path: a
+real `minion`, a real server process, a real gate and a real audit row.
+
+```sh
+# 1. the fixture server is a normal cargo bin
+cargo build                       # produces target/debug/mcp-stub-server
+
+# 2. a config that consumes it, plus one server that cannot start
+cat > /tmp/m5/minion.toml <<'TOML'
+[provider]
+base_url = "http://127.0.0.1:8099/v1"
+api_key_env = ""
+api_key_file = ""
+model = "stub-model"
+[cron]
+enabled = false
+[mcp.client.servers.stub]
+command = "/abs/path/target/debug/mcp-stub-server"
+tool_allow = ["*"]
+approval = "ask"
+[mcp.client.servers.ghost]
+command = "/nonexistent/mcp-server"
+tool_allow = ["*"]
+TOML
+
+# 3. what the model would be offered, and what tool_allow hides
+minion --config /tmp/m5/minion.toml mcp list
+minion --config /tmp/m5/minion.toml mcp tools stub
+
+# 4. a turn: the stub provider (the SSE stub above) asks for mcp__stub__echo
+minion --config /tmp/m5/minion.toml --db /tmp/m5/m5.db run "call the echo tool" < /dev/null
+```
+
+What to check, and what was checked:
+
+- `mcp tools stub` prints every tool the server lists, each with its flattened name, and marks the ones
+  `tool_allow` hides (`·` rather than `▸`). The `inputSchema` is the server's, byte for byte — the stub
+  carries an invented `x-stub-marker` and it survives.
+- With `approval = "ask"` and no allowlist, a piped run **refuses** the call: the transcript gains
+  `{"error":"denied by policy: …needs approval but nothing can answer a prompt…"}` and `audit_log` has
+  a `deny` row for `mcp__stub__echo`.
+- Add `[[policy.allow]] tool = "mcp__stub__echo" pattern = "*"` and the same run returns `pong` from
+  the server, with an `allow` row in `audit_log`.
+- Change the server to `approval = "auto"` and it runs unattended with no allowlist at all — the
+  per-server policy substituting the global non-interactive `deny`.
+- The unreachable `ghost` server costs only its tools: the turn completes, and exactly one `system`
+  message in the transcript explains why. A second turn adds no second copy.
+- `ps` shows no `mcp-stub-server` after any of those commands: the connections are closed on the way
+  out.

@@ -88,6 +88,34 @@ pub enum Command {
 
     /// Manage scheduled jobs (§5.12).
     Cron(CronArgs),
+
+    /// Inspect the external MCP servers minion consumes (§5.10, §5.12).
+    Mcp(McpArgs),
+}
+
+/// Arguments for `minion mcp`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct McpArgs {
+    /// The action to perform.
+    #[command(subcommand)]
+    pub action: McpAction,
+}
+
+/// MCP client actions.
+///
+/// `mcp serve` — the other direction — belongs to M6 and is deliberately not
+/// listed here yet: a subcommand that exists but refuses to run is worse than
+/// one that is not there.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum McpAction {
+    /// List configured servers, whether they came up, and the tools they offer.
+    List,
+
+    /// Inspect one server: everything it lists, and what minion publishes of it.
+    Tools {
+        /// The server's name, as it appears under `[mcp.client.servers]`.
+        server: String,
+    },
 }
 
 /// Arguments for `minion cron`.

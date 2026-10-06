@@ -15,6 +15,7 @@ libc = "0.2.189"
 minion-core = { version = "0.1.0", path = "../minion-core" }
 minion-cron = { version = "0.1.0", path = "../minion-cron" }
 minion-guard = { version = "0.1.0", path = "../minion-guard" }
+minion-mcp = { version = "0.1.0", path = "../minion-mcp" }
 minion-provider = { version = "0.1.0", path = "../minion-provider" }
 minion-store = { version = "0.1.0", path = "../minion-store" }
 minion-tools = { version = "0.1.0", path = "../minion-tools" }

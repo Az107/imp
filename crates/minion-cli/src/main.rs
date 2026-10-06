@@ -5,6 +5,7 @@ mod cli;
 mod cron;
 mod init;
 mod markdown;
+mod mcp;
 mod render;
 mod repl;
 mod run;
@@ -59,6 +60,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
         Some(Command::Init(_)) => unreachable!("handled above"),
         Some(Command::Session(args)) => session::run(&cli, &config, args.clone()).await,
         Some(Command::Cron(args)) => cron::run(&cli, &config, args.clone()).await,
+        Some(Command::Mcp(args)) => mcp::run(&cli, &config, args.clone()).await,
         Some(Command::Run { prompt }) => {
             let prompt = resolve_prompt(prompt)?;
             let stop = run::one_shot(&cli, &config, &cwd, prompt).await?;
@@ -100,11 +102,18 @@ fn resolve_prompt(prompt: &str) -> Result<String> {
 
 /// Logs always go to stderr so stdout stays machine-readable.
 fn init_logging(level: &str, format: LogFormat, verbose: u8) {
-    let level = match verbose {
+    let mut level = match verbose {
         0 => level.to_string(),
         1 => "debug".to_string(),
         _ => "trace".to_string(),
     };
+    // `rmcp` announces every service, task cancellation and shutdown at INFO.
+    // That is protocol chatter on a channel the REPL uses for tool activity, so
+    // it is quieted at the default verbosity and left alone once `-v` asks for
+    // the detail.
+    if verbose == 0 && !level.contains("rmcp") {
+        level.push_str(",rmcp=warn");
+    }
     let filter = tracing_subscriber::EnvFilter::try_new(&level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 

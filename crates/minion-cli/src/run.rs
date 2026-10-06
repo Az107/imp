@@ -34,6 +34,10 @@ pub async fn one_shot(
     // Everything from this index on belongs to the turn, and is persisted as a
     // unit so the transcript never contains half of one.
     let turn_start = session.history.len();
+    for notice in session.refresh_mcp().await {
+        eprintln!("… {notice}");
+        session.history.push(Message::system(notice));
+    }
     session.history.push(Message::user(prompt));
 
     // Printed before the renderer starts, so the two writers cannot interleave.
@@ -73,6 +77,9 @@ pub async fn one_shot(
             session.session_id
         );
     }
+
+    // The external servers belong to the session, so they go with it.
+    session.shutdown().await;
 
     Ok(outcome.stop)
 }
