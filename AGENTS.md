@@ -2,15 +2,21 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0 through M3 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0 through M3.5 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
-sessions, keyword memory, `http_fetch` with its SSRF guard, and `minion init`. Branch is `main`.
+sessions, keyword memory, `http_fetch` with its SSRF guard, `minion init`, and the optional System One
+guard for the approval gate. Branch is `main`.
 
 **M3 is done.** `remember`/`recall` live in `minion-store/src/memory.rs`,
 `minion-tools/src/memory.rs` and `minion-core/src/memory.rs`; `http_fetch` and its guard are
 `minion-tools/src/http_fetch.rs`, and the `[http_fetch]` config section is
 `HttpFetchConfig` in `minion-core/src/config.rs`. The milestone table in `SDD.md` reads `done`.
+
+**M3.5 is done.** The guard's policy — eligibility floor, thresholds, the `SystemOneGuard` trait —
+is `minion-core/src/guard.rs`, the engine consults it from `PolicyEngine::check`
+(`minion-core/src/policy.rs`, step 5b), and the `/v1/systemone` client is the `minion-guard` crate.
+`[guard]` is `GuardConfig` in `minion-core/src/config.rs`. Still disabled by default.
 
 `minion-cron` and `minion-mcp` are **empty stubs** for M4–M6. Their manifests list real dependencies
 (`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs` and
@@ -52,7 +58,7 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   second bin, or relying on the package name, will surprise you.
 - `minion-core` has **no terminal, network, or database dependencies** on purpose: the agent loop
   is tested against a scripted `MockProvider` in `crates/minion-core/src/agent.rs`. Keep it that
-  way — push I/O into `minion-provider`, `minion-tools`, or `minion-cli`.
+  way — push I/O into `minion-provider`, `minion-tools`, `minion-guard`, or `minion-cli`.
 - Assistant text goes to **stdout**; tool activity, logs, and errors go to **stderr**. This is what
   makes `minion run ... > answer.txt` clean. Don't print diagnostics to stdout.
 - **Piped output is never rendered.** `run::style_for` checks `IsTerminal` *before* honouring
@@ -164,6 +170,41 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - The approval prompt matches exact input only. First-character matching used to turn `sure` into
   session scope; keep the strict match.
 
+## Guard rules (M3.5)
+
+- **The guard may only narrow a prompt.** It is consulted at the one place a prompt would be shown
+  (`PolicyEngine::check`, step 5b), after deny rules, allowlists, the classifier and the
+  non-interactive decision, so a silent allow there can only shorten the path to a prompt. If you
+  move the call, the property to preserve is that every refusal still refuses and every earlier
+  decision still decides.
+- **A non-interactive run never reaches the guard, and must not.** There is no prompt to resolve off
+  a terminal, so the request is not made and `policy.noninteractive` still decides. The call sits
+  after the `!self.interactive` branch on purpose: before it, a model allow would let a `curl`
+  through a pipe that D15 deliberately denies.
+- **`privilege`, `remote-execution` and `destructive` are a floor, not a filter.**
+  `minion_core::guard::is_eligible` runs before any socket is opened, and one ineligible tag poisons
+  the whole command — `curl … && sudo …` is ineligible. A command the classifier did not flag is not
+  eligible either: the guard resolves a *flagged* prompt and nothing else. Don't "improve" the floor
+  by letting the model opine on an ineligible command.
+- **`state` is the command string alone.** `{"state": "<command>"}` is the entire request body; the
+  transcript, tool output and file contents are never included (FR-46). A test asserts the payload
+  has exactly one key.
+- **A verdict is a number and the thresholds live in our code.** The reply is `{"unsafe": <0..1>}`,
+  so a model cannot assert itself into an allow in prose. Non-JSON, a missing or non-numeric `unsafe`,
+  a non-finite value, or one outside `[0, 1]` is an error.
+- **Every failure is a prompt, never an allow.** Network, timeout, non-2xx, unreadable body: the
+  guard returns `Err` and the engine falls through to the ordinary prompt (FR-45). Do not "fall back
+  to the default decision" here — the failure path *is* the prompt.
+- **The middle band is not a refusal.** A verdict above `allow_threshold` prompts whether it lands
+  between the thresholds or above `deny_threshold`; the band only changes what the audit records
+  (`guard_uncertain` vs `guard_deny`). FR-47 keeps a human in the middle by design.
+- **Every verdict is audited**, failures included (`guard_error`), through `ApprovalStore::audit`,
+  which is best effort and never fails a turn.
+- **`[guard]` is off by default, wired in `minion-cli::setup::build_gate`.** `minion-core` has no
+  network dependency; `minion-guard` is the only crate that opens the socket, behind the
+  `SystemOneGuard` trait. Keep the client there — a `reqwest::Client` in `minion-core` breaks the
+  rule that lets the loop be tested against a mock provider.
+
 ## Memory rules
 
 - **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and
@@ -244,12 +285,16 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 - The CLI has `run`, `init`, `session`, and the default REPL. There is still no `doctor`, `cron`,
   `mcp`, or `config` subcommand, so §5.12's CLI surface is only partly built.
-- **M3.5 (the System One guard, D16) is specified but not written.** `SDD.md` has FR-43–FR-47,
-  the D16 entry, a T14 threat row and an R9 risk row for it, and no code exists. If you are reading
-  this expecting a `[guard]` block in `config.rs` or a `minion-guard` crate, neither is there. The
-  design constraints that matter when it gets written: the guard may only narrow prompts, never
-  widen permissions; `privilege`/`remote-execution`/`destructive` never reach the model; every
-  failure path resolves to the existing prompt; only the command string is sent as `state`.
+- **M3.5's guard policy is tested, its interactive wiring is not.** `minion-core` unit-tests the
+  floor, the thresholds and the engine (with a fake guard) and `minion-guard` runs the real HTTP
+  client against a fake `/v1/systemone` server inside the real engine, but no test drives a real
+  keystroke through `minion` with the guard enabled — the same limitation as the approval prompt.
+- **The `/v1/systemone` response contract is ours.** The SDD says the model returns calibrated
+  numbers; it does not say which field carries one. This implementation reads a top-level `unsafe` in
+  `[0, 1]` and treats anything else as unreadable, which prompts. If a real vendor shape differs, only
+  `parse_verdict` in `crates/minion-guard/src/lib.rs` changes.
+- The guard is a **noise filter, not a boundary**: it resolves prompts strictly inside the boundary
+  the static rules drew, and it is off by default.
 - **The interactive approval keystroke path is not machine-tested.** The prompt renders correctly and
   `parse_choice` plus all four engine outcomes are unit-tested, but a pty harness kept
   desynchronising, so no test drives a real keypress end to end. Treat it as unverified.

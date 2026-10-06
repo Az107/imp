@@ -1122,6 +1122,7 @@ dependencies = [
  "libc",
  "minion-core",
  "minion-cron",
+ "minion-guard",
  "minion-provider",
  "minion-store",
  "minion-tools",
@@ -1166,6 +1167,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "minion-guard"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "minion-core",
+ "reqwest",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

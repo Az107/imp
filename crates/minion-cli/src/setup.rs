@@ -8,11 +8,13 @@ use std::time::Duration;
 use minion_core::agent::AgentOptions;
 use minion_core::config::{Config, Decision};
 use minion_core::error::{Error, Result};
+use minion_core::guard::GuardThresholds;
 use minion_core::message::{Message, Role};
 use minion_core::policy::PolicyEngine;
 use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
 use minion_core::{Agent, new_session_id};
+use minion_guard::HttpSystemOneGuard;
 use minion_provider::OpenAiProvider;
 use minion_store::{NewSession, SessionRow, Store};
 use minion_tools::{ToolConfig, default_registry};
@@ -296,18 +298,30 @@ fn build_gate(
         config.policy.noninteractive
     };
 
-    Arc::new(
-        PolicyEngine::new(
-            allow,
-            deny_rules,
-            default,
-            noninteractive,
-            scope.to_string(),
-            tty,
-        )
-        .with_ui(approval::ui_for(tty))
-        .with_store(store.approvals()),
+    let engine = PolicyEngine::new(
+        allow,
+        deny_rules,
+        default,
+        noninteractive,
+        scope.to_string(),
+        tty,
     )
+    .with_ui(approval::ui_for(tty))
+    .with_store(store.approvals());
+
+    // The optional System One guard (SDD §5.6, D16). Disabled by default; when
+    // enabled it can only shorten a prompt into a silent allow, and it is never
+    // consulted off a terminal because there is no prompt to resolve there.
+    let engine = if config.guard.enabled {
+        engine.with_guard(
+            Arc::new(HttpSystemOneGuard::new(&config.guard)),
+            GuardThresholds::from(&config.guard),
+        )
+    } else {
+        engine
+    };
+
+    Arc::new(engine)
 }
 
 /// The system prompt: persona plus a digest of what the agent is allowed to do.

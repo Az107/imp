@@ -10,7 +10,7 @@ already cost time, for anyone (human or agent) working on this next.
 
 ## Status
 
-Milestones M0 through M3 are done. What works today:
+Milestones M0 through M3.5 are done. What works today:
 
 - **Streaming agent loop** against any OpenAI-compatible endpoint
 - **Eight tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
@@ -18,6 +18,10 @@ Milestones M0 through M3 are done. What works today:
 - **Approval engine** — every write, exec, and network call is gated by a policy
   engine, with an allowlist, persisted approvals, and a fail-closed
   non-interactive path
+- **Optional System One guard** — an opt-in `/v1/systemone` judge may resolve a
+  flagged `run_command` prompt when it rates the command reversible; destructive,
+  privileged and remote-execution commands are resolved before any network call
+  and always prompt
 - **Workspace memory** — `remember`/`recall` over SQLite FTS5, scoped to the
   canonical workspace root
 - **Guarded HTTP** — `http_fetch` with a domain allowlist (`https` unless an
@@ -102,6 +106,11 @@ writes or executes goes through a policy engine that decides *before* the call:
 - `http_fetch` reaches only hosts in its `[http_fetch]` allowlist, refuses
   private, loopback, link-local and cloud-metadata addresses, and does not
   follow a redirect off an allowed host.
+- The **optional System One guard** (`[guard]`, off by default) is a noise filter
+  inside that boundary, not a new authority: it can turn a *prompt* into a silent
+  allow and nothing else. `privilege`, `remote-execution` and `destructive`
+  commands never reach it, only the command string is ever sent, and any failure
+  — network, timeout, rate limit, unreadable body — falls back to the prompt.
 - Approval is remembered by **verb**, so approving one `cargo build` does not
   approve every `cargo` invocation.
 

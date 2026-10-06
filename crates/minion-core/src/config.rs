@@ -34,6 +34,8 @@ pub struct Config {
     pub policy: PolicyConfig,
     /// Outbound HTTP limits and the SSRF guard for `http_fetch`.
     pub http_fetch: HttpFetchConfig,
+    /// The optional System One guard for the approval gate.
+    pub guard: GuardConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -280,6 +282,46 @@ impl Default for HttpFetchConfig {
     }
 }
 
+/// The optional System One guard for the approval gate (SDD §5.6, D16).
+///
+/// When enabled, a flagged `run_command` in an eligible category may be
+/// resolved by a `/v1/systemone` model instead of prompting. The guard is
+/// **disabled by default**: it is a network call that carries command text to a
+/// third party, so it stays opt-in until it has been seen behaving. It can only
+/// narrow prompts, never widen permissions (FR-43), and every failure falls
+/// back to the existing prompt (FR-45).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardConfig {
+    /// Whether the guard is consulted at all. Off by default.
+    pub enabled: bool,
+    /// Server root of the System One model, *without* the `/v1` suffix.
+    ///
+    /// The request is sent to `{base_url}/v1/systemone`.
+    pub base_url: String,
+    /// Highest risk that resolves silently. A verdict at or below this allows.
+    pub allow_threshold: f32,
+    /// Risk above which the verdict is a confident refusal.
+    ///
+    /// The band between the two thresholds also prompts; the distinction is
+    /// what the audit trail records (FR-47).
+    pub deny_threshold: f32,
+    /// Wall-clock budget for one verdict, in seconds.
+    pub timeout_secs: u64,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            allow_threshold: 0.25,
+            deny_threshold: 0.75,
+            timeout_secs: 10,
+        }
+    }
+}
+
 /// Log destination and verbosity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -405,6 +447,34 @@ impl Config {
         if self.http_fetch.timeout_secs == 0 {
             return Err(Error::Config(
                 "http_fetch.timeout_secs must be at least 1".to_string(),
+            ));
+        }
+        if self.guard.timeout_secs == 0 {
+            return Err(Error::Config(
+                "guard.timeout_secs must be at least 1".to_string(),
+            ));
+        }
+        // Thresholds are probabilities. A NaN fails both range checks, which is
+        // the point: an unset threshold must not silently become a comparison
+        // that can only ever allow.
+        for (name, value) in [
+            ("allow_threshold", self.guard.allow_threshold),
+            ("deny_threshold", self.guard.deny_threshold),
+        ] {
+            if !(0.0..=1.0).contains(&value) {
+                return Err(Error::Config(format!(
+                    "guard.{name} must be a probability between 0 and 1, was {value}"
+                )));
+            }
+        }
+        if self.guard.allow_threshold > self.guard.deny_threshold {
+            return Err(Error::Config(
+                "guard.allow_threshold must not exceed guard.deny_threshold".to_string(),
+            ));
+        }
+        if self.guard.enabled && self.guard.base_url.trim().is_empty() {
+            return Err(Error::Config(
+                "guard.base_url must be set when guard.enabled is true".to_string(),
             ));
         }
         Ok(())
@@ -644,6 +714,80 @@ mod tests {
         write(
             &dir.path().join("minion.toml"),
             "[http_fetch]\nmax_bytes = 0\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn the_guard_is_disabled_by_default() {
+        let config = Config::default();
+        assert!(
+            !config.guard.enabled,
+            "the guard is a network call carrying command text, so it stays opt-in"
+        );
+        assert!(config.guard.base_url.is_empty());
+        assert_eq!(config.guard.allow_threshold, 0.25);
+        assert_eq!(config.guard.deny_threshold, 0.75);
+        assert_eq!(config.guard.timeout_secs, 10);
+    }
+
+    #[test]
+    fn the_guard_section_is_read_from_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[guard]\nenabled = true\nbase_url = \"http://127.0.0.1:8080\"\n\
+             allow_threshold = 0.1\ndeny_threshold = 0.9\ntimeout_secs = 3\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert!(config.guard.enabled);
+        assert_eq!(config.guard.base_url, "http://127.0.0.1:8080");
+        assert_eq!(config.guard.allow_threshold, 0.1);
+        assert_eq!(config.guard.deny_threshold, 0.9);
+        assert_eq!(config.guard.timeout_secs, 3);
+    }
+
+    #[test]
+    fn an_enabled_guard_needs_a_base_url() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("minion.toml"), "[guard]\nenabled = true\n");
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+        assert!(err.to_string().contains("base_url"), "was: {err}");
+    }
+
+    #[test]
+    fn guard_thresholds_must_be_ordered_probabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[guard]\nallow_threshold = 0.9\ndeny_threshold = 0.1\n",
+        );
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[guard]\nallow_threshold = 1.5\n",
+        );
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_zero_guard_timeout_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[guard]\ntimeout_secs = 0\n",
         );
 
         let err = Config::load_with(None, None, dir.path()).unwrap_err();

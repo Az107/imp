@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod fs;
 pub mod glob;
+pub mod guard;
 pub mod memory;
 pub mod message;
 pub mod policy;
@@ -18,10 +19,11 @@ pub mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome};
 pub use classify::classify_command;
-pub use config::{Config, Credentials, HttpFetchConfig};
+pub use config::{Config, Credentials, GuardConfig, HttpFetchConfig};
 pub use error::{Error, Result};
 pub use fs::write_private_file;
 pub use glob::glob_match;
+pub use guard::{GuardBand, GuardThresholds, GuardVerdict, SystemOneGuard, is_eligible};
 pub use memory::namespace_for;
 pub use message::{Message, Role, ToolCall};
 pub use policy::{
