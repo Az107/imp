@@ -7,10 +7,19 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = "0.1.92"
 chrono = { version = "0.4.45", features = ["serde"] }
+# IANA timezones. The `cron` crate is generic over `TimeZone` and ships no
+# database of its own, so a job's `timezone` means nothing without this.
+chrono-tz = "0.10.4"
 cron = "0.17.0"
 minion-core = { version = "0.1.0", path = "../minion-core" }
+serde_json = "1.0.151"
 thiserror = "2.0.21"
-tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
+tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros", "rt-multi-thread"] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"
+
+[dev-dependencies]
+minion-store = { version = "0.1.0", path = "../minion-store" }
+tempfile = "3.27.0"

@@ -10,6 +10,7 @@ repository.workspace = true
 async-trait = "0.1.92"
 libc = "0.2.189"
 minion-core = { version = "0.1.0", path = "../minion-core" }
+minion-cron = { version = "0.1.0", path = "../minion-cron" }
 minion-store = { version = "0.1.0", path = "../minion-store" }
 # `http_fetch` needs a client. `reqwest` is already in the build for
 # `minion-provider`, so this adds an edge, not a dependency tree; the feature
@@ -25,4 +26,5 @@ tokio-util = "0.7.19"
 tracing = "0.1.44"
 
 [dev-dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
 tempfile = "3.27.0"

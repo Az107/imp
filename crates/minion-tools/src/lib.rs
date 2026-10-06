@@ -5,6 +5,7 @@
 //! A tool is only registered here once that gate exists, so nothing unguarded
 //! can be reached from a model.
 
+pub mod cron;
 pub mod http_fetch;
 pub mod memory;
 pub mod patch;
@@ -12,6 +13,7 @@ pub mod read_file;
 pub mod run_command;
 pub mod write_file;
 
+pub use cron::{CronAdd, CronList, CronRemove, CronTools};
 pub use http_fetch::HttpFetch;
 pub use memory::{Recall, Remember};
 pub use patch::{ApplyPatch, EditFile, Operation};
@@ -22,9 +24,28 @@ pub use write_file::WriteFile;
 use std::sync::Arc;
 use std::time::Duration;
 
+use minion_core::clock::{Clock, SystemClock};
 use minion_core::config::HttpFetchConfig;
 use minion_core::tool::ToolRegistry;
 use minion_store::Store;
+
+/// What the cron tools need from the process, beyond the store.
+#[derive(Clone)]
+pub struct CronContext {
+    /// Time source for a new job's first occurrence.
+    pub clock: Arc<dyn Clock>,
+    /// Timezone a job gets when it does not name one.
+    pub timezone: String,
+}
+
+impl Default for CronContext {
+    fn default() -> Self {
+        Self {
+            clock: Arc::new(SystemClock),
+            timezone: "UTC".to_string(),
+        }
+    }
+}
 
 /// Register the tools available at this milestone.
 ///
@@ -32,9 +53,10 @@ use minion_store::Store;
 /// [`minion_core::PolicyEngine`]. A registry built without one is only safe for
 /// read-only use.
 ///
-/// `store` backs the memory tools. It is the same handle the session persists
-/// through, so a fact written by a tool is in the transcript's database.
-pub fn default_registry(config: &ToolConfig, store: Arc<Store>) -> ToolRegistry {
+/// `store` backs the memory and cron tools. It is the same handle the session
+/// persists through, so a fact written by a tool, or a job it creates, is in the
+/// transcript's database.
+pub fn default_registry(config: &ToolConfig, store: Arc<Store>, cron: CronContext) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadFile::new(config.max_file_bytes));
     registry.register(EditFile::new(config.max_file_bytes));
@@ -47,8 +69,19 @@ pub fn default_registry(config: &ToolConfig, store: Arc<Store>) -> ToolRegistry 
         config.output_cap_bytes,
     ));
     registry.register(Remember::new(store.clone()));
-    registry.register(Recall::new(store));
+    registry.register(Recall::new(store.clone()));
     registry.register(HttpFetch::new(&config.http_fetch));
+
+    // The cron tools share the session's store, so a job added by the model is
+    // in the same database the scheduler ticks over.
+    let cron_tools = CronTools {
+        store: store.jobs(),
+        clock: cron.clock,
+        timezone: cron.timezone,
+    };
+    registry.register(CronAdd::new(cron_tools.clone()));
+    registry.register(CronList::new(cron_tools.clone()));
+    registry.register(CronRemove::new(cron_tools));
     registry
 }
 

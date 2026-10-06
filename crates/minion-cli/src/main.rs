@@ -2,6 +2,7 @@
 
 mod approval;
 mod cli;
+mod cron;
 mod init;
 mod markdown;
 mod render;
@@ -57,6 +58,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
     match &cli.command {
         Some(Command::Init(_)) => unreachable!("handled above"),
         Some(Command::Session(args)) => session::run(&cli, &config, args.clone()).await,
+        Some(Command::Cron(args)) => cron::run(&cli, &config, args.clone()).await,
         Some(Command::Run { prompt }) => {
             let prompt = resolve_prompt(prompt)?;
             let stop = run::one_shot(&cli, &config, &cwd, prompt).await?;

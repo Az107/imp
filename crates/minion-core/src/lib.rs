@@ -5,11 +5,13 @@
 
 pub mod agent;
 pub mod classify;
+pub mod clock;
 pub mod config;
 pub mod error;
 pub mod fs;
 pub mod glob;
 pub mod guard;
+pub mod job;
 pub mod memory;
 pub mod message;
 pub mod policy;
@@ -19,11 +21,15 @@ pub mod tool;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome};
 pub use classify::classify_command;
-pub use config::{Config, Credentials, GuardConfig, HttpFetchConfig};
+pub use clock::{Clock, ManualClock, SystemClock};
+pub use config::{Config, Credentials, CronConfig, GuardConfig, HttpFetchConfig, MissedRunPolicy};
 pub use error::{Error, Result};
 pub use fs::write_private_file;
 pub use glob::glob_match;
 pub use guard::{GuardBand, GuardThresholds, GuardVerdict, SystemOneGuard, is_eligible};
+pub use job::{
+    Job, JobRun, JobStatus, JobStore, JobUpdate, NewJob, NewJobRun, SessionMode, parse_stamp, stamp,
+};
 pub use memory::namespace_for;
 pub use message::{Message, Role, ToolCall};
 pub use policy::{

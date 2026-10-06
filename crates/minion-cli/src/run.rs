@@ -24,6 +24,13 @@ pub async fn one_shot(
 ) -> Result<StopReason> {
     let mut session = setup::build(cli, config, cwd, None).await?;
 
+    // Jobs fire while minion runs, one-shot included: the scheduler is
+    // in-process (D5), so this is the same service the REPL starts.
+    let _cron = crate::cron::start(config, &session.store, session.cron_runner.clone())
+        .await
+        .ok()
+        .flatten();
+
     // Everything from this index on belongs to the turn, and is persisted as a
     // unit so the transcript never contains half of one.
     let turn_start = session.history.len();

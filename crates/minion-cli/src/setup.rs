@@ -5,19 +5,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use minion_core::agent::AgentOptions;
+use async_trait::async_trait;
+
+use minion_core::agent::{Agent, AgentEvent, AgentOptions, StopReason};
+use minion_core::clock::SystemClock;
 use minion_core::config::{Config, Decision};
 use minion_core::error::{Error, Result};
 use minion_core::guard::GuardThresholds;
+use minion_core::job::{Job, SessionMode};
 use minion_core::message::{Message, Role};
+use minion_core::new_session_id;
 use minion_core::policy::PolicyEngine;
 use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
-use minion_core::{Agent, new_session_id};
+use minion_cron::RunReport;
 use minion_guard::HttpSystemOneGuard;
 use minion_provider::OpenAiProvider;
 use minion_store::{NewSession, SessionRow, Store};
-use minion_tools::{ToolConfig, default_registry};
+use minion_tools::{CronContext, ToolConfig, default_registry};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::approval;
 use crate::cli::Cli;
@@ -41,6 +48,9 @@ pub struct Session {
     pub store: Arc<Store>,
     /// How many trailing messages to keep when a transcript is reloaded.
     pub history_window: usize,
+    /// Runs a scheduled job's prompt. Wired to the real agent, always
+    /// non-interactively; the scheduler never builds an agent itself.
+    pub cron_runner: Arc<dyn minion_cron::JobRunner>,
     /// Retained so the provider can be rebuilt when the conversation changes.
     spec: ProviderSpec,
     /// The approval gate, shared so session-scoped allows accumulate.
@@ -48,6 +58,7 @@ pub struct Session {
 }
 
 /// The parameters a provider was built from, kept to rebuild it later.
+#[derive(Clone)]
 struct ProviderSpec {
     base_url: String,
     api_key: Option<String>,
@@ -163,7 +174,11 @@ pub async fn build(
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let store = Arc::new(Store::open(&database).await?);
 
-    let tools = Arc::new(default_registry(&tool_config(config), store.clone()));
+    let tools = Arc::new(default_registry(
+        &tool_config(config),
+        store.clone(),
+        cron_context(config),
+    ));
     let system = Message::system(system_prompt(config, &workspace_root, &tools));
 
     let (session_id, mut history) = match resume {
@@ -225,6 +240,18 @@ pub async fn build(
         cli.deny,
     );
 
+    // Cron runs through a *different* gate, on purpose: a job prompt has no
+    // terminal, so it must take the non-interactive decision and can never be
+    // approved. See `build_cron_gate`.
+    let cron_runner: Arc<dyn minion_cron::JobRunner> = Arc::new(JobAgentRunner {
+        spec: spec.clone(),
+        tools: tools.clone(),
+        gate: build_cron_gate(config, &store, &workspace_root.display().to_string()),
+        config: config.clone(),
+        store: store.clone(),
+        history_window,
+    });
+
     let session = Session {
         provider,
         tools,
@@ -234,6 +261,7 @@ pub async fn build(
         session_id,
         store,
         history_window,
+        cron_runner,
         spec,
         gate,
     };
@@ -252,6 +280,14 @@ fn tool_config(config: &Config) -> ToolConfig {
         max_timeout: Duration::from_secs(config.exec.max_timeout_secs),
         output_cap_bytes: config.exec.output_cap_bytes,
         http_fetch: config.http_fetch.clone(),
+    }
+}
+
+/// What the `cron_*` tools need from the process: a clock, and the default zone.
+fn cron_context(config: &Config) -> CronContext {
+    CronContext {
+        clock: Arc::new(SystemClock),
+        timezone: config.cron.timezone.clone(),
     }
 }
 
@@ -322,6 +358,190 @@ fn build_gate(
     };
 
     Arc::new(engine)
+}
+
+/// The gate a scheduled job's prompt runs behind.
+///
+/// It is built with `interactive = false` and **no approval UI at all**, which
+/// is the whole point: §5.7 says a job prompt cannot prompt for approval, so a
+/// tool that would `ask` is decided by `policy.noninteractive` instead —
+/// `deny` by default. A job therefore cannot promote an `ask` tool to `auto`,
+/// and a job cannot reach the System One guard either, because the guard only
+/// ever resolves a *prompt* and there is no prompt here.
+///
+/// Deny rules and allow rules still apply first, so an allowlisted command runs
+/// and a denied one is still denied: this narrows nothing and widens nothing
+/// except the absence of a human.
+pub fn build_cron_gate(config: &Config, store: &Arc<Store>, scope: &str) -> Arc<PolicyEngine> {
+    let allow = config
+        .policy
+        .allow
+        .iter()
+        .map(|rule| (rule.tool.clone(), rule.pattern.clone()))
+        .collect();
+    let deny = config
+        .policy
+        .deny
+        .iter()
+        .map(|rule| (rule.tool.clone(), rule.pattern.clone()))
+        .collect();
+
+    Arc::new(
+        PolicyEngine::new(
+            allow,
+            deny,
+            config.policy.default,
+            config.policy.noninteractive,
+            scope.to_string(),
+            false,
+        )
+        .with_store(store.approvals()),
+    )
+}
+
+/// Runs a job's prompt as one real agent turn.
+///
+/// This is the `minion-cron` [`JobRunner`](minion_cron::JobRunner) seam filled
+/// in with the agent loop. It owns the session bookkeeping a job needs — a fresh
+/// session per run for `new`, the job's own session for `reuse` — because that
+/// is knowledge about conversations, not about scheduling.
+struct JobAgentRunner {
+    spec: ProviderSpec,
+    tools: Arc<ToolRegistry>,
+    gate: Arc<PolicyEngine>,
+    config: Config,
+    store: Arc<Store>,
+    history_window: usize,
+}
+
+impl JobAgentRunner {
+    /// Open (or reopen) the conversation this run appends to.
+    async fn conversation(&self, job: &Job) -> Result<(String, Vec<Message>)> {
+        if job.session_mode == SessionMode::Reuse
+            && let Some(id) = &job.session_id
+        {
+            let exists = self.store.session(id).await?.is_some();
+            if exists {
+                let history = self.store.load_messages(id).await?;
+                return Ok((id.clone(), history));
+            }
+            // The session was deleted under the job; fall through and start one.
+        }
+        let id = new_session_id();
+        self.store
+            .create_session(NewSession {
+                id: id.clone(),
+                cwd: job.cwd.clone(),
+                model: Some(self.config.provider.model.clone()),
+                provider: Some(self.spec.base_url.clone()),
+            })
+            .await?;
+        Ok((id, Vec::new()))
+    }
+
+    async fn execute(&self, job: &Job) -> Result<RunReport> {
+        let workspace = PathBuf::from(&job.cwd);
+        let system = Message::system(system_prompt(&self.config, &workspace, &self.tools));
+        let (session_id, mut history) = self.conversation(job).await?;
+        let fresh = history.is_empty();
+
+        // A reloaded transcript starts with its own system prompt; a fresh one
+        // starts empty. Either way index 0 is the prompt, never history.
+        if history
+            .first()
+            .map(|message| message.role != Role::System)
+            .unwrap_or(true)
+        {
+            history.insert(0, system);
+        }
+        apply_history_window(&mut history, self.history_window);
+
+        let tag = job.label();
+        // A session that was just created is persisted whole, prompt included,
+        // the way `setup::build` does it. A reused one only gains this turn.
+        let start = if fresh { 0 } else { history.len() };
+        history.push(Message::user(format!("[cron:{tag}] {}", job.prompt)));
+
+        let options = AgentOptions {
+            model: self.config.provider.model.clone(),
+            max_iterations: self.config.agent.max_iterations,
+            temperature: self.config.provider.temperature,
+            max_tokens: None,
+            parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
+            include_usage: self.config.provider.supports_usage_in_stream,
+            workspace_root: workspace,
+        };
+        let agent = Agent::new(
+            Arc::new(self.spec.build(&session_id)),
+            self.tools.clone(),
+            options,
+        )
+        .with_gate(self.gate.clone());
+
+        let (sender, mut events) = mpsc::unbounded_channel();
+        // Drain to a buffer rather than the renderer: a job's output must not
+        // fight the REPL for the terminal, and stdout belongs to the user's
+        // conversation.
+        let collected = tokio::spawn(async move {
+            let mut text = String::new();
+            while let Some(event) = events.recv().await {
+                if let AgentEvent::TextDelta(delta) = event {
+                    text.push_str(&delta);
+                }
+            }
+            text
+        });
+
+        let outcome = agent
+            .run(&mut history, &sender, CancellationToken::new())
+            .await;
+        drop(sender);
+        let text = collected.await.unwrap_or_default();
+
+        self.store
+            .append_messages(&session_id, &history[start..])
+            .await?;
+
+        let summary = format!(
+            "{} · {}",
+            outcome.stop.as_str(),
+            one_line(&text, 160).unwrap_or_else(|| "(no output)".to_string())
+        );
+        let report = if outcome.stop == StopReason::Completed {
+            RunReport::ok(summary)
+        } else {
+            RunReport::failed(summary)
+        };
+        Ok(report
+            .with_session(Some(session_id.clone()))
+            .with_output_ref(Some(session_id)))
+    }
+}
+
+#[async_trait]
+impl minion_cron::JobRunner for JobAgentRunner {
+    async fn run(&self, job: &Job, _run_id: &str) -> RunReport {
+        tracing::info!(job = %job.label(), session_mode = job.session_mode.as_str(), "cron run starting");
+        match self.execute(job).await {
+            Ok(report) => {
+                tracing::info!(job = %job.label(), ok = report.ok, summary = %report.summary, "cron run finished");
+                report
+            }
+            Err(err) => {
+                tracing::warn!(job = %job.label(), error = %err, "cron run failed");
+                RunReport::failed(format!("{err}"))
+            }
+        }
+    }
+}
+
+/// The first line of `text`, clipped, or `None` when there is nothing to show.
+fn one_line(text: &str, width: usize) -> Option<String> {
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    if line.chars().count() <= width {
+        return Some(line.to_string());
+    }
+    Some(line.chars().take(width - 1).collect::<String>() + "…")
 }
 
 /// The system prompt: persona plus a digest of what the agent is allowed to do.
@@ -450,6 +670,8 @@ pub fn describe_session(row: &SessionRow) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use minion_core::policy::ToolGate;
+    use minion_core::tool::Risk;
 
     fn config() -> Config {
         Config::default()
@@ -459,7 +681,11 @@ mod tests {
     /// throwaway in-memory store is enough. Async because opening the store is.
     async fn tools() -> ToolRegistry {
         let store = Arc::new(Store::open_in_memory().await.expect("in-memory store"));
-        default_registry(&tool_config(&Config::default()), store)
+        default_registry(
+            &tool_config(&Config::default()),
+            store,
+            CronContext::default(),
+        )
     }
 
     fn conversation() -> Vec<Message> {
@@ -591,5 +817,103 @@ mod tests {
         apply_history_window(&mut history, 0);
 
         assert_eq!(history.len(), before, "0 means 'do not trim', not 'empty'");
+    }
+
+    // ------------------------------------------------------------- cron gate
+
+    /// §5.7: a job prompt cannot prompt for approval, so a tool the policy would
+    /// `ask` about is decided by `policy.noninteractive` instead. A job cannot
+    /// promote such a tool to `auto`.
+    #[tokio::test]
+    async fn a_cron_gate_cannot_promote_an_ask_tool_to_auto() {
+        let store = Arc::new(Store::open_in_memory().await.expect("in-memory store"));
+        let config = Config::default();
+        assert_eq!(config.policy.default, Decision::Ask);
+        assert_eq!(config.policy.noninteractive, Decision::Deny);
+        let gate = build_cron_gate(&config, &store, "/workspace");
+
+        // `cron_add` is `Write`: with a terminal this would prompt.
+        let err = gate
+            .check(
+                "cron_add",
+                Risk::Write,
+                &serde_json::json!({ "name": "weekly" }),
+                Some("weekly"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-interactive"), "was: {err}");
+
+        // The same for a command, which is what a job would actually want.
+        let err = gate
+            .check(
+                "run_command",
+                Risk::Execute,
+                &serde_json::json!({ "command": "ls -la" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-interactive"), "was: {err}");
+
+        // Reading is not a change, so a job can still gather context (D15).
+        gate.check("read_file", Risk::ReadOnly, &serde_json::json!({}), None)
+            .await
+            .expect("a read-only tool must survive the absence of a terminal");
+    }
+
+    /// The cron gate narrows nothing: a deny rule still refuses and an allow
+    /// rule still permits, exactly as they do in an interactive session.
+    #[tokio::test]
+    async fn a_cron_gate_still_honours_allow_and_deny_rules() {
+        let store = Arc::new(Store::open_in_memory().await.expect("in-memory store"));
+        let mut config = Config::default();
+        config.policy.allow.push(minion_core::config::AllowRule {
+            tool: "run_command".to_string(),
+            pattern: "git status".to_string(),
+            scope: "session".to_string(),
+        });
+        config.policy.deny.push(minion_core::config::DenyRule {
+            tool: "run_command".to_string(),
+            pattern: "*sudo*".to_string(),
+        });
+        let gate = build_cron_gate(&config, &store, "/workspace");
+
+        gate.check(
+            "run_command",
+            Risk::Execute,
+            &serde_json::json!({ "command": "git status" }),
+            None,
+        )
+        .await
+        .expect("an allowlisted command runs without a terminal");
+
+        let err = gate
+            .check(
+                "run_command",
+                Risk::Execute,
+                &serde_json::json!({ "command": "sudo ls" }),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("deny rule"), "was: {err}");
+    }
+
+    /// The scheduler's own tools are registered, so a model can schedule a job.
+    #[tokio::test]
+    async fn the_cron_tools_are_registered_and_advertised() {
+        let store = Arc::new(Store::open_in_memory().await.expect("in-memory store"));
+        let tools = default_registry(
+            &tool_config(&Config::default()),
+            store.clone(),
+            CronContext::default(),
+        );
+        assert!(tools.get("cron_add").is_some());
+        assert!(tools.get("cron_list").is_some());
+        assert!(tools.get("cron_remove").is_some());
+        // The tools the scheduler itself registers must be advertised too.
+        let prompt = system_prompt(&Config::default(), Path::new("/tmp/ws"), &tools);
+        assert!(prompt.contains("cron_add"), "was: {prompt}");
     }
 }

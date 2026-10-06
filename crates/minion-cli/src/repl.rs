@@ -36,6 +36,10 @@ pub async fn interactive(
     let mut editor = DefaultEditor::new()
         .map_err(|err| Error::Config(format!("cannot start the line editor: {err}")))?;
 
+    // The scheduler lives and dies with the session: a job fires while minion is
+    // running, and nothing is left behind when it exits (D5).
+    let _cron = start_cron(config, &state).await;
+
     // Ctrl-C mid-turn cancels the turn; the token is replaced so the next turn
     // starts fresh.
     let interrupt = Arc::new(Mutex::new(CancellationToken::new()));
@@ -125,6 +129,36 @@ pub async fn interactive(
     }
 
     Ok(())
+}
+
+/// Start the in-process scheduler for this session, reporting what it did.
+///
+/// Failure is not fatal: a scheduler that cannot start must not take the REPL
+/// with it, since the user is still there to work. It is loud on stderr instead.
+async fn start_cron(config: &Config, state: &Session) -> Option<crate::cron::CronService> {
+    match crate::cron::start(config, &state.store, state.cron_runner.clone()).await {
+        Ok(Some((service, startup))) => {
+            if startup.reconciled > 0 {
+                eprintln!(
+                    "… cron: closed {} run(s) left in flight by a previous process",
+                    startup.reconciled
+                );
+            }
+            let caught = startup.caught_up;
+            if caught != minion_cron::TickReport::default() {
+                eprintln!(
+                    "… cron catch-up: {} fired, {} queued, {} skipped, {} overlapped",
+                    caught.fired, caught.queued, caught.skipped, caught.overlapped
+                );
+            }
+            Some(service)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            eprintln!("minion: the cron scheduler did not start: {err}");
+            None
+        }
+    }
 }
 
 /// Handle a `/command`. Returns `true` when the REPL should exit.
@@ -218,6 +252,15 @@ async fn handle_slash(
             println!("{note}");
         }
         "where" => println!("{}", state.store.path().display()),
+        "cron" | "jobs" => {
+            let jobs = state.store.jobs().list_jobs().await?;
+            if jobs.is_empty() {
+                println!("No jobs scheduled. Add one with `minion cron add`.");
+            }
+            for job in jobs {
+                println!("  {}", minion_cron::describe(&job));
+            }
+        }
         other => {
             let _ = cli;
             eprintln!("unknown command `/{other}` — try /help");
@@ -235,6 +278,7 @@ fn print_help() {
     println!("  /clear             forget the messages, keep the session");
     println!("  /model [name]      show or change the model for this session");
     println!("  /tools             list enabled tools and their risk class");
+    println!("  /cron              list scheduled jobs (alias /jobs)");
     println!("  /cost              token usage for this session");
     println!("  /session           show the conversation id sent to the provider");
     println!("  /where             show the database path");

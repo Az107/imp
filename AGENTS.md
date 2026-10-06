@@ -2,11 +2,12 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0 through M3.5 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0 through M4 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
-sessions, keyword memory, `http_fetch` with its SSRF guard, `minion init`, and the optional System One
-guard for the approval gate. Branch is `main`.
+sessions, keyword memory, `http_fetch` with its SSRF guard, `minion init`, the optional System One
+guard for the approval gate, and the in-process cron scheduler with job CRUD, run history and
+catch-up. The work for M4 landed on branch `m4-cron`, cut from `m3.5-systemone`.
 
 **M3 is done.** `remember`/`recall` live in `minion-store/src/memory.rs`,
 `minion-tools/src/memory.rs` and `minion-core/src/memory.rs`; `http_fetch` and its guard are
@@ -18,14 +19,21 @@ is `minion-core/src/guard.rs`, the engine consults it from `PolicyEngine::check`
 (`minion-core/src/policy.rs`, step 5b), and the `/v1/systemone` client is the `minion-guard` crate.
 `[guard]` is `GuardConfig` in `minion-core/src/config.rs`. Still disabled by default.
 
-`minion-cron` and `minion-mcp` are **empty stubs** for M4–M6. Their manifests list real dependencies
-(`rmcp`, `cron`), but there is no code behind them yet. In `minion-store`, the `jobs`, `job_runs` and
-`audit_log` tables exist in the schema but nothing writes to them until M4. The `memory` table is now
-written and read.
+**M4 is done.** The scheduler is `minion-cron` (`scheduler.rs`, `schedule.rs`, `jobs.rs`); the job
+and run types plus the `JobStore` boundary are `minion-core/src/job.rs` and the `Clock` trait is
+`minion-core/src/clock.rs`; the SQLite side is `minion-store/src/jobs.rs`; the `cron_*` tools are
+`minion-tools/src/cron.rs`; the subcommand and the service that runs with a session are
+`minion-cli/src/cron.rs`, with the real agent runner and the cron gate in
+`minion-cli/src/setup.rs`. `[cron]` is `CronConfig` in `minion-core/src/config.rs`. The `jobs`,
+`job_runs` and `audit_log` tables were created by the baseline migration and now have writers.
 
-`default_registry` takes a second argument, an `Arc<Store>`, because the memory tools need one. This
-is why `minion-tools` depends on `minion-store`; the store is opened *before* the registry in
-`setup::build` so the system prompt can still be built from the finished tool list.
+`minion-mcp` is still an **empty stub** for M5–M6. Its manifest lists real dependencies (`rmcp`),
+but there is no code behind it yet.
+
+`default_registry` takes a second argument, an `Arc<Store>`, because the memory and cron tools need
+one, and a third, a `CronContext`, carrying the clock and default timezone the `cron_*` tools use.
+This is why `minion-tools` depends on `minion-store` and `minion-cron`; the store is opened *before*
+the registry in `setup::build` so the system prompt can still be built from the finished tool list.
 
 Assistant text is rendered as markdown on a terminal (`crates/minion-cli/src/markdown.rs`):
 headings, emphasis, code, lists, quotes, rules, and pipe tables. It is rendered per block, so
@@ -37,6 +45,7 @@ nothing already on screen is ever revised.
 cargo +1.89.0 build                # whole workspace
 cargo +1.89.0 test --workspace     # all tests; offline, no network, no API key needed
 cargo +1.89.0 test -p minion-core   # one crate
+cargo +1.89.0 test -p minion-cron   # the scheduler: virtual clock, no sleeps, no network
 cargo +1.89.0 test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
 cargo +1.89.0 clippy --all-targets -- -D warnings    # lint gate; currently clean
 cargo +1.89.0 fmt --all
@@ -90,7 +99,9 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   allowlists.
 - The MCP server is read-only by default. `expose_exec`/`expose_write` stay `false`; `run_command`
   is never exposed over MCP by default.
-- Cron job runs always use the non-interactive policy and cannot prompt for approval.
+- Cron job runs always use the non-interactive policy and cannot prompt for approval. The gate is
+  `setup::build_cron_gate` — no `ApprovalUi`, `interactive = false`, no guard. Don't route a job
+  through the session's gate.
 - Path guard: `ToolCtx::resolve` canonicalizes and confines to `workspace_root`. Use it for every
   path-taking tool; do not reimplement it.
 - **The config file must never contain a secret.** `Plan::to_toml` has no field that can hold the
@@ -205,6 +216,48 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   `SystemOneGuard` trait. Keep the client there — a `reqwest::Client` in `minion-core` breaks the
   rule that lets the loop be tested against a mock provider.
 
+## Cron rules (M4)
+
+- **A cron run uses a *different* gate, and it must stay different.** `setup::build_cron_gate`
+  builds a `PolicyEngine` with `interactive = false` and **no `ApprovalUi`**, and deliberately no
+  guard. That is what makes a job unable to promote an `ask` tool to `auto`, unable to reach the
+  System One model (there is no prompt to resolve), and unable to add or delete jobs unless an allow
+  rule names it. Never wire the session's interactive gate into `JobAgentRunner`; a prompt that
+  appeared at an arbitrary moment would be approved by whoever happened to be mid-keystroke. See
+  D19 and §11's resolved question 2.
+- **A fire consumes its occurrence.** `next_run_at` is advanced in the same transaction that inserts
+  the `job_runs` row, and recomputed again on completion from the completion instant. Advancing only
+  on completion would make a job whose run outlasts its own interval look due on every tick, and
+  every tick would then write an `overlap` row.
+- **The `job_runs` row exists before the prompt is dispatched** (NFR-6). `Recorder` in the scheduler
+  tests asserts it; if you move the dispatch earlier, that test is the one that should fail.
+- **`skipped` and `overlap` are different statuses for different reasons.** `skipped` is a catch-up
+  policy decision, `overlap` is a live run colliding with its own next occurrence. `queued` is an
+  accepted run waiting for a slot. Don't collapse them — `/cron` and the audit trail read them.
+- **The cron expression is a five-field Vixie expression, and `minion_cron::schedule::expression`
+  is the only place that is true.** The `cron` crate is six-field Quartz with `1` = Sunday, so the
+  parser prefixes `0 ` and rewrites the day-of-week field. Any new caller must go through that
+  function, not `Schedule::from_str`; a direct call would silently fire a day late. See D18.
+- **`jobs.session_id` is a foreign key.** A `reuse` job's session must exist before it is adopted,
+  which is why the runner creates the session and the scheduler adopts it in a statement separate
+  from the run's terminal status: an adoption that fails must not roll back the record that the run
+  finished. `cron_end_to_end.rs` has a test for exactly that.
+- **Job timestamps are written with `minion_core::job::stamp`**, fixed-width RFC 3339 with
+  milliseconds and a `Z`. `due_jobs` compares `next_run_at <= ?` as *text*, so mixing formats would
+  make the comparison a lexicographic guess. Use `stamp`/`parse_stamp`, never `to_rfc3339()`.
+- **Catch-up replays occurrences without the overlap check.** A replayed occurrence never ran, so
+  there is no live run to collide with; `max_concurrent_jobs` and `missed_run_cap` are what bound the
+  burst. Adding the overlap check there would silently drop `run_all` occurrences after the first.
+- **The scheduler lives and dies with the process** (D5). `cron::start` runs `reconcile()` — which
+  closes runs a dead process left `running` — then `catch_up()`, then the tick loop. Jobs do not run
+  while minion is closed (R6), and no daemon is left behind.
+- **`--cwd` is both a global flag and a `cron add` flag**, so the subcommand's own definition wins
+  inside `minion cron`. The job's `cwd` is canonicalized before it is stored: a relative path would
+  otherwise be resolved against whatever directory the *scheduler* happened to run in.
+- `minion-cron` has **no network and no database dependency**: the store is behind `minion_core::JobStore`
+  and the prompt behind `minion_cron::JobRunner`. Keep it that way — it is what lets the firing rules
+  be tested against an in-memory fake and a `ManualClock`.
+
 ## Memory rules
 
 - **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and
@@ -283,8 +336,18 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 ## Known gaps (don't mistake these for bugs)
 
-- The CLI has `run`, `init`, `session`, and the default REPL. There is still no `doctor`, `cron`,
+- The CLI has `run`, `init`, `session`, `cron`, and the default REPL. There is still no `doctor`,
   `mcp`, or `config` subcommand, so §5.12's CLI surface is only partly built.
+- **The cron tick loop is verified by unit tests on a virtual clock and by one manual end-to-end
+  run, not by an automated integration test against a real clock.** `scheduler.rs` drives every
+  firing rule through `tick()`/`catch_up()` directly with a `ManualClock`, and
+  `cron_end_to_end.rs` exercises the real SQLite store, but no test waits for a wall clock to pass a
+  minute boundary. The manual run that was performed is described under "Manual smoke test".
+- **`/cron` in the REPL and the scheduler's start/stop wiring are manually verified.** The
+  subcommand (`minion cron add|list|remove`) is the tested surface; the REPL path has no automated
+  test, the same limitation as the interactive approval prompt.
+- **The MCP `cron_*` tools (§5.9) are not wired.** The tools exist and are registered in the agent's
+  registry; exposing them over `mcp serve` is M6's job.
 - **M3.5's guard policy is tested, its interactive wiring is not.** `minion-core` unit-tests the
   floor, the thresholds and the engine (with a fake guard) and `minion-guard` runs the real HTTP
   client against a fake `/v1/systemone` server inside the real engine, but no test drives a real
@@ -300,8 +363,8 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   desynchronising, so no test drives a real keypress end to end. Treat it as unverified.
 - Tool calls execute **sequentially**; bounded concurrency is tracked as `FR-8` in `agent.rs`.
 - `usage` is advisory and may be zero; no turn is blocked on it.
-- History trimming / summarization (`history_window`, `summarize_on_truncate`) is configured but not
-  yet applied by the loop.
+- History trimming / summarization (`history_window`, `summarize_on_truncate`) is applied when a
+  transcript is reloaded, but summarization is not implemented.
 - The provider is only smoke-tested against a stub server. There is no recorded provider fixture
   suite yet (SDD §8).
 - **The markdown renderer is verified by unit tests and one manual pty pass, not fixtures.** Column
@@ -347,3 +410,36 @@ cannot be driven by piping stdin — that path takes the non-interactive branch.
 `pty.fork()` and write one answer per prompt; feeding all lines at once desynchronises the prompts
 and produces a confusing failure. Always rebuild the binary (`cargo build`) before a manual test:
 `cargo test` does not refresh `target/debug/minion`.
+
+### Cron end to end
+
+The cron path needs a process that lives long enough for a real minute boundary, so it is driven with
+the REPL and piped stdin rather than a pty. With the same SSE stub as above:
+
+```sh
+# 1. a job that fires on the next minute boundary
+minion --cwd /tmp/e2e --db /tmp/e2e/minion.db \
+  cron add --schedule '* * * * *' --prompt 'say hello' --name e2e --timezone UTC
+
+# 2. let the scheduler tick past one occurrence, then leave
+( sleep 70; echo '/quit' ) | minion --cwd /tmp/e2e --db /tmp/e2e/minion.db
+
+# 3. one occurrence passes while minion is closed, then catch up
+sleep 65
+( sleep 12; echo '/quit' ) | minion --cwd /tmp/e2e --db /tmp/e2e/minion.db
+```
+
+What to check, and what was checked:
+
+- The stub's request log gains one entry per run, with the first user message reading
+  `[cron:e2e] say hello` — the synthetic tag.
+- `jobs.runs_count` counts the runs; `next_run_at` has moved past now; `last_status` is `ok`.
+- `job_runs` has a row per run with a `finished_at` and an `exit_summary`, and none left `running`.
+- Step 3 prints `… cron catch-up: 1 fired` on stderr, and the second run's row appears with a
+  `started_at` at startup time rather than at the missed minute — that is `run_once` replaying one
+  occurrence.
+- Each run got its own session (`session_mode = new`), whose first message is the system prompt and
+  whose system prompt says `Mode: non-interactive (approval is unavailable; …)`.
+
+`python3` and `sqlite3` are enough to inspect the database; the throwaway helper used for this is a
+three-line `sqlite3.connect` plus a `SELECT * FROM jobs` / `SELECT * FROM job_runs`.

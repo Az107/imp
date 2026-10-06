@@ -85,6 +85,58 @@ pub enum Command {
 
     /// Inspect and manage stored conversations.
     Session(SessionArgs),
+
+    /// Manage scheduled jobs (§5.12).
+    Cron(CronArgs),
+}
+
+/// Arguments for `minion cron`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct CronArgs {
+    /// The action to perform.
+    #[command(subcommand)]
+    pub action: CronAction,
+}
+
+/// Cron actions.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum CronAction {
+    /// Create a job.
+    Add {
+        /// Five-field cron expression: minute hour day-of-month month day-of-week.
+        #[arg(long)]
+        schedule: String,
+        /// The prompt to run on each fire.
+        #[arg(long)]
+        prompt: String,
+        /// Optional unique label.
+        #[arg(long)]
+        name: Option<String>,
+        /// Workspace the run executes in. Defaults to the current directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// IANA timezone. Defaults to `cron.timezone`.
+        #[arg(long)]
+        timezone: Option<String>,
+        /// `new` (default) or `reuse`.
+        #[arg(long = "session-mode")]
+        session_mode: Option<String>,
+        /// Stop after this many runs.
+        #[arg(long = "max-runs")]
+        max_runs: Option<i64>,
+        /// Allow a run to start while the previous one is still active.
+        #[arg(long = "allow-overlap")]
+        allow_overlap: bool,
+    },
+
+    /// List scheduled jobs.
+    List,
+
+    /// Delete a job by id or name.
+    Remove {
+        /// Job id, or its name.
+        key: String,
+    },
 }
 
 /// Arguments for `minion session`.

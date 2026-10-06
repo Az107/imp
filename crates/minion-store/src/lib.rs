@@ -13,6 +13,7 @@ use minion_core::message::{Message, Role};
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod approvals;
+pub mod jobs;
 pub mod memory;
 pub mod migrate;
 

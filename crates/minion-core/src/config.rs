@@ -36,6 +36,8 @@ pub struct Config {
     pub http_fetch: HttpFetchConfig,
     /// The optional System One guard for the approval gate.
     pub guard: GuardConfig,
+    /// In-process cron scheduler settings.
+    pub cron: CronConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -322,6 +324,52 @@ impl Default for GuardConfig {
     }
 }
 
+/// In-process cron scheduler settings (SDD §5.3, §5.7).
+///
+/// The scheduler is a task inside the process, not an OS crontab entry (D5), so
+/// these values describe one running `minion`. That also means jobs do not run
+/// while minion is closed — a documented limitation, R6.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CronConfig {
+    /// Whether the tick loop starts at all.
+    pub enabled: bool,
+    /// IANA timezone a job gets when it does not name one.
+    pub timezone: String,
+    /// What to do about occurrences that came due while minion was not running.
+    pub missed_run_policy: MissedRunPolicy,
+    /// How many job runs may be in flight at once. The rest are queued.
+    pub max_concurrent_jobs: usize,
+    /// Hard ceiling on the runs a single `run_all` catch-up may start, so a job
+    /// missed for a year cannot turn into a thousand runs at startup.
+    pub missed_run_cap: usize,
+}
+
+impl Default for CronConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timezone: "UTC".to_string(),
+            missed_run_policy: MissedRunPolicy::RunOnce,
+            max_concurrent_jobs: 2,
+            missed_run_cap: 20,
+        }
+    }
+}
+
+/// What to do with occurrences that were missed while the process was not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissedRunPolicy {
+    /// Drop them: recompute `next_run_at` and record one `skipped` run.
+    Skip,
+    /// Run the job once now, then resume the schedule.
+    #[default]
+    RunOnce,
+    /// Run every missed occurrence, bounded by `missed_run_cap`.
+    RunAll,
+}
+
 /// Log destination and verbosity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -475,6 +523,21 @@ impl Config {
         if self.guard.enabled && self.guard.base_url.trim().is_empty() {
             return Err(Error::Config(
                 "guard.base_url must be set when guard.enabled is true".to_string(),
+            ));
+        }
+        if self.cron.timezone.trim().is_empty() {
+            return Err(Error::Config(
+                "cron.timezone must be an IANA name such as UTC or America/Mexico_City".to_string(),
+            ));
+        }
+        if self.cron.max_concurrent_jobs == 0 {
+            return Err(Error::Config(
+                "cron.max_concurrent_jobs must be at least 1".to_string(),
+            ));
+        }
+        if self.cron.missed_run_cap == 0 {
+            return Err(Error::Config(
+                "cron.missed_run_cap must be at least 1".to_string(),
             ));
         }
         Ok(())
@@ -750,6 +813,50 @@ mod tests {
         assert_eq!(config.guard.allow_threshold, 0.1);
         assert_eq!(config.guard.deny_threshold, 0.9);
         assert_eq!(config.guard.timeout_secs, 3);
+    }
+
+    #[test]
+    fn cron_defaults_match_the_spec() {
+        let config = Config::default();
+        assert!(
+            config.cron.enabled,
+            "the tick loop is on unless told otherwise"
+        );
+        assert_eq!(config.cron.missed_run_policy, MissedRunPolicy::RunOnce);
+        assert_eq!(config.cron.max_concurrent_jobs, 2);
+        assert_eq!(config.cron.missed_run_cap, 20);
+    }
+
+    #[test]
+    fn the_cron_section_is_read_from_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[cron]\nenabled = false\ntimezone = \"America/Mexico_City\"\n\
+             missed_run_policy = \"run_all\"\nmax_concurrent_jobs = 4\nmissed_run_cap = 5\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert!(!config.cron.enabled);
+        assert_eq!(config.cron.timezone, "America/Mexico_City");
+        assert_eq!(config.cron.missed_run_policy, MissedRunPolicy::RunAll);
+        assert_eq!(config.cron.max_concurrent_jobs, 4);
+        assert_eq!(config.cron.missed_run_cap, 5);
+    }
+
+    #[test]
+    fn an_unusable_cron_bound_is_rejected_before_use() {
+        for body in [
+            "[cron]\nmax_concurrent_jobs = 0\n",
+            "[cron]\nmissed_run_cap = 0\n",
+            "[cron]\ntimezone = \"\"\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("minion.toml"), body);
+            let err = Config::load_with(None, None, dir.path()).unwrap_err();
+            assert!(matches!(err, Error::Config(_)), "`{body}` gave: {err}");
+        }
     }
 
     #[test]

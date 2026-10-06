@@ -112,6 +112,7 @@ fn registry(store: Arc<Store>) -> minion_core::ToolRegistry {
             http_fetch: minion_core::HttpFetchConfig::default(),
         },
         store,
+        minion_tools::CronContext::default(),
     )
 }
 

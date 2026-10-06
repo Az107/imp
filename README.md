@@ -10,11 +10,12 @@ already cost time, for anyone (human or agent) working on this next.
 
 ## Status
 
-Milestones M0 through M3.5 are done. What works today:
+Milestones M0 through M4 are done. What works today:
 
 - **Streaming agent loop** against any OpenAI-compatible endpoint
-- **Eight tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
-  `run_command`, `remember`, `recall`, `http_fetch`
+- **Eleven tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
+  `run_command`, `remember`, `recall`, `http_fetch`, `cron_add`, `cron_list`,
+  `cron_remove`
 - **Approval engine** — every write, exec, and network call is gated by a policy
   engine, with an allowlist, persisted approvals, and a fail-closed
   non-interactive path
@@ -27,12 +28,14 @@ Milestones M0 through M3.5 are done. What works today:
 - **Guarded HTTP** — `http_fetch` with a domain allowlist (`https` unless an
   exact entry names the host), a private/loopback/metadata address block, no
   cross-domain redirects, and a response cap
+- **In-process cron** — jobs on 5-field cron expressions in an IANA timezone,
+  with run history, a concurrency cap, overlap detection, and catch-up for
+  occurrences missed while minion was closed
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
 - **`minion init`** — one command from a bare machine to a working config
 - **Markdown rendering** on a terminal, including tables
 
-Not built yet: cron and MCP in either direction. The CLI surface in §5.12 of the
-SDD is only partly present, and `minion-cron` and `minion-mcp` are empty stubs.
+Not built yet: MCP in either direction. `minion-mcp` is still an empty stub.
 
 ## Install
 
@@ -65,7 +68,7 @@ which those gateways require.
 
 ```
 /new  /sessions  /resume <id>  /rename  /clear  /model  /tools  /cost
-/session  /where  /help  /quit
+/cron  /session  /where  /help  /quit
 !<command>          run a shell command directly, bypassing the model
 ```
 
@@ -90,6 +93,37 @@ alignment carries meaning, colour does not.
 
 `--json` emits newline-delimited events for scripting.
 
+## Cron
+
+Jobs are prompts on a schedule. They live in the same SQLite database as the
+conversations, and they run **inside** a running minion — there is no daemon and
+no crontab entry, so a job does not fire while minion is closed. Missed
+occurrences are dealt with at the next start, according to `[cron]
+missed_run_policy`.
+
+```sh
+minion cron add --schedule '0 9 * * 1' --prompt 'summarize the week' --name weekly
+minion cron list
+minion cron remove weekly
+```
+
+The schedule is a five-field cron expression (`minute hour day-of-month month
+day-of-week`) read in an IANA timezone — `--timezone America/Mexico_City`, or
+`[cron] timezone`. Day of week is `0` or `7` for Sunday and `1` for Monday, as
+in every other cron. `--session-mode reuse` keeps one conversation across runs
+instead of starting a fresh one each time, and `--max-runs` retires a job after
+a fixed number of runs.
+
+A run's history is in `job_runs`: its status, when it started and finished, and
+a summary. A job that is still running when its next occurrence comes due is
+recorded as an overlap rather than started twice, unless it was created with
+`--allow-overlap`. `/cron` in the REPL shows the job table.
+
+**A job prompt cannot ask for approval.** It has no terminal, so a tool the
+policy would `ask` about is refused unless an allowlist entry covers it — a job
+cannot promote itself, and it cannot reach the System One guard either. See
+`[policy.allow]` and the safety model below.
+
 ## Safety model
 
 There is no sandbox. The model can only act through tools, and every tool that
@@ -111,6 +145,9 @@ writes or executes goes through a policy engine that decides *before* the call:
   allow and nothing else. `privilege`, `remote-execution` and `destructive`
   commands never reach it, only the command string is ever sent, and any failure
   — network, timeout, rate limit, unreadable body — falls back to the prompt.
+- **Cron runs fail closed.** A job's prompt is executed behind a gate with no approval UI at all, so
+  anything the policy would `ask` about is denied rather than approved by whoever happened to be at
+  the keyboard. Deny rules and allowlists still apply first.
 - Approval is remembered by **verb**, so approving one `cargo build` does not
   approve every `cargo` invocation.
 
