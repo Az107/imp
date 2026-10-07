@@ -10,7 +10,7 @@ already cost time, for anyone (human or agent) working on this next.
 
 ## Status
 
-Milestones M0 through M5 are done. What works today:
+Milestones M0 through M6 are done. What works today:
 
 - **Streaming agent loop** against any OpenAI-compatible endpoint
 - **Eleven built-in tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
@@ -35,11 +35,15 @@ Milestones M0 through M5 are done. What works today:
   `mcp__<server>__<tool>` with the server's own schema untouched, filtered by a
   per-server `tool_allow`, gated by the same approval engine, and carried by a
   per-server policy
+- **MCP server** — `minion mcp serve` publishes the agent over stdio: `agent_ask`,
+  the introspection tools, the `cron_*` tools, and a read-only surface by default
+  (shell execution and file writes are opt-in flags, printed at startup)
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
 - **`minion init`** — one command from a bare machine to a working config
 - **Markdown rendering** on a terminal, including tables
 
-Not built yet: the MCP **server** (exposing minion to another model) — that is M6.
+Not built yet: `minion doctor`, `minion config`, and a daemon that runs cron jobs while no session is
+open (that is M7).
 
 ## Install
 
@@ -169,6 +173,56 @@ The per-server `approval` replaces the global default *for that server's tools*:
 trusted local server can be `auto` while a server reached over the network stays `ask`.
 Deny rules, allowlists and the command classifier still run first.
 
+## MCP server
+
+The other direction: minion can *be* an MCP server, so another model or harness can
+drive it. It speaks stdio, and it never starts a REPL — both own stdin/stdout, so
+`mcp serve` is a mode of its own.
+
+```sh
+minion mcp serve
+```
+
+The surface is read-only by default:
+
+| Tool | What it does |
+|---|---|
+| `agent_ask` | Run one agent turn with minion's own model backend. Params: `prompt`, `session_id?`, `model?`, `max_iterations?`, `allow_tools?` |
+| `agent_list_sessions` | Stored conversations, newest first |
+| `agent_get_session` | One conversation's transcript |
+| `agent_list_tools` | The read-only tools `agent_ask` may call, with risk classes |
+| `cron_add` / `cron_list` / `cron_remove` | Manage scheduled jobs (present when `expose_cron_write`) |
+| `agent_run_command` | Shell execution — **refused** unless `expose_exec` |
+| `agent_write_file` | File writes — **refused** unless `expose_write` |
+
+It also serves the resources `minion://sessions`, `minion://sessions/{id}`,
+`minion://jobs` and `minion://config-redacted`, and the `minion_agent` prompt for
+hosts that support prompts but not tools.
+
+```toml
+[mcp.server]
+expose_exec = false        # agent_run_command is listed but refused
+expose_write = false       # agent_write_file is listed but refused
+expose_cron_write = true   # the cron tools are published
+```
+
+Three things are worth knowing:
+
+- **`agent_run_command` and `agent_write_file` are listed and refused, not hidden.**
+  Without their flag the call reaches the same policy engine as everything else and is
+  denied there, with the refusal written to the audit trail and returned to the caller
+  as a readable tool error. Turning a flag on is the operator's consent; deny rules and
+  allowlists still run first, so it cannot grant something already refused.
+- **The startup banner states the capabilities.** `minion mcp serve` prints one line per
+  flag on stderr, and shouts about the enabled ones, so nobody enables remote code
+  execution by accident.
+- **`agent_ask` is read-only whatever the flags say.** It runs a turn against the
+  read-only subset of the built-in tools; `expose_write`/`expose_exec` add the *direct*
+  tools, they do not widen the agent. `minion://config-redacted` never carries a secret.
+
+Jobs created over MCP are stored in the same database, but `mcp serve` does not run the
+scheduler — they fire the next time a process that does (a REPL or `minion run`) opens it.
+
 ## Safety model
 
 There is no sandbox. The model can only act through tools, and every tool that
@@ -196,6 +250,10 @@ writes or executes goes through a policy engine that decides *before* the call:
 - **External MCP tools are not a second path.** They are ordinary tools behind the same gate, with
   `network` risk, and only the ones a server's `tool_allow` names exist at all. A server is spawned
   directly, never through a shell.
+- **The MCP server is read-only by default.** `agent_ask` runs a turn with the read-only tool subset;
+  shell execution and file writes over MCP are opt-in flags that are printed at startup, and a
+  disabled capability is refused by the policy engine — visibly, and in the audit trail — rather than
+  quietly absent. `minion://config-redacted` strips secret-shaped header values.
 - Approval is remembered by **verb**, so approving one `cargo build` does not
   approve every `cargo` invocation.
 

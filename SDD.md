@@ -995,6 +995,43 @@ The server task is started with `minion mcp serve` (stdio). It uses `rmcp`'s ser
 
 **Protocol posture:** read-only by default; write/exec capabilities are opt-in flags that are printed loudly at server startup, so an operator cannot enable them unknowingly.
 
+**As implemented (M6).** The server is `minion mcp serve` over stdio, in
+`minion-cli::mcp_serve`. It assembles the same pieces a session does — the same
+store, the same built-in tool registry, the same `PolicyEngine` — and it never
+starts a REPL, because both own stdin/stdout (R5). A turn's output goes nowhere
+but the protocol, so diagnostics stay on stderr.
+
+- **The surface, name for name.** `agent_ask`, `agent_list_sessions`,
+  `agent_get_session`, `agent_list_tools`, then `cron_add`/`cron_list`/
+  `cron_remove` when `expose_cron_write`, then `agent_run_command` and
+  `agent_write_file`. `agent_ask`'s inner agent gets the **read-only subset** of
+  the built-in registry, chosen by the risk class itself rather than by a
+  hand-kept list, and `allow_tools` can narrow it further (an unknown name is
+  dropped, fail-closed). So the default surface observes and nothing else.
+- **A disabled capability is denied, not hidden.** `agent_run_command` and
+  `agent_write_file` are always listed. Without their flag the gate carries a
+  deny rule that refuses every call, and the refusal is written to `audit_log`
+  like any other decision; the caller receives it as a readable tool error, not
+  an opaque protocol error. Hiding the tool would leave the host guessing at
+  what the server can do.
+- **The gate is non-interactive, and an enabled family substitutes the fallback.**
+  stdin is the protocol pipe, so there is no terminal to prompt on: an enabled
+  family gets a `ToolPolicy` that resolves to `auto` (D21) and everything else
+  takes `policy.noninteractive`. Deny and allow rules run first as always, which
+  is why `agent_run_command` is decided under the name `run_command` — an
+  operator's existing `run_command` rules protect the MCP surface too, and the
+  command classifier still sees the command.
+- **Resources and prompt.** `minion://sessions`, `minion://jobs`,
+  `minion://config-redacted` and the `minion://sessions/{id}` template; the
+  `minion_agent` prompt frames a task for a host that has prompts but no tools.
+  `config-redacted` serialises the effective config with header values whose
+  *name* looks like a credential replaced by `<redacted>`, so the resource cannot
+  become an exfiltration path for a hand-written config.
+- **The scheduler does not run here.** A job added over MCP is stored in the
+  same database and runs the next time a process with a scheduler opens it.
+  `mcp serve` is a protocol server, not a daemon; starting a scheduler inside it
+  is a separate decision and is not part of this milestone.
+
 ### 5.10 MCP client
 
 - Servers from `[mcp.client.servers.*]` are spawned at startup (lazily on first use if `lazy = true`).
@@ -1232,7 +1269,7 @@ For each capability, an operator should be able to answer "who can trigger this?
 | M3.5 — System One guard | done | Optional `/v1/systemone` judge for flagged `run_command`, two thresholds, category floor, audited verdicts | An ineligible command never reaches the model; every failure path prompts; a guard that returns `Err` cannot produce an allow |
 | M4 — Cron | done | Scheduler, job CRUD, run history, catch-up | A weekly job fires on a virtual clock test |
 | M5 — MCP client | done | External servers, namespaced tools, per-server policy | External tool callable with approval |
-| M6 — MCP server | | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
+| M6 — MCP server | done | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
 | M7 — Hardening | | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
 
 ---
@@ -1349,3 +1386,4 @@ than editing individual tools.
 | D19 | A cron run always takes the non-interactive policy, and a fire consumes its occurrence | §11's open question 2 is settled as fail-closed, and the reason is the same one D15 gives: consent requires a person who is being asked. A job prompt has no terminal even when the scheduler is ticking inside a REPL that has one, so its gate is built with `interactive = false` **and no approval UI**, which makes `policy.noninteractive` the deciding rule for anything that changes something and leaves deny rules and allowlists in front of it untouched. A job cannot promote an `ask` tool to `auto`, cannot reach the System One guard (there is no prompt for it to resolve), and cannot create or delete other jobs unless an allow rule names it — the three properties the milestone's tests pin. The fire path is the other half: the occurrence is consumed when it fires, not when it finishes, because `next_run_at` recomputed only on completion would leave a job whose run outlasts its own interval looking due on every tick, and every tick would then record an overlap. Completion recomputes from the cron expression and the completion instant, which can only move the value later, so the "on completion" sentence in §5.7 and the fire-time advance agree instead of fighting. `missed_run_policy` stays a `[cron]` setting rather than a per-job column, since the schema has none and inventing one means a migration for a knob nobody has asked to vary per job; catch-up replays occurrences without the overlap check, because a replayed occurrence never ran and there is no live run to collide with, while `max_concurrent_jobs` and `missed_run_cap` still bound the burst. A `reuse` job's session is adopted in a *separate* statement from the run's terminal status, because `jobs.session_id` is a foreign key and an adoption that fails must not roll back the record that the run finished |
 | D20 | The tool catalogue the model sees is read live from a `ToolCatalog`, and `lazy` defers a server's spawn to the first turn rather than hiding its tools | §5.10 asks for two things that a registry frozen at session assembly cannot both have: the servers are "spawned at startup", and a server that failed is "retried on the next turn". A `Vec<Box<dyn Tool>>` built once can do neither — a retry that cannot re-add a tool is not a retry. So the registry keeps its registered tools and *consults* a catalogue on every read of the tool list; an MCP failure adds or removes entries in a structure that changes under the frozen `Arc<ToolRegistry>` every caller already holds. That also settles shadowing by construction rather than by convention: registered tools are enumerated first and a name already present is skipped, so a server cannot publish a name a built-in owns, and two servers cannot fight over one. `lazy` is the one place where a literal reading had to be traded for a useful one. "Spawned lazily on first use" cannot mean "hidden until a tool is called", because a tool cannot be called before it is listed and a server cannot list tools before it is spawned — the two requirements would deadlock. It therefore means the spawn is deferred from session assembly to the first turn: opening a session (or `minion mcp list`, which is an explicit ask) does not start a process, and the tools reach the catalogue from that point rather than being invisible. The alternative — lazy servers reachable only through a generic `mcp_call` — was rejected because it moves the policy decision off the tool name the per-server policy keys on. `mcp_call` itself is deferred for that reason; the flattened tools are the surface §5.10 describes as primary |
 | D21 | An external tool is always `Risk::Network`, and a server's `policy` substitutes the global default *and* the non-interactive decision for its own tools | §5.5 says an external tool inherits the target's declared risk with `Network` as a floor. MCP declares risk only in `ToolAnnotations`, and the protocol's own documentation says a client must not make tool-use decisions from them — they come from a server the operator has not vouched for (T6). Since the floor is `Network`, an inherited hint could only ever *lower* the class, never raise it, so the floor is the whole rule and the annotations are ignored. The consequence is deliberate: every external call is gated at least as strictly as an outbound HTTP request, and D15 puts `Network` on the side of the line that a missing terminal refuses. The per-server policy then has to mean something for an unattended run, or "a trusted local server can be `auto`" would be false the moment a pipe is involved. It therefore substitutes both fallbacks — `policy.default` and `policy.noninteractive` — and nothing else: deny rules, allow rules and the command classifier still run first and still win, so a family marked `auto` cannot resurrect a refusal that already happened, and a family marked `deny` refuses its tools outright. This is the trust boundary §6.3 describes applied literally: each MCP client is its own entry point, and the config states its policy in one place |
+| D22 | The MCP server's disabled capabilities are *listed and refused*, not absent, and the exposed shell tool is decided under the name `run_command` | §5.9's table says `agent_run_command` and `agent_write_file` are "denied unless" the flag is set, and T5's mitigation is a startup banner — both describe a capability that exists and is refused, not one that is missing. A hidden tool would leave the host unable to tell "minion cannot do this" from "I mistyped the name", and it would make the denial invisible in the audit trail. So the two tools are always in the list, and without their flag the engine carries a deny rule that refuses every call and records the refusal. The name the *gate* sees is the real tool's — `run_command`, `write_file` — because the policy engine is not a second, weaker world: an operator's existing `run_command` deny rules keep protecting the MCP surface, the classifier still sees the command it is judging, and `subject_for`/`pattern_for` still extract the right subject. The `agent_` prefix is a naming convention of this surface, not a second identity, and the audit row therefore names the tool that actually ran. The gate is non-interactive (`stdin` is the protocol pipe, so no prompt can be shown), and an enabled family substitutes the non-interactive fallback through `ToolPolicy` (D21) — deny and allow rules still run first, so turning a flag on grants nothing that was refused. `agent_ask`'s inner agent is restricted to the read-only subset of the built-in registry, filtered by `Risk::is_observation` rather than by a list of names, so the default surface cannot drift wider than the read/write line itself. The scheduler is deliberately not started here: a job created over MCP is stored and runs under the non-interactive cron gate the next time a process with a scheduler opens the database, which keeps `mcp serve` a protocol server rather than a daemon |

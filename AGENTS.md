@@ -2,13 +2,14 @@
 
 ## Status
 
-Rust workspace implementing `SDD.md`. Milestones **M0 through M5 are complete**: config and layered
+Rust workspace implementing `SDD.md`. Milestones **M0 through M6 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
 sessions, keyword memory, `http_fetch` with its SSRF guard, `minion init`, the optional System One
-guard for the approval gate, the in-process cron scheduler with job CRUD, run history and catch-up, and
-the **MCP client** that consumes external servers as gated tools. The work for M5 landed on branch
-`m5-mcp-client`, cut from `m4-cron`.
+guard for the approval gate, the in-process cron scheduler with job CRUD, run history and catch-up,
+the **MCP client** that consumes external servers as gated tools, and the **MCP server** that
+publishes the agent to another model. M5 landed on branch `m5-mcp-client`, cut from `m4-cron`; M6
+landed on `m6-mcp-server`, cut from `m5-mcp-client`.
 
 **M3 is done.** `remember`/`recall` live in `minion-store/src/memory.rs`,
 `minion-tools/src/memory.rs` and `minion-core/src/memory.rs`; `http_fetch` and its guard are
@@ -37,8 +38,16 @@ registry in `minion-core/src/tool.rs`; the per-server approval fallback is `Tool
 `setup.rs`, `run.rs` and `repl.rs`. `src/bin/mcp_stub_server.rs` is a real MCP server used as the test
 fixture, so the tests exercise a process boundary rather than a mock.
 
-`minion-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. The
-**server** half (`mcp serve`, §5.9) is still M6.
+**M6 is done.** The server is `minion-cli::mcp_serve`: `Runtime` assembles the shared pieces (store,
+read-only tool subset, the non-interactive gate), `MinionServer` is the `rmcp` `ServerHandler`, and
+the exposed tools are ordinary `minion_core::tool::Tool`s dispatched through the same gate. `[mcp.server]`
+is `McpServerSection` in `minion-core/src/config.rs`; the subcommand is `McpAction::Serve` in
+`cli.rs`, dispatched from `mcp.rs`. `agent_run_command`/`agent_write_file` are `Exposed` wrappers over
+`RunCommand`/`WriteFile`, so the surface adds a name and nothing else. The golden surface lives in
+`crates/minion-cli/src/snapshots/minion__mcp_serve__tests__the_default_surface_is_a_golden.snap`.
+
+`minion-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. Both halves
+of MCP exist: `minion-mcp` is the client (§5.10), `minion-cli::mcp_serve` is the server (§5.9).
 
 `default_registry` takes a second argument, an `Arc<Store>`, because the memory and cron tools need
 one, and a third, a `CronContext`, carrying the clock and default timezone the `cron_*` tools use.
@@ -57,6 +66,7 @@ cargo +1.89.0 test --workspace     # all tests; offline, no network, no API key 
 cargo +1.89.0 test -p minion-core   # one crate
 cargo +1.89.0 test -p minion-cron   # the scheduler: virtual clock, no sleeps, no network
 cargo +1.89.0 test -p minion-mcp    # the MCP client: spawns the stub server, no network
+cargo +1.89.0 test -p minion-cli --bin minion mcp_serve   # the MCP server, over an in-memory pipe
 cargo +1.89.0 test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
 cargo +1.89.0 clippy --all-targets -- -D warnings    # lint gate; currently clean
 cargo +1.89.0 fmt --all
@@ -122,8 +132,11 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   the schemas *and* unresolvable by name.
 - Approval is fail-closed: non-TTY never prompts and defaults to `deny`; deny rules always beat
   allowlists.
-- The MCP server is read-only by default. `expose_exec`/`expose_write` stay `false`; `run_command`
-  is never exposed over MCP by default.
+- **The MCP server is read-only by default.** `expose_exec`/`expose_write` stay `false`;
+  `run_command` is never *callable* over MCP by default. The two tools are still listed — the denial
+  is a policy decision the audit trail records, not a missing tool (D22) — and `agent_ask`'s inner
+  agent only ever gets the read-only subset of the registry. `minion mcp serve` never starts a REPL
+  (R5): both own stdin/stdout.
 - Cron job runs always use the non-interactive policy and cannot prompt for approval. The gate is
   `setup::build_cron_gate` — no `ApprovalUi`, `interactive = false`, no guard. Don't route a job
   through the session's gate.
@@ -332,6 +345,48 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   `read_file`, or any external call at all, left no trace. It is a decorator on purpose: the rule order
   in `PolicyEngine::check` is the security property, and wrapping records without touching it.
 
+## MCP server rules (M6)
+
+- **`mcp serve` is a terminal mode.** It owns stdin/stdout for the protocol and returns `ExitCode`
+  when the peer closes; there is no path from it to `repl::interactive`. That *is* R5 — not a flag
+  that has to be checked, but a control flow that cannot reach the REPL.
+- **The surface is a `ToolRegistry`, and the gate is the same engine.** `MinionServer::dispatch`
+  resolves a tool, calls `gate.check(policy_name(name), tool.risk(), args, subject)` and then
+  `invoke`, exactly as `Agent::dispatch` does with a model in front of it. If you add a tool to the
+  surface, give it a risk class and a schema; do not add a call path that skips `dispatch`.
+- **`policy_name` maps `agent_run_command` → `run_command` and `agent_write_file` → `write_file`.**
+  This is load-bearing, not cosmetic: the engine's classifier, `subject_for` and `pattern_for` all key
+  on the *real* tool name, and an operator's existing `run_command` deny rules must protect the MCP
+  surface. The `agent_` prefix is a naming convention of this surface, not a second identity (D22).
+  The audit row names the tool that actually ran.
+- **A disabled capability is listed and refused.** Without `expose_exec`/`expose_write`, the gate
+  carries a deny rule (`run_command`/`write_file` → `*`) rather than the tool being absent. The
+  refusal reaches the caller as `CallToolResult::error`, which is a tool failure the host can read —
+  not `Err(McpError)`, which MCP clients render opaquely.
+- **The gate is built with `interactive = false` and an enabled family gets `ToolPolicy::Auto`.**
+  stdin is the protocol pipe, so no prompt can ever be shown; a flag is the operator's consent, and it
+  substitutes the non-interactive fallback for that one family (D21). Deny and allow rules still run
+  first, so turning a flag on grants nothing that was already refused. Never make the server's gate
+  interactive, and never build it from the session's `ApprovalUi`.
+- **`agent_ask`'s tool set is filtered by `Risk::is_observation`, not by a list of names.**
+  `default_registry` is built and then reduced to its read-only tools, so the inner surface cannot
+  drift wider than the read/write line itself. `allow_tools` narrows further, and an unknown name is
+  dropped (fail-closed, like `tool_allow`).
+- **A host-supplied `session_id` is honoured.** An unknown id creates a conversation under that id, so
+  a caller can keep one across calls without a round trip. `history[0]` is always the system prompt;
+  the fresh/resumed split decides whether the whole transcript or just the turn is persisted.
+- **`config-redacted` redacts by header *name*.** The repo invariant is that a config never contains a
+  secret, but `[provider].headers` is hand-writable and may carry an `Authorization` value. Anything
+  whose name contains `authorization`/`auth`/`token`/`key`/`secret`/`cookie`/`password`/`credential`
+  becomes `<redacted>`; the env var *name* and file *path* stay, because they are not secrets.
+- **The scheduler is not started by `mcp serve`.** A job created over MCP is stored and runs under the
+  non-interactive cron gate the next time a process with a scheduler opens the database. `mcp serve` is
+  a protocol server, not a daemon; starting the scheduler inside it is a separate decision.
+- **The tests drive a real MCP connection over an in-memory pipe.** `serve_server` must be
+  `tokio::spawn`ed, never awaited, before the client is built: it completes the handshake before
+  returning, and it cannot handshake with a client that does not exist yet — awaiting it deadlocks.
+  The fake provider is injected through `Runtime::build`'s `ProviderFactory`, so no network is needed.
+
 ## Memory rules
 
 - **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and
@@ -410,9 +465,9 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 ## Known gaps (don't mistake these for bugs)
 
-- The CLI has `run`, `init`, `session`, `cron`, `mcp list` / `mcp tools`, and the default REPL. There
-  is still no `doctor`, no `config` subcommand and no `mcp serve` (that is M6), so §5.12's CLI surface
-  is only partly built.
+- The CLI has `run`, `init`, `session`, `cron`, `mcp list` / `mcp tools` / `mcp serve`, and the
+  default REPL. There is still no `doctor` and no `config` subcommand, so §5.12's CLI surface is only
+  partly built.
 - **`mcp_call` is not implemented.** §5.5 lists a generic `mcp_call(server, tool, arguments)` escape
   hatch. The per-server approval policy keys on a tool *name*, so a generic tool would either have to
   be special-cased to read `args.server` for its decision, or would let a server marked `deny` be
@@ -433,8 +488,17 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - **`/cron` in the REPL and the scheduler's start/stop wiring are manually verified.** The
   subcommand (`minion cron add|list|remove`) is the tested surface; the REPL path has no automated
   test, the same limitation as the interactive approval prompt.
-- **The MCP `cron_*` tools (§5.9) are not wired.** The tools exist and are registered in the agent's
-  registry; exposing them over `mcp serve` is M6's job.
+- **`mcp serve` does not run the scheduler.** A job created over MCP (`cron_add`) is stored in the
+  session database and runs the next time a process that *does* start a scheduler — `minion run`, the
+  REPL, or a future `doctor`/daemon — opens it. The server is a protocol endpoint, not a daemon (D22).
+- **`mcp serve` ignores `[mcp.client.servers.*]`.** The server's inner agent is the read-only subset
+  of the built-in registry, and external tools are `Risk::Network`, so they would never be offered
+  anyway; the client half is not assembled. A future widening of `agent_ask` beyond read-only has to
+  decide whether external tools join it.
+- **`agent_ask`'s inner agent is read-only, always.** `expose_write`/`expose_exec` add the *direct*
+  tools `agent_write_file`/`agent_run_command`; they do not widen what `agent_ask` can do. That
+  matches §5.9's "read-only tool subset", and it means a host that wants a write must call the write
+  tool explicitly rather than ask the agent to do it.
 - **M3.5's guard policy is tested, its interactive wiring is not.** `minion-core` unit-tests the
   floor, the thresholds and the engine (with a fake guard) and `minion-guard` runs the real HTTP
   client against a fake `/v1/systemone` server inside the real engine, but no test drives a real
@@ -582,3 +646,65 @@ What to check, and what was checked:
   message in the transcript explains why. A second turn adds no second copy.
 - `ps` shows no `mcp-stub-server` after any of those commands: the connections are closed on the way
   out.
+
+### MCP server end to end
+
+The automated test drives a real MCP client against a real server over an in-memory pipe
+(`cargo test -p minion-cli --bin minion mcp_serve`), which is the surface to trust. This recipe is for
+the *binary* path: a real `minion mcp serve` process, its own stdin/stdout, the SSE stub as the model.
+
+```sh
+# 1. a config whose provider is the SSE stub, with the default read-only surface
+cat > /tmp/m6/minion.toml <<'TOML'
+[provider]
+base_url = "http://127.0.0.1:8099/v1"
+api_key_env = ""
+api_key_file = ""
+model = "stub-model"
+[cron]
+enabled = false
+[mcp.server]
+expose_exec = false
+expose_write = false
+expose_cron_write = true
+TOML
+
+# 2. a throwaway MCP client: JSON-RPC over the child's stdin/stdout
+python3 - <<'PY'
+import json, subprocess, sys
+p = subprocess.Popen(
+    ["minion", "--config", "/tmp/m6/minion.toml", "--db", "/tmp/m6/m6.db", "mcp", "serve"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def rpc(id, method, params=None):
+    p.stdin.write((json.dumps({"jsonrpc":"2.0","id":id,"method":method,
+                               "params": params or {}}) + "\n").encode()); p.stdin.flush()
+    return json.loads(p.stdout.readline())
+rpc(1, "initialize", {"protocolVersion":"2025-06-18","capabilities":{},
+                      "clientInfo":{"name":"probe","version":"0"}})
+p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'); p.stdin.flush()
+tools = rpc(2, "tools/list")["result"]["tools"]
+print([t["name"] for t in tools])
+print(rpc(3, "tools/call", {"name":"agent_ask","arguments":{"prompt":"say hello"}}))
+print(rpc(4, "tools/call", {"name":"agent_run_command","arguments":{"command":"echo hi"}}))
+p.stdin.close()
+PY
+```
+
+What to check, and what was checked:
+
+- `minion mcp serve` prints the banner on **stderr** before the protocol starts: one line per
+  `expose_*` flag, `surface: read-only` while both exec and write are off. Nothing but protocol ever
+  reaches stdout, so the client's JSON parse never sees a log line.
+- `tools/list` returns the nine tools in surface order (the golden snapshot), `agent_run_command` and
+  `agent_write_file` among them.
+- `tools/call agent_ask` returns `{"session_id":…,"stop":"completed","text":…}` — the stub provider's
+  answer — and a `sessions` row appears in the database under that id.
+- `tools/call agent_run_command` returns `isError: true` with `refused by a deny rule` in the content,
+  and `audit_log` gains a `deny` row for `run_command`. Set `expose_exec = true`, restart, and the
+  same call returns the command's output with an `allow` row.
+- `resources/list` and `resources/read minion://config-redacted` work; the config JSON carries no
+  secret even if `[provider.headers]` names one.
+- `ps` shows no child process after the client closes stdin: the server exits when the peer closes.
+
+`python3` and `sqlite3` are enough to inspect the database (`SELECT * FROM sessions`, `SELECT * FROM
+audit_log`).
