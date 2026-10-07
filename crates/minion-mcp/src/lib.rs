@@ -15,9 +15,11 @@
 //!   a name that is already taken (§5.10).
 
 mod client;
+mod peer;
 mod servers;
 mod tool;
 
 pub use client::{CallOutcome, McpClient, ToolInfo};
+pub use peer::{PeerAsk, peer_policies, peer_tools};
 pub use servers::{McpServers, OnStart};
 pub use tool::McpTool;

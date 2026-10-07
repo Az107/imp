@@ -224,6 +224,10 @@ impl Runtime {
             .get("max_iterations")
             .and_then(Value::as_u64)
             .map(|value| value.max(1) as u32);
+        let max_tokens = args
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(1, u32::MAX as u64) as u32);
         let allow_tools: Option<Vec<String>> = match args.get("allow_tools") {
             Some(Value::Array(items)) => Some(
                 items
@@ -272,7 +276,7 @@ impl Runtime {
             model: model.unwrap_or_else(|| self.config.provider.model.clone()),
             max_iterations: max_iterations.unwrap_or(self.config.agent.max_iterations),
             temperature: self.config.provider.temperature,
-            max_tokens: None,
+            max_tokens,
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
             workspace_root: self.workspace_root.clone(),
@@ -649,7 +653,7 @@ impl MinionTool for AgentAsk {
     fn description(&self) -> &'static str {
         "Run one turn of minion's agent with its own model backend and return the answer. \
          Params: prompt (required), session_id? (continue a conversation), model?, \
-         max_iterations?, allow_tools? (a subset of the read-only tools)."
+         max_tokens?, max_iterations?, allow_tools? (a subset of the read-only tools)."
     }
 
     fn schema(&self) -> Value {
@@ -662,6 +666,10 @@ impl MinionTool for AgentAsk {
                     "description": "Continue this conversation. Omit to start a new one."
                 },
                 "model": { "type": "string", "description": "Override the model for this turn." },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Cap the tokens this turn may generate."
+                },
                 "max_iterations": {
                     "type": "integer",
                     "description": "Cap the provider round-trips for this turn."
@@ -1677,6 +1685,35 @@ mod tests {
         assert!(stored.is_some(), "the conversation was persisted");
 
         client.cancel().await.ok();
+    }
+
+    /// The depth cap, pinned (M10.2, §5.13). The inner surface an `agent_ask`
+    /// turn runs — the one a peer runs *when it answers a brief* — is the
+    /// read-only subset of the built-ins: no `peer__*` tool is in it, so a peer
+    /// cannot pass the brief on to a third model. If someone ever widens this
+    /// surface, this test is the one that should fail.
+    #[tokio::test]
+    async fn the_inner_surface_a_peer_runs_has_no_delegation_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(
+            dir.path(),
+            Exposure::from(&McpServerSection::default()),
+            Scripted::once("x"),
+        )
+        .await;
+
+        let risks = runtime.tools.risks();
+        assert!(!risks.is_empty(), "the inner surface is not empty");
+        for (name, risk) in risks {
+            assert!(
+                risk.is_observation(),
+                "`{name}` is {risk:?}, so it must not be handed to a delegated turn"
+            );
+            assert!(
+                !name.starts_with("peer__"),
+                "`{name}` would let a peer delegate again, breaking the depth cap"
+            );
+        }
     }
 
     /// A denial crosses the protocol as a readable tool error, which is what the

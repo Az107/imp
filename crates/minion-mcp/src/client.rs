@@ -217,18 +217,25 @@ fn render(content: &[ContentBlock], cap: usize) -> (String, bool) {
         text.push_str(&piece);
     }
 
+    cap_text(text, cap)
+}
+
+/// Cut `text` to `cap` bytes on a character boundary, marking the cut.
+///
+/// A cap that splits a code point would produce a string the provider rejects
+/// outright, so the boundary is searched for rather than assumed. `truncated`
+/// is `true` only when something was actually removed.
+pub fn cap_text(mut text: String, cap: usize) -> (String, bool) {
     if text.len() <= cap {
         return (text, false);
     }
-    // Cut on a character boundary: a cap that splits a code point would produce
-    // a string the provider rejects outright.
     let mut end = cap;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    let mut cut = text[..end].to_string();
-    cut.push_str("\n… [truncated to the output cap]");
-    (cut, true)
+    text.truncate(end);
+    text.push_str("\n… [truncated to the output cap]");
+    (text, true)
 }
 
 #[cfg(test)]

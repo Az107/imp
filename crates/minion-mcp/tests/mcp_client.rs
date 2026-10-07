@@ -182,7 +182,7 @@ async fn tool_allow_hides_and_blocks() {
     // Every tool the server listed is still known, which is what makes
     // `minion mcp tools` able to say what was hidden.
     let discovered = servers.discovered("stub");
-    assert_eq!(discovered.len(), 4, "was: {discovered:?}");
+    assert_eq!(discovered.len(), 5, "was: {discovered:?}");
 
     servers.shutdown().await;
 }
@@ -295,7 +295,7 @@ async fn a_lazy_server_starts_when_it_is_asked_about() {
         .expect("an explicit use starts it");
 
     assert!(servers.is_up("slow"));
-    assert_eq!(servers.discovered("slow").len(), 4);
+    assert_eq!(servers.discovered("slow").len(), 5);
     assert_eq!(servers.published("slow").len(), 1);
 
     servers.shutdown().await;
