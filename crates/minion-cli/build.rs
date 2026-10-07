@@ -15,8 +15,13 @@
 use std::process::Command;
 
 fn main() {
-    // A rebuild after a commit must not keep the old SHA.
+    // A rebuild after a commit must not keep the old SHA. `HEAD` alone is not
+    // enough: it still reads `ref: refs/heads/<branch>` after a commit, so the
+    // refs have to be watched too, along with `packed-refs` for a repository
+    // whose refs have been packed.
     println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs");
+    println!("cargo:rerun-if-changed=../../.git/packed-refs");
     println!("cargo:rerun-if-changed=build.rs");
     for var in [
         "MINION_GIT_SHA",
