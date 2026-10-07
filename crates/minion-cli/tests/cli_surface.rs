@@ -23,10 +23,62 @@ fn version_reports_the_git_sha_and_enabled_features() {
         text.contains("features: mcp, cron"),
         "the default build enables both features; was: {text}"
     );
-    // `<version> (<sha>; features: ...)`: the sha is there, not just the number.
+    // `<version> (<sha>; features: ...)`: the sha must be the commit actually
+    // checked out. A release artifact that names the wrong commit is lying
+    // about its provenance (§9), and `.git/HEAD`-only invalidation made that
+    // happen on every incremental build — so assert against HEAD itself.
+    // Outside a checkout (a source tarball) the binary reports `unknown` and
+    // there is no HEAD to compare with.
+    if let Some(sha) = git_head_sha() {
+        assert!(
+            text.contains(&sha),
+            "the version line must name HEAD ({sha}); was: {text}"
+        );
+    }
+}
+
+/// `git rev-parse --short=12 HEAD` from the repository above this crate, or
+/// `None` when this is not a git checkout or git is unavailable.
+fn git_head_sha() -> Option<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() { None } else { Some(sha) }
+}
+
+/// `--max-iterations 0` is rejected the same way `[agent] max_iterations = 0`
+/// in the config is: exit 2, not a silent clamp to 1.
+#[test]
+fn max_iterations_zero_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = minion()
+        .arg("--cwd")
+        .arg(dir.path())
+        .args(["--max-iterations", "0", "config", "show"])
+        .output()
+        .expect("run with --max-iterations 0");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a zero iteration budget is a config error; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        text.contains('(') && text.contains(';'),
-        "the version line should carry the commit; was: {text}"
+        String::from_utf8_lossy(&output.stderr).contains("max_iterations must be at least 1"),
+        "was: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

@@ -70,8 +70,14 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
     }
     if let Some(iterations) = cli.max_iterations {
         // `--max-iterations 0` would end every turn immediately; the config
-        // validation rejects that, so the flag does too.
-        config.agent.max_iterations = iterations.max(1);
+        // validation rejects that, so the flag does too — same message, same
+        // exit code `2` as a `[agent] max_iterations = 0` in the file.
+        if iterations == 0 {
+            return Err(Error::Config(
+                "agent.max_iterations must be at least 1".to_string(),
+            ));
+        }
+        config.agent.max_iterations = iterations;
     }
 
     // The redaction layer is built from the *resolved* configuration, so the

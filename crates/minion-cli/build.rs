@@ -10,7 +10,19 @@ fn main() {
     // Re-run when the checkout moves: the SHA is part of the output.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=GIT_DIR");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    // `.git/HEAD` alone is not enough: on a branch it holds a *ref name*, not a
+    // commit, so a new commit on that branch leaves it untouched and the baked
+    // SHA goes stale on every incremental build. The ref file, the reflog and
+    // the packed refs all move with the commit; cargo re-scans a directory, so
+    // watching `.git/refs` catches a ref that lives in its own file.
+    for path in [
+        "../../.git/HEAD",
+        "../../.git/refs",
+        "../../.git/logs/HEAD",
+        "../../.git/packed-refs",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
 
     let mut features: Vec<&str> = Vec::new();
     if std::env::var_os("CARGO_FEATURE_MCP").is_some() {

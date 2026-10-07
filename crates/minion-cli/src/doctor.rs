@@ -171,11 +171,12 @@ async fn database_check(path: &Path) -> (Check, bool) {
                 .await
                 .map(|rows| rows.len())
                 .unwrap_or(0);
+            let audit = audit_summary(&store).await;
             (
                 Check::ok(
                     "database",
                     format!(
-                        "{} · schema {} · writable{}",
+                        "{} · schema {} · writable{}{audit}",
                         store.path().display(),
                         minion_store::SCHEMA_VERSION,
                         if count > 0 { "" } else { " · no sessions yet" }
@@ -185,6 +186,23 @@ async fn database_check(path: &Path) -> (Check, bool) {
             )
         }
         Err(err) => (Check::fail("database", err.to_string()), false),
+    }
+}
+
+/// The tail of the audit trail, so `doctor` shows whether the gate recorded
+/// anything at all — and, if so, what it decided last (a refused tool is the
+/// first thing an operator wants to see when something "did nothing").
+async fn audit_summary(store: &Store) -> String {
+    match store.recent_audit(1).await {
+        Ok(rows) => match rows.first() {
+            Some(row) => {
+                let tool = row.tool.as_deref().unwrap_or("(unknown tool)");
+                let decision = row.decision.as_deref().unwrap_or("(open)");
+                format!(" · last decision {decision} {tool}")
+            }
+            None => " · no decisions recorded".to_string(),
+        },
+        Err(_) => String::new(),
     }
 }
 
