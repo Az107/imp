@@ -308,9 +308,9 @@ Rationale: `minion-core` has zero terminal and zero network dependencies, so the
 
 ### 5.1 Configuration
 
-**Precedence** (highest first): CLI flags → env vars (`MINION_*`) → project `minion.toml` → user config → built-in defaults.
+**Precedence** (highest first): CLI flags → env vars (`MINION_*`) → project `minion.toml` → synced master layer (`config sync`, §5.14) → user config → built-in defaults.
 
-Locations: `$XDG_CONFIG_HOME/minion/config.toml` (or `~/Library/Application Support/minion/` on macOS), plus `./minion.toml` in the workspace.
+Locations: `$XDG_CONFIG_HOME/minion/config.toml` (or `~/Library/Application Support/minion/` on macOS), plus `./minion.toml` in the workspace, plus the machine-local `synced.toml` written by `config sync` (§5.14).
 
 ```toml
 [provider]
@@ -416,6 +416,15 @@ level = "info"
 format = "text"                  # text | json
 file = "~/.local/state/minion/minion.log"
 redact_env = true
+
+# The master config channel (M11, §5.14). This section is read from the *local*
+# layers only — it is the bootstrap that tells a node where the master repo is,
+# so the synced layer itself may never define it. `remote`/`ref` name the git
+# channel; `node` names *this* machine and is resolved when it is empty.
+[configsync]
+remote = "https://git.albruiz.dev/albruiz/minion-config.git"
+ref = "main"                     # branch or tag; a pinned commit is also accepted
+node = ""                        # empty → `hostname -s` → the self entry of `tailscale status`
 ```
 
 **Secrets.** The config records only the *names* of where a secret comes from. The value is read at
@@ -1219,7 +1228,11 @@ minion mcp tools <server>              # inspect one server
 minion init [--check] [--project] [--force] [--non-interactive]
             [--header 'Name: value']… [--credentials-file <PATH>] [--no-store-token]
                                        # first-run setup for the model backend (§5.1.1)
-minion config show|path                # read-only; `config init` aliases `minion init`
+minion config show|path [--origin] [--json]
+                                       # read-only; `--origin` names the layer each value
+                                       # came from (§5.14); `config init` aliases `minion init`
+minion config sync [--dry-run] [--check] [--node <NAME>] [--remote <URL>] [--ref <REF>]
+                                       # converge the machine layer from the master repo (§5.14)
 minion doctor                          # env, config, db, provider reachability
 minion update [--check] [--yes] [--force] [--rollback]
                                        # check a release channel and replace the installed
@@ -1304,6 +1317,165 @@ the second hop the depth cap exists to forbid.
 
 ---
 
+### 5.14 Master config layer — `minion config sync`
+
+A **master** lets one place describe how all the other nodes are configured, without depending on
+the network between them. It is deliberately *not* a process: the master is a **git repository plus
+a convention**, and each node converges by pulling it. This section fixes the shape of that pull;
+it is a design proposal (M11), not a built feature (D35–D39).
+
+**Pull, never push.** Every node runs `minion config sync`. The master never reaches into a node,
+so convergence works for a node behind NAT, on a different network, or on one that is not on the
+tailnet at all — which is the case of the 1050 Ti today. The evaluated alternative is an HTTP
+endpoint served by the master (either a live `GET /config` or a push channel): it is **refused**
+because it needs a service that is always on (against the no-daemon principle and the non-goals
+below), it needs every node to be able to *reach* the master (exactly the connectivity problem the
+pull solves), and it re-implements — worse — what git already is: versioning, transport auth,
+history, and an offline cache. Recorded as **D35**.
+
+**Channel: the git repo.** `[configsync].remote` and `.ref` name the channel; both are read from
+the **local layers only** (flags or the user config), because this is the bootstrap that tells a
+node where the master is — the synced layer itself may never define it.
+
+```
+minion-config/                 # a repo of its own (Forgejo), not the minion source tree
+├── base.toml                  # shared by every node
+├── nodes/<name>.toml          # the overlay for one node
+└── checksums.txt              # the commit and a sha256 per file (generated, committed)
+```
+
+`sync` shells out to the system `git` (a bare mirror under `$XDG_CACHE_HOME/minion/config-sync/`),
+rather than growing a second protocol: git is already where the nodes are, it already carries the
+host's auth (SSH key or HTTPS token), and it is the versioned, auditable store this milestone is
+about. If `git` is absent the command fails loudly — it never degrades to a silent no-op.
+
+**Base + overlay.** The synced layer is `base.toml` deep-merged with `nodes/<name>.toml` on
+`toml::Value`, the existing merge, so an overlay only restates the keys it changes. A directory of
+per-node files is chosen over one `[node."<name>"]` table in a shared file: adding a node is a file
+add, two nodes never collide on one table (a merge hotspot), and one node's policy is one file to
+read. **D37**.
+
+**How a node knows its own name.** In order: the `--node` flag → `[configsync].node` → `hostname
+-s` → the self entry of `tailscale status --json` (`DNSName`, domain stripped). The resolved name
+and the rule that produced it are logged and printed by `config show --origin`. A name that does
+not appear in `nodes/` is **not** an error: the node applies the base alone and warns, so a freshly
+provisioned machine converges before its entry exists. A node that *is* listed but whose overlay
+fails to parse is a hard error — a policy that cannot be honoured must not be silently dropped.
+
+**Precedence.** The synced layer fits the existing order without replacing it (highest first):
+
+```
+CLI flags → env (MINION_*) → project minion.toml → synced layer → user config → defaults
+```
+
+The argument is the one the existing order already uses — *more specific wins*. The synced layer is
+a **machine** layer; a project `minion.toml` is a **workspace** layer, therefore more specific, and
+stays above it; the user config is also machine-level but expresses a personal preference, and an
+admin policy outranks it, so the synced layer sits above the user file. `sync` writes the merged
+base+overlay to a machine-local `synced.toml` beside the user config (never committed, never part
+of a `--project` write) with a sibling state file recording `{remote, ref, commit, files:sha256,
+applied_at}`; `Config::load` then merges it like any other layer, so a machine that has never synced
+has no file and behaves exactly as today. No database is involved. **D36**.
+
+Two consequences are written down rather than hidden. Because the project file is above the synced
+layer, **a cloned repository's committed `minion.toml` can override master policy** (for example
+widen `[policy.allow]`); and because the synced layer is above the user file, **an operator cannot
+override master policy in their own config**. If master policy should instead be a floor that
+neither can loosen, that is a different mechanism — a "locked keys" list, not an order — and it is
+flagged for the spec owner (§11, R10) rather than decided here.
+
+**Observability is mandatory, not a nicety.** A sync nobody can inspect is magic, and magic is not
+debuggable.
+
+- `minion config sync --dry-run` fetches and verifies, prints the *effective* diff, and writes
+  nothing:
+
+  ```
+  config sync: node "1050ti" (from hostname)
+    channel  https://git.albruiz.dev/albruiz/minion-config.git @ 4f2a1c9 (ref main)
+    verified 3 files, sha256 ok, commit ok
+    synced layer (base.toml + nodes/1050ti.toml):
+      + peers.big.url          nodes/1050ti.toml
+      + peers.big.token_file   base.toml
+      ~ policy.noninteractive  base.toml   "ask" -> "deny"   (shadowed by project ./minion.toml)
+    dry-run: nothing written
+  ```
+
+- `minion config sync --check` resolves the remote commit and exits `1` when it differs from the
+  applied one, writing nothing — the same shape as `minion update --check`.
+
+- `minion config show --origin` names, for every effective key, the layer it came from:
+  `default` / `user:<path>` / `synced:<commit> <file>` / `project:<path>` / `env:<VAR>` / `flag`.
+  It is implemented by keeping each layer's `toml::Value` and walking them highest-first: a leaf's
+  origin is the topmost layer that defines it. `--json` is the script form.
+
+  ```
+  provider.model         = "qwen2.5:14b"   [user:~/.config/minion/config.toml]
+  peers.big.url          = "http://big…"   [synced:4f2a1c9 nodes/1050ti.toml]
+  policy.noninteractive  = "deny"          [project:./minion.toml]
+  workspace.roots        = ["."]           [default]
+  ```
+
+**Integrity, the same contract as `minion update` (D23).** The bundle carries `checksums.txt` with
+the commit and a sha256 per config file. Before anything is applied, in order: **(1)** every file
+hashes (computed in-tree, `minion_core::sha256`) to its entry, and **(2)** the commit the ref
+resolves to equals the `commit` line. Any mismatch refuses the whole bundle — exit `4`, nothing
+written (fail-closed). Two checks, not one, for update's reason: the **checksum** binds the bytes to
+the manifest and the **commit** binds the manifest to a revision, so a bundle that swapped both
+files and manifest still fails the commit check. Both are needed even though git hashes objects,
+because git proves the objects it fetched and says nothing about a hand-edited cache, and it does
+not bind a bundle read any other way to a revision. Applying is atomic: `synced.toml` and its state
+file are written to a temp file and `rename()`d, so an interrupted sync never leaves a half-applied
+layer. **D38**.
+
+The honest limit, stated as the risk it is: **whoever controls the channel controls the effective
+policy of every node.** The manifest lives in the repo, so a malicious publisher rewrites the files
+*and* the manifest together and passes both checks — the residual is publisher trust, exactly the
+limit D23 already carries, not a claim of supply-chain security. It is written up as **T15** and
+**R10**. What keeps the blast radius bounded is §5.1: the channel can only ever distribute *names*,
+never a secret value, so a compromised master distributes policy — it cannot exfiltrate keys.
+
+**Relation to peers (M10).** The peer cohort is the clearest use case. Today `[peers.big]` is
+repeated in every node's config, so adding a node means editing N files. With the master, the peer
+lives once in `base.toml`:
+
+```toml
+# base.toml
+[peers.big]
+url = "http://big.tailnet.ts.net:8788/mcp"
+token_file = "~/.config/minion/big.credentials"   # a path, never the token
+approval = "ask"
+```
+
+Every node gains `peer__big_ask` after its next `config sync`; adding a node is one
+`nodes/<name>.toml`; rotating the peer's endpoint is one line in the base. Only **names** travel —
+`url` plus a `token_file` *path* or a `token_env` *variable name* — so §5.1 holds and the master is
+never where the tokens live. Each node's own `0600` credentials file (or environment) supplies the
+value; provisioning those values is out of scope, below.
+
+**What does not enter.** **D39.**
+
+- **Centralizing secret *values*.** That is the token-manager's job, a separate system. The master
+  records names and paths, never values (§5.1, D9/D11). A master that held every node's key would
+  be the single point of compromise this whole section exists to avoid.
+- **Automatic node discovery or enrolment.** A node is in the repo because a human put it there.
+  No tailnet scan, no self-registration, no "join" protocol.
+- **Any permanently-running master service.** No daemon, no endpoint, no listener (D35).
+- **A sync timer inside minion.** `sync` runs when it is invoked. A node that wants it periodic
+  wires its own cron/launchd to call `minion config sync`; minion starts no background loop for it.
+
+**Exit codes:** `0` up to date · `2` usage · `3` channel unreachable (remote, auth, or ref missing)
+· `4` refused (integrity mismatch, or a listed overlay that will not parse) · `5` internal.
+`--check` exits `1` when drift exists.
+
+**Placement.** The rules — bundle shape, the manifest parse, verification, the overlay merge and the
+origin walk — are pure and live in `minion-core` (they take bytes and return values, no I/O). The
+one part that shells out to `git` lives in a new small crate **`minion-master`**, mirroring the split
+`minion-update` and `minion-guard` already use to keep `minion-core` free of I/O; the subcommand is
+`minion-cli/src/config.rs`. `[configsync]` is `ConfigSyncConfig` in `minion-core/src/config.rs`.
+
+---
+
 ## 6. Security and threat model
 
 ### 6.1 Assets
@@ -1328,6 +1500,7 @@ API keys; filesystem contents; shell access; the SQLite store (may contain sensi
 | T11 | `init` writes a config that leaks a credential | The value goes only to the separate `0600` credentials file; the config records env var *names* and paths, so `--project` output stays committable; the token is never printed, never logged, and never appears in `--json` |
 | T12 | `init` silently overwrites a hand-tuned config | Existing target is diffed and requires `--force`; writes go through a temp file and rename, so no partial config is left behind |
 | T13 | The API key leaks into terminal scrollback or a screen share | Echo is disabled *before* the prompt is printed, not after, closing the window in which a fast paste would be echoed; the guard restores the previous termios on drop, including on panic |
+| T15 | The master config channel is the softest target in the fleet: whoever controls it controls the effective policy of *every* node | The bundle is verified before it is applied (per-file SHA-256 against a committed manifest, plus the commit the ref resolves to), fail-closed (D38, §5.14); the channel can only *name* secrets, never carry a value (§5.1), so a compromised channel cannot exfiltrate keys — it can only distribute policy; sync is an explicit pull, never a daemon, so nothing applies without a decision. The residual — a manifest that agrees with a malicious commit — is publisher trust, the same acknowledged limit `minion update` carries (D23) |
 
 ### 6.3 Principle of least exposure
 
@@ -1430,6 +1603,7 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `minion update` installs; a mismatched version or a failing test publishes nothing |
 | M10 — Peer transport | done | Streamable HTTP for both halves: `url` on `[mcp.client.servers.*]` with bearer-token auth (`token_env`/`token_file`), `transport = "http"` + `bind` on `[mcp.server]`, a fail-closed bind policy, no TLS by design | Two minion instances on a tailnet discover and call each other's gated tools over HTTP; a non-loopback bind with no token refuses to start; a wrong token lists nothing |
 | M10.2 — Peer delegation | done | One `peer__<name>_ask` tool per `[peers.*]` entry, carrying a *brief* to the peer's `agent_ask`; a configurable result cap (~8 KB), the read-only depth cap, remote usage folded into the turn, and the whole thing behind the `Network` gate | A small model escalates a self-contained brief to a bigger peer through the gate and gets its answer as tool-result data; a cron job cannot escalate; the gate decides before the network is touched; a peer that fails or goes missing is a tool error, never a panic or a hang |
+| M11 — Master config node | proposed | A master as a **git repo, not a service**: `minion config sync` converges a machine-local synced layer (`base.toml` + `nodes/<name>.toml`) from a Forgejo repo, under the D23 integrity contract, slotted into the existing precedence, with `--dry-run` and `config show --origin`. Design only (§5.14, D35–D39); no code in this milestone card | A node behind NAT — or one not yet on the tailnet — converges its config by *pulling*; a manipulated bundle is refused and nothing changes; adding a peer cohort member is one edit to the repo, not N node configs |
 
 ---
 
@@ -1446,6 +1620,7 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | R6 | Cron in-process means jobs don't run when minion is closed | Documented; optional `--system` crontab/launchd integration deferred to v2 |
 | R7 | `always` allowlist could persist an over-broad pattern | Show the exact pattern before persisting; require explicit confirmation; cap pattern length and forbid wildcards alone |
 | R8 | Token/cost accounting differs per provider | Treat usage as advisory; never block a turn solely on a missing usage field |
+| R10 | The master channel is the fleet's single point of policy injection, and the chosen precedence lets a cloned project — and blocks a local user — override master policy | The bundle is verified before it is applied, fail-closed (D38), and the channel carries names, never secret values (§5.1), so a compromised master distributes policy but cannot exfiltrate keys; recorded as T15. The residual (a manifest that agrees with a malicious commit) is publisher trust, the same limit D23 carries. Whether master policy should instead be a *floor* a project or user cannot loosen — a "locked keys" mechanism with its own decision — is left open for the spec owner |
 
 **Open questions for review:**
 1. ~~Should `http_fetch` support an explicit `http://` for local dev servers via a named allowlist
@@ -1554,3 +1729,8 @@ than editing individual tools.
 | D29 | A peer reaches the model as **one flattened tool per peer**, `peer__<name>_ask`, never as a generic `delegate(target = "…")` | The approval engine decides on a tool *name*: deny rules, allow rules and the per-server/per-peer `ToolPolicy` all key on it. A single generic tool with a `target` parameter would move that decision off the name and into an argument, which is exactly the ambiguity that `mcp_call` was deferred over (D20) and that the flattened `mcp__<server>__<tool>` tools exist to remove. Flattening per peer keeps three things true at once: an operator writes a rule that names one peer (or `peer__*` names them all), the audit row names the tool that actually ran, and the naming style is the MCP client's own — a namespace plus a fixed leaf, here `peer__<name>_ask` rather than `mcp__<name>__agent_ask`, because a peer contributes *one* capability (a brief) rather than a server's catalogue. A peer is still an MCP server underneath (D25): same transport, same handshake, same client, same bearer-token resolution. The alternative — modelling a peer as an ordinary `[mcp.client.servers.*]` entry and letting `agent_ask` reach the model as `mcp__peer__agent_ask` — was rejected because it would offer the peer's whole catalogue (listing sessions, reading transcripts, the cron tools) instead of the one bounded delegation the milestone is about, and because it would lose the per-peer result cap and the two-argument brief that keep the handoff small |
 | D30 | A delegation sends a **brief, not a trajectory**, and the answer is capped (~8 KB) and treated as **data** | The handoff-tax measurement (arXiv 2608.24358) is the evidence: escalating with the full trajectory recovers less than half of the quality gap, and the escalation does *better* the less of the weak model's history it carries — so the tool takes `{ brief, context? }` and sends exactly that, with `context` a short optional prefix and no part of the local transcript. The other half of the argument is mechanical: the model that receives the answer is local and small (a 2B model has a 4–8K context), so a long answer back is what breaks it; hence `result_cap_bytes` with an ~8 KB default, cutting on a character boundary and marking the cut. The peer's text enters the transcript as a *tool result* and nowhere else — never as a system prompt, never executed — because a peer is a remote endpoint whose output is untrusted input (T14), and the tool's own description says so. `max_tokens` is forwarded to the peer's `agent_ask` (which now accepts it) so a caller can bound the answer at the source, and a caller that tries to pass a `tools` argument is refused rather than ignored: the peer's surface is the peer's read-only subset (D22), and the caller does not get to widen it |
 | D31 | The **depth cap is 1** and it is the read/write line, not a counter; a peer's tokens are folded into the turn's usage | Two small models passing a brief back and forth is the failure mode — an unbounded escalation with no answer at the end. The cap is not a hop counter a caller could reset or forget to thread through: a delegated turn runs under the peer's `agent_ask`, whose inner registry is the read-only subset of the built-ins (D22), and a delegation tool is `Risk::Network`, so it is never in that subset. `mcp serve` also deliberately does not assemble `[peers.*]` (it already ignores `[mcp.client.servers.*]`), so the reachability hole is closed at the source as well as by the risk filter; `mcp_serve`'s tests pin the property so a future widening of the inner surface fails loudly. Cost rides the same decision: the peer's `agent_ask` already reports `usage`, so the delegation tool puts it in the tool result's metadata and the agent loop folds it into the turn's usage — which is what `/cost` reads — through `ToolOutput::reported_usage`, advisory and fail-open exactly as R8 requires (a peer that reports nothing simply does not count, and no turn is blocked on a missing value) |
+| D35 | The master is a **git repository plus a pull-side `minion config sync`**, never a service the master runs | The requirement is to configure many nodes without depending on the network *between* them, and a pull is the only shape that satisfies it: the master never has to reach a node, so a machine behind NAT, on another network, or not yet on the tailnet (the 1050 Ti today) converges the moment it can reach the channel — and the channel, a Forgejo repo, already exists. The alternative, an HTTP endpoint served by the master (a live `GET /config` or a push channel), was evaluated and refused on three counts: it needs a process that is always on, against the no-daemon principle and this milestone's own non-goals; it needs every node to be reachable *from* the master, which is exactly the connectivity problem the pull exists to avoid; and it would re-implement, worse, what git already provides — history, transport auth, audit, and an offline cache. So "master" is a convention plus a repo, not a running thing, and `sync` is an explicit act a node performs rather than something done to it |
+| D36 | The synced layer is a **machine-level layer between the project file and the user config**, materialized as a machine-local `synced.toml` beside the user config | The new layer has to slot into the existing precedence, not replace it, and the existing rule is *more specific wins*. A project `minion.toml` describes one workspace, so it is more specific than any machine-wide policy and stays above the synced layer; the user config is also machine-level but is a personal preference, and an admin policy outranks a preference, so the synced layer sits above it. The result — flags → env → project → synced → user → defaults — reuses the existing specificity rule instead of inventing a second one, and a machine that has never synced has no `synced.toml` and behaves exactly as today. `sync` writes only that file plus a sibling state file (commit, ref, per-file hashes); it is never committed and never part of `--project`, and `Config::load` merges it like any other layer, so no database is involved and `minion run` stays offline. Two consequences are recorded rather than hidden: a cloned repo's committed `minion.toml` can override master policy, and a local user cannot — if master policy should be a floor instead of a layer, that is a distinct "locked keys" mechanism and is left open (§11 R10), not smuggled in here |
+| D37 | Overlays are **one file per node** (`nodes/<name>.toml`), the node's name is resolved from `--node` → `[configsync].node` → `hostname -s` → `tailscale status`, and `--dry-run`/`config show --origin` are part of the design, not extras | A single `[node."<name>"]` table in one file makes every node's edit a conflict in that file and makes "add a node" a change to shared content; a directory keeps one node's policy to one file, makes adding a node a file add, and lets a reviewer read exactly one node. The name has to resolve deterministically and be *visible*: an explicit `--node`/config wins, `hostname -s` is the Unix-native default, and `tailscale status --json` is the fallback so a node matches its MagicDNS name without config — and whichever rule fired is printed. An unknown name applies the base alone with a warning rather than failing, so a freshly provisioned machine converges before its entry exists; a *listed* node whose overlay will not parse is a hard error, because a policy that cannot be honoured must not be silently dropped. `--dry-run` and `--origin` are mandatory because a sync that cannot show its diff and its provenance is undebuggable magic — the point of a config layer is that an operator can answer "why is this value what it is" from the tool itself |
+| D38 | The bundle is verified **before** it is applied with the same two checks as `minion update` — a per-file sha256 against a committed manifest, and the commit the ref resolves to — and any mismatch refuses the bundle, fail-closed | Whoever controls the channel controls the effective policy of every node, so applying an unverified bundle is remote policy injection, and the contract `minion update` already uses (D23) is the right one to borrow verbatim. The checksum binds the bytes to the manifest and the commit binds the manifest to a revision, so swapping the files *and* the manifest still fails the commit check; the pair is needed even though git hashes its own objects, because git proves what it fetched and says nothing about a hand-edited cache or a bundle read another way. A refusal exits `4` and writes nothing, and the write is temp-file-plus-rename, so an interrupted sync cannot leave a half-applied layer. The honest limit is stated, not papered over: the manifest is committed in the repo, so a malicious publisher rewrites it alongside the files and passes both checks — the residual is publisher trust, the same acknowledged limit D23 carries, recorded as T15 and R10. What bounds the blast radius is that the channel carries only *names*, never a secret value (§5.1): a compromised master distributes policy but cannot exfiltrate keys |
+| D39 | The master carries **names, never secret values**, and the non-goals are explicit: no secret centralization, no node discovery, no always-on service, no sync timer | The invariant that makes the design safe is §5.1's: a config records *where* a secret comes from, never the secret. If the master could carry values it would become the single place where every node's keys live — the exact centralization this milestone is told not to build, and a single point of compromise for the fleet. So the channel distributes `token_file` paths and `token_env` names; values are provisioned per node by whatever the operator already uses (environment, a credentials file, or the separate token-manager system), which keeps this milestone out of the secrets business. Node discovery and self-enrolment are refused because a node appears in the repo because a human put it there — scanning a tailnet and trusting whatever answers is a different threat model. And because the whole value of the design is that the master is *not* a process, anything that would require one — an endpoint, a listener, a background sync loop — is out of scope by construction; a node that wants periodic sync wires its own cron to call `minion config sync`, so minion still starts no daemon (the spirit of D5) |
