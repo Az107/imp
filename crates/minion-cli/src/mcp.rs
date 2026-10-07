@@ -62,6 +62,7 @@ async fn list(cli: &Cli, servers: &McpServers) -> Result<ExitCode> {
                     "name": name,
                     "command": server.command,
                     "args": server.args,
+                    "url": server.url,
                     "lazy": server.lazy,
                     "approval": server.approval.map(decision_name),
                     "tool_allow": server.tool_allow,
@@ -78,7 +79,11 @@ async fn list(cli: &Cli, servers: &McpServers) -> Result<ExitCode> {
 
     for (name, config) in &configured {
         println!("{name}  {}", status_of(servers, name));
-        println!("  command: {} {}", config.command, config.args.join(" "));
+        if config.is_http() {
+            println!("  url: {}", config.url);
+        } else {
+            println!("  command: {} {}", config.command, config.args.join(" "));
+        }
         println!(
             "  approval: {}  lazy: {}  tool_allow: [{}]",
             config
