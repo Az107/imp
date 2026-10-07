@@ -389,16 +389,27 @@ missed_run_cap = 20              # ceiling on the runs one run_all catch-up may 
 
 [mcp.server]
 enabled = true
-transport = "stdio"
+transport = "stdio"              # stdio | http
+bind = "127.0.0.1:8788"          # only for transport = "http"; loopback by default
+token_env = ""                   # for "http": the NAME of the var holding the bearer token
+token_file = ""                  # ...or the PATH to the 0600 credentials file holding it
 expose_exec = false              # run_command over MCP defaults OFF
 expose_write = false
 expose_cron_write = true
 
+# A server is reached one of two ways, and they are mutually exclusive: a
+# `command` minion spawns over stdio, or a `url` it speaks Streamable HTTP to.
 [mcp.client.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
 approval = "ask"
 tool_allow = ["read_file", "list_directory"]
+
+[mcp.client.servers.peer]
+url = "http://peer.tailnet.ts.net:8788/mcp"
+token_file = "~/.config/minion/peer.credentials"
+approval = "ask"
+tool_allow = ["*"]
 
 [logging]
 level = "info"
@@ -975,7 +986,8 @@ results were dropped is rejected by the provider, so a turn must never be split.
 
 ### 5.9 MCP server
 
-The server task is started with `minion mcp serve` (stdio). It uses `rmcp`'s server trait and shares the same core loop, store, and policy engine.
+The server task is started with `minion mcp serve`, over **stdio** or **Streamable HTTP**
+(`[mcp.server].transport = "http"`). It uses `rmcp`'s server trait and shares the same core loop, store, and policy engine.
 
 **Exposed tools** (default surface):
 
@@ -1032,19 +1044,40 @@ but the protocol, so diagnostics stay on stderr.
   `mcp serve` is a protocol server, not a daemon; starting a scheduler inside it
   is a separate decision and is not part of this milestone.
 
+**Transport (as implemented, M10).** With `transport = "http"` the same surface
+is served over `rmcp`'s Streamable HTTP transport on `bind`, instead of owning
+stdin/stdout. The gate, the read-only default and the `agent_*` naming are
+unchanged — the transport is a socket where stdio was a pipe, nothing above it
+moves. The bind policy (D27) runs at config load, before `TcpListener::bind`, so
+a wildcard, a globally routable address, or a non-loopback bind with no token is
+refused as a startup error rather than served unauthenticated; the default is
+`127.0.0.1:8788`. When a token source is configured the bearer token is required
+on every request, loopback included (D26); the config carries only the *name* of
+the environment variable or the *path* to the `0600` credentials file, resolved
+through the same `resolve_secret` the provider key uses. Off a loopback bind the
+`Host` allowlist is switched off deliberately: a MagicDNS name cannot be derived
+from an `IP:port` bind, and the token — not the request's `Host` or its source
+address — is the authentication boundary. There is no TLS, also deliberately
+(D26): inside the tailnet WireGuard already encrypts the traffic.
+
 ### 5.10 MCP client
 
-- Servers from `[mcp.client.servers.*]` are spawned at startup (lazily on first use if `lazy = true`).
+- Servers from `[mcp.client.servers.*]` are reached at startup — spawned over stdio when they have a `command`, or contacted over Streamable HTTP when they have a `url` (lazily on first use if `lazy = true`).
 - `tools/list` results are flattened into the registry as `mcp__<server>__<tool>`, with `inputSchema` passed through verbatim (minion does not rewrite third-party schemas).
 - `tool_allow` per server filters what reaches the model; anything not listed is invisible and uncallable.
 - Per-server approval policy overrides the global default, so a trusted local server can be `auto` while a network server is `ask`.
 - Server failures degrade gracefully: the tools are removed from the catalog and a `system` notice explains why. They are retried on the next turn.
 - Tool name collisions with built-ins are resolved by prefixing, never shadowing: built-ins always win.
 
-**Configuration.** Each `[mcp.client.servers.<name>]` entry is `command`, `args`, `lazy`, `tool_allow`
-and `approval`. The table key is the namespace: it names every tool of that server, and a key containing
-`__` is rejected at load time rather than left to collide with another server's. `command` is spawned
-directly, never through a shell, so an argument cannot become a second command.
+**Configuration.** Each `[mcp.client.servers.<name>]` entry is reached one of two ways, and they are
+mutually exclusive: a `command` (with `args`) minion spawns over stdio, or a `url` it speaks
+Streamable HTTP to. `Config::validate` accepts exactly one of the two — both, or neither, is a startup
+error, as is an `args` list beside a `url` or a scheme that is not `http(s)`. A `url` server may name a
+bearer token source — `token_env` (a variable *name*) or `token_file` (a credentials-file *path*),
+sent as `Authorization: Bearer` — and the value is never in the config. The table key is the namespace:
+it names every tool of that server, and a key containing `__` is rejected at load time rather than left
+to collide with another server's. `command` is spawned directly, never through a shell, so an argument
+cannot become a second command.
 
 ```toml
 [mcp.client.servers.files]
@@ -1053,6 +1086,12 @@ args = ["--root", "/srv"]
 lazy = true                       # contact it on the first turn, not at startup
 tool_allow = ["read_*", "list"]   # empty allows nothing; ["*"] allows everything
 approval = "auto"                 # this server's tools substitute the global default
+
+[mcp.client.servers.peer]         # a second minion, on the same tailnet
+url = "http://peer.tailnet.ts.net:8788/mcp"
+token_file = "~/.config/minion/peer.credentials"   # api_key = "…", mode 0600
+approval = "ask"
+tool_allow = ["*"]
 ```
 
 **What is published, and what is gated (as implemented, M5).** An external tool is an ordinary `Tool`:
@@ -1078,6 +1117,17 @@ built-in, whatever a server calls itself.
 a tool list cannot be discovered without a connection — `lazy` buys a cheaper session start, not a
 hidden tool set. `minion mcp list` and `minion mcp tools <server>` are explicit uses and start a lazy
 server immediately, which is also how an operator inspects one.
+
+**HTTP transport (as implemented, M10).** A `url` server goes through the same
+`McpClient`, so the catalogue, `tool_allow`, the per-server policy, the transition
+notices and the retry are the stdio behaviour unchanged — a peer that is down is a
+notice and a retry on the next turn, exactly as a child process that failed to
+spawn is. The difference is the handshake: `connect_http` opens `rmcp`'s Streamable
+HTTP client against the endpoint and, when a token is configured, sends it as
+`Authorization: Bearer` on every request. The token is resolved from `token_env`
+then `token_file` with the provider's resolution; a source that is *named* but
+yields nothing is an error rather than a silent anonymous call. `minion mcp list`
+prints the `url` in place of the `command` line for such a server.
 
 **Failure.** A server that cannot be started costs its tools and nothing else: the turn completes, the
 tools are gone from the catalogue, and the reason arrives as a `system` message. Notices are emitted on
@@ -1314,6 +1364,7 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | M7 — Hardening | | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
 | M8 — Self-update | done | `minion update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
 | M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `minion update` installs; a mismatched version or a failing test publishes nothing |
+| M10 — Peer transport | done | Streamable HTTP for both halves: `url` on `[mcp.client.servers.*]` with bearer-token auth (`token_env`/`token_file`), `transport = "http"` + `bind` on `[mcp.server]`, a fail-closed bind policy, no TLS by design | Two minion instances on a tailnet discover and call each other's gated tools over HTTP; a non-loopback bind with no token refuses to start; a wrong token lists nothing |
 
 ---
 
@@ -1432,3 +1483,6 @@ than editing individual tools.
 | D22 | The MCP server's disabled capabilities are *listed and refused*, not absent, and the exposed shell tool is decided under the name `run_command` | §5.9's table says `agent_run_command` and `agent_write_file` are "denied unless" the flag is set, and T5's mitigation is a startup banner — both describe a capability that exists and is refused, not one that is missing. A hidden tool would leave the host unable to tell "minion cannot do this" from "I mistyped the name", and it would make the denial invisible in the audit trail. So the two tools are always in the list, and without their flag the engine carries a deny rule that refuses every call and records the refusal. The name the *gate* sees is the real tool's — `run_command`, `write_file` — because the policy engine is not a second, weaker world: an operator's existing `run_command` deny rules keep protecting the MCP surface, the classifier still sees the command it is judging, and `subject_for`/`pattern_for` still extract the right subject. The `agent_` prefix is a naming convention of this surface, not a second identity, and the audit row therefore names the tool that actually ran. The gate is non-interactive (`stdin` is the protocol pipe, so no prompt can be shown), and an enabled family substitutes the non-interactive fallback through `ToolPolicy` (D21) — deny and allow rules still run first, so turning a flag on grants nothing that was refused. `agent_ask`'s inner agent is restricted to the read-only subset of the built-in registry, filtered by `Risk::is_observation` rather than by a list of names, so the default surface cannot drift wider than the read/write line itself. The scheduler is deliberately not started here: a job created over MCP is stored and runs under the non-interactive cron gate the next time a process with a scheduler opens the database, which keeps `mcp serve` a protocol server rather than a daemon |
 | D23 | `minion update` installs a **prebuilt binary from a release channel**, never compiles on the target, and verifies it with two independent checks before replacing anything | The alternative — `git pull` and `cargo build` in place — was rejected because it turns an update into a build environment problem: it needs a toolchain on every machine, it needs a writable checkout, and a failure halfway leaves a half-built tree rather than a known-good binary. A prebuilt asset is one file that either matches or does not. The channel is a GitHub-compatible releases API with prebuilt per-platform assets and a `checksums.txt`, which is the shape `Az107/space-elevator` already publishes, so there is a working precedent to mirror. Two checks, not one, because each closes a different hole: the **checksum** binds the bytes to the release, and the **commit** binds the release to a revision, so a swapped asset that comes with a swapped manifest still fails the commit check. The commit is read from `target_commitish` when it is a hex SHA, or from a `build-commit:` line in the notes otherwise; a release that declares neither is refused rather than installed on a guess, which is the fail-closed reading of §5.12's "refused" exit. The hash is SHA-256 implemented in-tree (`minion-core::sha256`) rather than taken from `sha2`: the algorithm is 60 lines, the tests pin the NIST vectors, and it keeps `Cargo.lock` free of a new external crate, which matters for a binary whose whole selling point is a small dependency surface. The replacement is a staging file plus `rename()` so the path is never a half-written file, and the previous binary is kept as `minion.old-<version>` — which is also what `--rollback` restores, so undo does not need the network. Nothing else is touched: not the config, not the database, not the credentials file, because an update replaces exactly one file and anything more would make it an installer with opinions. When the directory is not writable, minion does not elevate and does not silently skip: it stages the verified bytes where it can write and prints the two literal `sudo` commands, matching the rule that Hermes never runs `sudo`. Two smaller decisions are recorded here too. `https` is required, with plain `http` permitted only to a literal loopback host — the exception exists for a local mirror and a test fixture, and it mirrors the rule `http_fetch` already uses (D17). And the target defaults to `current_exe()` canonicalized, overridable with `$MINION_UPDATE_BINARY`, so an update can replace an installation other than the one currently running without becoming a privileged operation: whoever can set the environment already runs the code. `--check` stays read-only, which is why it exits `1` on "update available" rather than `0`: a script asking "should I update?" needs the answer in the status, not in the prose |
 | D24 | The release pipeline publishes **gnu Linux binaries for amd64 and arm64** (amd64 native, arm64 cross-compiled with `gcc-aarch64-linux-gnu` on the runner), derives the tag from the newest `vX.Y.Z` tag, and refuses to publish unless that tag equals `[workspace.package].version` | §9 asks for musl static on Linux, and this deviates: the binaries are gnu and dynamically linked. The reason is the dependency tree. `minion-store` bundles SQLite and rustls pulls `aws-lc-sys`, both of which compile C through `cc` and cmake, so a static musl build is a cross-toolchain problem — a musl C compiler for each architecture — rather than the one-file build musl is for a pure-Rust crate. The gnu path builds with the runner's own toolchain and only adds `gcc-aarch64-linux-gnu` for the arm64 link, which is the option the milestone named; musl is deferred until it can be exercised end to end rather than guessed at. The cost is a glibc floor: the job is pinned to the `ubuntu-22.04` runner (glibc 2.35) instead of `ubuntu-latest`, so the floor is stable rather than moving when GitHub rotates the image, and the failure mode is bounded — a binary that cannot start fails the `--version` commit check inside `minion update` and the install is refused, not half-applied. Only Linux assets are published; the two `linux` assets are the pair `minion update` can consume today, and a macOS job would be a separate matrix entry. The tag is derived from the newest tag rather than from the manifest because that is the rule the `Az107/space-elevator` precedent publishes with, but the manifest is what the binary reports and `minion update` compares that to the tag, so the two must agree or the workflow fails: a release whose tag and embedded version disagree would make `minion update` offer the same release forever. |
+| D25 | MCP gains a **Streamable HTTP** transport for both halves, and a client server is `command` (stdio) *xor* `url` (HTTP) | Two minion instances on the same tailnet need to talk to each other, and today both halves are stdio-only: `transport-child-process` for the client, `mcp serve` owning stdin/stdout for the server. `rmcp` 3.5.0 already ships both the Streamable HTTP client (`transport-streamable-http-client-reqwest`) and server (`transport-streamable-http-server`), so the transport is adopted, not invented — no second protocol, no hand-rolled framing. The two client paths are mutually exclusive on purpose and checked at config load: a `command` is spawned over stdio, a `url` is spoken to over HTTP, and "both" or "neither" is a startup error rather than a server that quietly picks one; `args` beside a `url`, or a scheme that is not `http(s)`, is refused for the same reason. The server half is a config value (`transport = "http"`) rather than a flag because it changes what resource the process owns — a socket where stdio was a pipe — but R5's exclusion still holds: neither path can reach the REPL. Everything above `McpClient` is untouched, so listing, `tool_allow`, the per-server policy, the transition notices and the next-turn retry are the stdio behaviour verbatim; a test proves a down HTTP peer degrades exactly as a child that failed to spawn does |
+| D26 | HTTP auth is a **bearer token**, never the source address, and there is **no TLS** — deliberately | Inside a tailnet the traffic is already encrypted by WireGuard, so TLS would add a dependency on the Tailscale daemon and on certificates to a binary whose whole selling point is a minimal dependency surface, and it would buy nothing against the threat that matters here. The real authentication is the token: any process on a tailnet node can open that port, so the source IP proves nothing about who is calling, and the `Host` header is no better — off a loopback bind the `Host` allowlist is switched off precisely because a MagicDNS name cannot be derived from an `IP:port` bind, leaving the token as the boundary. The client sends `Authorization: Bearer` on every request, and the server, when a token is configured, requires it even on loopback — a token that is only checked on a tailnet is a token that can be forgotten locally. The comparison is constant-time so a token cannot be recovered a byte at a time, and the check runs *before* the MCP service, so a wrong token lists no tool and reaches no handler (the test asserts the raw `401`). The config carries only names — `token_env` (a variable name) or `token_file` (a `0600` credentials-file path) — resolved through the same `resolve_secret` the provider key uses; a source that is named but yields nothing is an error, not a silent anonymous request, so a typo cannot masquerade as a server that rejects you. An `https://` URL is still accepted by the client, so a future decision can add certificates without a config change |
+| D27 | The HTTP bind is **fail-closed**: default `127.0.0.1:8788`; wildcard and globally routable addresses are always refused, and any other non-loopback bind needs a token or the server refuses to start | The policy runs at config load, before `TcpListener::bind`, so a bad bind is a startup error rather than a socket that is already listening when the mistake is noticed. `0.0.0.0` and `::` are refused unconditionally because they are not an address — they are every interface, the public one included, and no tailnet bind wants them. A globally routable address is refused because minion's wide-area transport is the tailnet, not the public internet, and that is a different decision than this milestone makes. Everything else that is not loopback — a tailnet `100.64.0.0/10` or `fd7a:115c:a1e0::/48` address, a LAN, a link-local one — is refused *unless* a token source is configured, because off loopback the token is the only thing minion has (D26). Loopback needs nothing: it is a local process. The default is loopback so the zero-config case is the safe one, and the private-address list is the one `http_fetch`'s `block_private_ips` already uses, so the two agree on where the public boundary is |
