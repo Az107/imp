@@ -30,6 +30,8 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     /// Process execution settings.
     pub exec: ExecConfig,
+    /// Which tools are offered to the model.
+    pub tools: ToolsConfig,
     /// Approval policy.
     pub policy: PolicyConfig,
     /// Outbound HTTP limits and the SSRF guard for `http_fetch`.
@@ -75,6 +77,16 @@ pub struct ProviderConfig {
     pub supports_usage_in_stream: bool,
     /// Whether to request multiple tool calls per assistant turn.
     pub parallel_tool_calls: bool,
+    /// Ask the backend to constrain tool arguments to their JSON schema.
+    ///
+    /// A provider quirk, off by default. When the backend understands it
+    /// (OpenAI-style `strict` function calling, Ollama's structured outputs),
+    /// each advertised function carries `"strict": true`, which makes the model
+    /// emit arguments that validate rather than prose the loop then has to
+    /// reject. A backend that does not understand the field sees the current
+    /// request, because the flag is simply absent. It is not a validation of
+    /// our own: a backend that ignores it changes nothing.
+    pub strict_tool_arguments: bool,
     /// Extra headers sent on every request.
     ///
     /// Values may contain `${session}`, which expands to the stable identifier
@@ -99,6 +111,7 @@ impl Default for ProviderConfig {
             max_retries: 3,
             supports_usage_in_stream: true,
             parallel_tool_calls: true,
+            strict_tool_arguments: false,
             headers: BTreeMap::new(),
         }
     }
@@ -112,6 +125,18 @@ pub struct AgentSettings {
     pub system_prompt_file: Option<String>,
     /// Maximum provider round-trips per turn.
     pub max_iterations: u32,
+    /// Maximum tool calls the model may make within one turn. `0` is unlimited.
+    ///
+    /// A weak local model loops; this is the wall that stops one turn from
+    /// burning the session. When it is reached the turn ends with
+    /// [`StopReason::ToolBudget`](crate::agent::StopReason::ToolBudget) and every
+    /// tool call already taken from the model is answered, so the stored
+    /// transcript stays valid.
+    pub max_tool_calls_per_turn: u32,
+    /// Treat the model as a small local one: append short numbered rules to the
+    /// system prompt. A 2–4B model imitates "never/always" far better than a
+    /// vague instruction, so the rules are imperative and finite.
+    pub small_model: bool,
     /// Advisory token ceiling for a turn.
     pub max_tokens_per_turn: u64,
     /// How many trailing messages to send.
@@ -125,9 +150,37 @@ impl Default for AgentSettings {
         Self {
             system_prompt_file: None,
             max_iterations: 25,
+            max_tool_calls_per_turn: 0,
+            small_model: false,
             max_tokens_per_turn: 200_000,
             history_window: 40,
             summarize_on_truncate: true,
+        }
+    }
+}
+
+/// Which tools the local agent is offered (M10.3).
+///
+/// Both lists name tools exactly, and both are **narrowing only**: they change
+/// what the model is shown, never what the approval gate decides. A hidden tool
+/// is unresolvable as well as unadvertised, so a model that calls one is refused
+/// as if the name did not exist. There is no way for `hide` to turn a denied
+/// call into an allowed one. See `tool::ToolSelection`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// When non-empty, only these tools are offered. Empty offers everything.
+    pub only: Vec<String>,
+    /// Tools removed from the surface, even if they also appear in `only`.
+    pub hide: Vec<String>,
+}
+
+impl ToolsConfig {
+    /// The registry filter these settings describe.
+    pub fn selection(&self) -> crate::tool::ToolSelection {
+        crate::tool::ToolSelection {
+            only: self.only.clone(),
+            hide: self.hide.clone(),
         }
     }
 }
@@ -647,6 +700,18 @@ impl Config {
         if self.exec.shell.trim().is_empty() {
             return Err(Error::Config("exec.shell must not be empty".to_string()));
         }
+        // A blank tool name can never match anything, so it is a typo rather
+        // than a silent no-op. Rejecting it here says so at startup.
+        for (section, names) in [
+            ("tools.only", &self.tools.only),
+            ("tools.hide", &self.tools.hide),
+        ] {
+            if names.iter().any(|name| name.trim().is_empty()) {
+                return Err(Error::Config(format!(
+                    "{section} must not name an empty tool"
+                )));
+            }
+        }
         if self.http_fetch.max_bytes == 0 {
             return Err(Error::Config(
                 "http_fetch.max_bytes must be at least 1".to_string(),
@@ -951,6 +1016,72 @@ mod tests {
         assert_eq!(config.policy.default, Decision::Ask);
         assert_eq!(config.policy.noninteractive, Decision::Deny);
         assert!(!config.workspace.follow_symlinks);
+    }
+
+    /// The M10.3 knobs must be inert by default: an operator opts in, and an
+    /// existing config keeps behaving exactly as it did.
+    #[test]
+    fn the_loop_ergonomics_default_to_the_current_behaviour() {
+        let config = Config::default();
+        assert_eq!(
+            config.agent.max_tool_calls_per_turn, 0,
+            "0 means unlimited, so the budget is off until it is set"
+        );
+        assert!(!config.agent.small_model);
+        assert!(config.tools.only.is_empty());
+        assert!(config.tools.hide.is_empty());
+        assert!(config.tools.selection().is_unrestricted());
+        assert!(!config.provider.strict_tool_arguments);
+    }
+
+    #[test]
+    fn the_tools_selection_is_read_from_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[tools]\nonly = [\"read_file\", \"edit_file\"]\nhide = [\"http_fetch\"]\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(
+            config.tools.only,
+            vec!["read_file".to_string(), "edit_file".to_string()]
+        );
+        assert_eq!(config.tools.hide, vec!["http_fetch".to_string()]);
+        let selection = config.tools.selection();
+        assert!(selection.admits("read_file"));
+        assert!(!selection.admits("http_fetch"), "hide beats only");
+        assert!(!selection.admits("run_command"), "only restricts the rest");
+    }
+
+    #[test]
+    fn a_blank_tool_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[tools]\nonly = [\"read_file\", \"\"]\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(err.to_string().contains("tools.only"), "was: {err}");
+    }
+
+    #[test]
+    fn the_small_model_and_strict_arguments_quirks_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[agent]\nsmall_model = true\nmax_tool_calls_per_turn = 12\n\
+             \n[provider]\nstrict_tool_arguments = true\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert!(config.agent.small_model);
+        assert_eq!(config.agent.max_tool_calls_per_turn, 12);
+        assert!(config.provider.strict_tool_arguments);
     }
 
     #[test]
