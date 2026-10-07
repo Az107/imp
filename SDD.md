@@ -325,6 +325,7 @@ max_retries = 3
 # provider quirks
 supports_usage_in_stream = true
 parallel_tool_calls = true
+strict_tool_arguments = false   # ask the backend to constrain tool args to the schema (M10.3)
 
 # Extra headers sent on every request. A value may contain `${session}`, which
 # expands to the stable identifier of the current conversation. Gateways that
@@ -336,9 +337,19 @@ parallel_tool_calls = true
 [agent]
 system_prompt_file = "~/.config/minion/system.md"
 max_iterations = 25
+max_tool_calls_per_turn = 0    # 0 = unlimited; a small model benefits from a small number (M10.3)
+small_model = false            # append short numbered rules for a 2-4B local model (M10.3)
 max_tokens_per_turn = 200_000
 history_window = 40            # messages; older ones are summarized or dropped
 summarize_on_truncate = true
+
+# Which tools the model is offered (M10.3). Narrowing only: it changes what the
+# model sees, never what the gate decides. A hidden tool is also unresolvable,
+# so `hide` can never turn a denied call into an allowed one. `hide` beats
+# `only` when a name appears in both.
+[tools]
+only = []                      # non-empty: offer only these names
+hide = ["http_fetch"]          # always removed, even if listed in `only`
 
 [workspace]
 roots = ["."]                  # path guard boundary; canonicalized at load
@@ -578,7 +589,7 @@ and the identifier is never invented per request — it cannot be, or prompt-cac
 ### 5.3 Agent loop
 
 ```rust
-pub enum StopReason { Completed, IterationLimit, TokenBudget, Cancelled, ProviderError }
+pub enum StopReason { Completed, IterationLimit, ToolBudget, TokenBudget, Cancelled, ProviderError }
 
 pub struct TurnOutcome {
     pub final_text: Option<String>,
@@ -595,6 +606,31 @@ Rules:
 - Tool results are `role:"tool"` messages with `tool_call_id`; every assistant `tool_calls` entry must get exactly one matching result, or the request is invalid and the loop repairs it with a synthetic error result.
 - Token budget is checked after each provider response; exceeding it stops with `TokenBudget`.
 - Cancellation is cooperative: the `CancellationToken` is checked between iterations and passed into every tool.
+
+**Ergonomics for a small local model (M10.3).** A 2–4B model is a poor tool-caller, and four
+loop-level rules exist so its failures do not become the session's (D29–D34):
+
+- **A truncated tool call is discarded, not parsed.** When a turn ends with `finish_reason: length`
+  *and* carries at least one tool call, the arguments are half a JSON object. The whole batch is
+  dropped — never parsed, never run — an assistant message with any text is kept, a `system` notice
+  asks for a shorter answer, and the loop asks again. The turn ends as a normal conversation, not as
+  a parse error.
+- **Repeated calls are answered once.** Within one turn, a call whose `name` and *canonical*
+  arguments repeat an earlier one is answered from the first result instead of re-running it, and the
+  repeat is marked as such on the event stream. Any successful call that can change the machine
+  (`Risk::is_observation() == false`) clears that cache first, so a read is never answered from
+  before a write.
+- **The tool budget bounds the turn.** `agent.max_tool_calls_per_turn` (0 = unlimited) counts every
+  call the model asks for, repeats included. On exhaustion, the remaining calls in the batch are
+  still *answered* — a `tool` message with a budget error, so no `tool_calls` id is left dangling —
+  a `system` notice explains why, and the turn stops with `StopReason::ToolBudget`, which is distinct
+  from `IterationLimit`.
+- **The advertised surface is trimmable.** `[tools] only`/`hide` narrow the catalogue the model is
+  shown, and the prompt's tool digest follows it. Hiding is applied *after* shadowing resolution, so
+  a hidden built-in cannot be replaced by a same-named MCP tool.
+
+Every one of these is inert by default: a config that does not set the new keys behaves exactly as
+before.
 
 ### 5.4 Tool framework
 
@@ -630,6 +666,11 @@ Invariants enforced by the registry, not by individual tools:
 - Output is truncated to `output_cap_bytes` with a `truncated` flag and a hint appended.
 - Every invocation is wrapped in `tokio::time::timeout` and tied to the cancellation token.
 - Every invocation emits a `tracing` span and an audit row.
+- **A name is offered and resolvable, or it is neither.** `[tools] only`/`hide` (M10.3) select a
+  subset for the model; a name the selection rejects is dropped from `schemas()` *and* from `get()`,
+  so a call to it is answered exactly like a misspelled one. Selection can only remove entries, so
+  it never grants a permission the approval engine would refuse — that boundary stays where D14/D15
+  put it.
 
 ### 5.5 Tool specifications
 
@@ -1314,6 +1355,7 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | M7 — Hardening | | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
 | M8 — Self-update | done | `minion update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
 | M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `minion update` installs; a mismatched version or a failing test publishes nothing |
+| M10.3 — Small-model loop ergonomics | done | A trimmable tool surface (`[tools] only`/`hide`), recovery from a tool call cut off by `finish_reason: length`, per-turn dedup of repeated calls, `agent.max_tool_calls_per_turn` with a `tool_budget` stop, numbered imperative rules behind `agent.small_model`, and strict tool arguments behind `[provider] strict_tool_arguments` | A 2–4B model drives a turn end to end without a parse error or a runaway loop: a truncated call is discarded and re-asked, a repeated call runs once, the budget ends the turn with every `tool_call_id` answered, and every knob is inert unless set |
 
 ---
 
@@ -1406,6 +1448,11 @@ than editing individual tools.
 
 ## Appendix C — Decision log
 
+*The M10.3 decisions are numbered from **D29** on purpose. D25–D27 belong to the M10.1 peer-transport
+branch (`m10-peers`) and D28 to the M9.1 six-target branch (`m9.1-six-targets`), both already pushed
+to `origin`; continuing at D29 lets the branches merge without renumbering. This branch is cut from
+`feat/update-command` at 77e054c, so those rows are not present here yet.*
+
 | # | Decision | Rationale |
 |---|---|---|
 | D1 | Rust over Zig | Mature async, SQLite, and MCP ecosystem; Zig's async and DB story would dominate the schedule |
@@ -1432,3 +1479,9 @@ than editing individual tools.
 | D22 | The MCP server's disabled capabilities are *listed and refused*, not absent, and the exposed shell tool is decided under the name `run_command` | §5.9's table says `agent_run_command` and `agent_write_file` are "denied unless" the flag is set, and T5's mitigation is a startup banner — both describe a capability that exists and is refused, not one that is missing. A hidden tool would leave the host unable to tell "minion cannot do this" from "I mistyped the name", and it would make the denial invisible in the audit trail. So the two tools are always in the list, and without their flag the engine carries a deny rule that refuses every call and records the refusal. The name the *gate* sees is the real tool's — `run_command`, `write_file` — because the policy engine is not a second, weaker world: an operator's existing `run_command` deny rules keep protecting the MCP surface, the classifier still sees the command it is judging, and `subject_for`/`pattern_for` still extract the right subject. The `agent_` prefix is a naming convention of this surface, not a second identity, and the audit row therefore names the tool that actually ran. The gate is non-interactive (`stdin` is the protocol pipe, so no prompt can be shown), and an enabled family substitutes the non-interactive fallback through `ToolPolicy` (D21) — deny and allow rules still run first, so turning a flag on grants nothing that was refused. `agent_ask`'s inner agent is restricted to the read-only subset of the built-in registry, filtered by `Risk::is_observation` rather than by a list of names, so the default surface cannot drift wider than the read/write line itself. The scheduler is deliberately not started here: a job created over MCP is stored and runs under the non-interactive cron gate the next time a process with a scheduler opens the database, which keeps `mcp serve` a protocol server rather than a daemon |
 | D23 | `minion update` installs a **prebuilt binary from a release channel**, never compiles on the target, and verifies it with two independent checks before replacing anything | The alternative — `git pull` and `cargo build` in place — was rejected because it turns an update into a build environment problem: it needs a toolchain on every machine, it needs a writable checkout, and a failure halfway leaves a half-built tree rather than a known-good binary. A prebuilt asset is one file that either matches or does not. The channel is a GitHub-compatible releases API with prebuilt per-platform assets and a `checksums.txt`, which is the shape `Az107/space-elevator` already publishes, so there is a working precedent to mirror. Two checks, not one, because each closes a different hole: the **checksum** binds the bytes to the release, and the **commit** binds the release to a revision, so a swapped asset that comes with a swapped manifest still fails the commit check. The commit is read from `target_commitish` when it is a hex SHA, or from a `build-commit:` line in the notes otherwise; a release that declares neither is refused rather than installed on a guess, which is the fail-closed reading of §5.12's "refused" exit. The hash is SHA-256 implemented in-tree (`minion-core::sha256`) rather than taken from `sha2`: the algorithm is 60 lines, the tests pin the NIST vectors, and it keeps `Cargo.lock` free of a new external crate, which matters for a binary whose whole selling point is a small dependency surface. The replacement is a staging file plus `rename()` so the path is never a half-written file, and the previous binary is kept as `minion.old-<version>` — which is also what `--rollback` restores, so undo does not need the network. Nothing else is touched: not the config, not the database, not the credentials file, because an update replaces exactly one file and anything more would make it an installer with opinions. When the directory is not writable, minion does not elevate and does not silently skip: it stages the verified bytes where it can write and prints the two literal `sudo` commands, matching the rule that Hermes never runs `sudo`. Two smaller decisions are recorded here too. `https` is required, with plain `http` permitted only to a literal loopback host — the exception exists for a local mirror and a test fixture, and it mirrors the rule `http_fetch` already uses (D17). And the target defaults to `current_exe()` canonicalized, overridable with `$MINION_UPDATE_BINARY`, so an update can replace an installation other than the one currently running without becoming a privileged operation: whoever can set the environment already runs the code. `--check` stays read-only, which is why it exits `1` on "update available" rather than `0`: a script asking "should I update?" needs the answer in the status, not in the prose |
 | D24 | The release pipeline publishes **gnu Linux binaries for amd64 and arm64** (amd64 native, arm64 cross-compiled with `gcc-aarch64-linux-gnu` on the runner), derives the tag from the newest `vX.Y.Z` tag, and refuses to publish unless that tag equals `[workspace.package].version` | §9 asks for musl static on Linux, and this deviates: the binaries are gnu and dynamically linked. The reason is the dependency tree. `minion-store` bundles SQLite and rustls pulls `aws-lc-sys`, both of which compile C through `cc` and cmake, so a static musl build is a cross-toolchain problem — a musl C compiler for each architecture — rather than the one-file build musl is for a pure-Rust crate. The gnu path builds with the runner's own toolchain and only adds `gcc-aarch64-linux-gnu` for the arm64 link, which is the option the milestone named; musl is deferred until it can be exercised end to end rather than guessed at. The cost is a glibc floor: the job is pinned to the `ubuntu-22.04` runner (glibc 2.35) instead of `ubuntu-latest`, so the floor is stable rather than moving when GitHub rotates the image, and the failure mode is bounded — a binary that cannot start fails the `--version` commit check inside `minion update` and the install is refused, not half-applied. Only Linux assets are published; the two `linux` assets are the pair `minion update` can consume today, and a macOS job would be a separate matrix entry. The tag is derived from the newest tag rather than from the manifest because that is the rule the `Az107/space-elevator` precedent publishes with, but the manifest is what the binary reports and `minion update` compares that to the tag, so the two must agree or the workflow fails: a release whose tag and embedded version disagree would make `minion update` offer the same release forever. |
+| D29 | `[tools] only`/`hide` narrow the surface the model is **offered and can resolve**, and are applied *after* shadowing, so hiding is a strict subtraction that touches no permission | §5 with 11 built-ins plus an MCP server's tools is a menu a 2–4B model orders badly from, and the fix could have been a permission change — "hide `run_command` and it is also allowed" — which is exactly the kind of coupling that turns a convenience into a hole. The selection is therefore defined as narrowing only: a rejected name is removed from `schemas()` (so it is not advertised, and the prompt's tool digest follows) **and** from `get()` (so a model that calls it anyway is answered as if the name were misspelled). It is applied last, over the merged registered-plus-catalog list, so hiding a built-in cannot be undone by a same-named catalog tool — which keeps D20's "registered tools win" intact rather than creating a second shadowing rule. Because the filter can only ever remove entries, there is no code path from `hide` to an allowance; the approval engine, the classifier and the risk classes are untouched, and the tool that is reached (if it is reached) is gated exactly as before. `hide` beats `only` for a name in both lists, matching the way deny rules beat allow rules, so a mistake fails closed. The alternative — a fresh registry re-registered by name — would have had to reproduce shadowing and would drift from the MCP catalogue that changes under it |
+| D30 | A turn that ends `finish_reason: length` while carrying tool calls is **discarded wholesale** and re-asked, never parsed | §5.2's tool-call assembly concatenates argument fragments before one JSON parse; when the token limit cuts generation mid-argument the result is half an object, and the two obvious responses both lie to the model. Parsing it produces an `invalid_json` tool error that blames the model for a truncation the loop caused and gives it nothing to correct, while silently running the *complete* calls of a batch that also contains a broken one would execute a turn the model was still composing. Both are avoided by dropping the whole batch: no assistant `tool_calls` message is committed (so no id is ever left unanswered and the stored transcript stays valid), any text is kept, and a `system` notice says what happened and asks for a shorter answer — one tool call, minimal arguments. The loop then asks again, which costs one iteration and lands inside `max_iterations`. Discarding the batch rather than only the broken call is the conservative choice for the model this exists for: a 2–4B model that overflowed the limit while emitting several calls is not a model whose other calls can be trusted as complete |
+| D31 | Repeated tool calls are answered from a per-turn cache, and any state-changing call clears it first | The pathology is concrete: a weak model calls `grep` or `read_file` with the same arguments three and four times, and each repeat costs an iteration and a provider round-trip for an answer already in the transcript. Within one turn the loop keys a small map on `name` plus *canonical* arguments (re-serialized through `serde_json`, so reformatting does not defeat it) and answers a hit from the first result, marking the event as a repeat. The hazard a cache introduces is staleness, and it is closed by the risk model the project already has: before a call that can change the machine runs (`!Risk::is_observation()`, D15's read/write line), the cache is cleared, so a read is never answered from before a write. The asymmetry is deliberate and safe — an over-eager clear only costs a re-run, a missing clear would return false data — and the same rule means two consecutive identical reads dedupe while `read; write; read` re-reads. The dedup is per-turn rather than per-session on purpose: the next user message is a new intent, and a session-lifetime cache would answer from minutes-old state |
+| D32 | `agent.max_tool_calls_per_turn` bounds a turn, and hitting it stops with a `tool_budget` reason that is distinct from `iteration_limit` | `max_iterations` bounds provider round-trips, which is not the same thing: a model can make several calls per round-trip, so a loop that repeats tools burns the session while still leaving iterations on the clock. The budget counts every call the model asks for, repeats included — it bounds the *loop*, not its cost — and `0` keeps today's unlimited behaviour, because a capable model should not be walled off by a default. When it is reached mid-batch the remaining calls are still answered with a budget-error `tool` message, not dropped: the assistant message holding those `tool_calls` is already committed, and leaving an id unanswered makes the stored transcript invalid for the provider, which is the one invariant the loop cannot break. A `system` notice explains the stop and the turn ends with `StopReason::ToolBudget`, kept separate from `IterationLimit` so a log can tell "it would not stop calling tools" from "it would not stop talking" — the two need different fixes |
+| D33 | `agent.small_model` appends six short, numbered, imperative rules to the system prompt, and nothing else changes | The observation it encodes is that a 2–4B model imitates "never"/"always" far better than the hedged prose a large model reads correctly: "work in small, verifiable steps" is advice, "Call at most one tool per turn" is an instruction it can pattern-match. The rules are chosen so each maps to a real loop behaviour rather than to taste — one call per turn keeps batches parseable and makes D30's truncation less likely, "never read a file you have already read" and "never repeat a call" name the repetition D31 absorbs, and "stop as soon as you can answer" is what ends a turn at all. They are appended, not prepended, so they are the freshest thing in context, and they are strictly additive: an operator's `system_prompt_file` persona is untouched and the digest of workspace, mode, tools and denies is unchanged. The flag is off by default because handing a capable model a list of rules it does not need is noise at best, and because a prompt is a hint the loop already enforces — the rules persuade, D30–D32 and the gate decide |
+| D34 | `[provider] strict_tool_arguments` is an opt-in quirk that adds `"strict": true` inside each function envelope, and a backend that ignores it sees today's request | The backends named in the milestone reach "arguments that validate" three ways — OpenAI-style `strict` function calling, Ollama's structured outputs, a llama.cpp built with `--jinja` and a grammar — and only the first is a *request-body* field; the other two are server configuration. So the client can offer exactly one thing without pretending otherwise: the `strict` flag the first reads, which Ollama's structured-output path also accepts when an operator has enabled it, while a llama.cpp operator sets `--jinja` or a grammar on the server and this flag is the request-side counterpart that makes it useful. It lives inside the function object (`{"function": {..., "strict": true}}`), matching Appendix A's envelope, and is omitted entirely when off, so a backend that rejects unknown fields (the reason `stream_options` is already conditional) sees an unchanged request. It is a request to the backend, not a check of our own: the arguments are still parsed and validated by the tool layer either way, so enabling it can only reduce malformed calls, never widen what runs |
