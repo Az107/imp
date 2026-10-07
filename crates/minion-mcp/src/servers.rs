@@ -323,9 +323,25 @@ impl McpServers {
         Ok((total, published))
     }
 
-    /// Spawn and handshake, recording the failure so `failure()` can explain it.
+    /// Connect and handshake, recording the failure so `failure()` can explain it.
+    ///
+    /// A server is reached one of two ways (D25): spawned over stdio when it has
+    /// a `command`, or spoken to over Streamable HTTP when it has a `url`. Both
+    /// paths end at the same [`McpClient`], so everything above this line —
+    /// listing, filtering, gating, retrying — is transport-agnostic.
     async fn attempt(&self, name: &str, config: &McpServerConfig) -> Result<Arc<McpClient>> {
-        match McpClient::connect(name, &config.command, &config.args).await {
+        let outcome = if config.is_http() {
+            match config.bearer_token() {
+                Ok(token) => {
+                    McpClient::connect_http(name, config.url.trim(), token.as_deref()).await
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            McpClient::connect(name, &config.command, &config.args).await
+        };
+
+        match outcome {
             Ok(client) => Ok(client),
             Err(err) => {
                 tracing::warn!(server = %name, error = %err, "MCP server is unavailable");
