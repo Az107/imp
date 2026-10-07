@@ -271,8 +271,9 @@ impl Runtime {
             include_usage: self.config.provider.supports_usage_in_stream,
             workspace_root: self.workspace_root.clone(),
         };
-        let agent =
-            Agent::new((self.provider)(&session_id), tools, options).with_gate(self.gate.clone());
+        let agent = Agent::new((self.provider)(&session_id), tools, options)
+            .with_gate(self.gate.clone())
+            .with_session(session_id.clone());
 
         let (sender, mut events) = mpsc::unbounded_channel();
         let collected = tokio::spawn(async move {
