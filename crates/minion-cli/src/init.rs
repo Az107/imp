@@ -26,8 +26,8 @@ use crate::cli::{Cli, InitArgs};
 const EXIT_REFUSED: u8 = 4;
 /// Exit code for a failed provider probe.
 const EXIT_PROVIDER: u8 = 3;
-/// How many discovered models to display before falling back to free text.
-const MAX_SUGGESTIONS: usize = 30;
+/// How many discovered models to show per page of the picker.
+const MODELS_PER_PAGE: usize = 30;
 /// `init` must not hang on a dead endpoint.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -297,8 +297,9 @@ async fn build_plan(args: &InitArgs) -> Result<Resolved> {
     let api_key_env = resolve_api_key_env(args, preset, interactive)?;
 
     // Ask for the real key rather than making the user export it themselves.
-    // Only meaningful on a TTY, where input can be hidden.
-    let token = match (&api_key_env, interactive, args.no_store_token) {
+    // Only meaningful on a TTY, where input can be hidden. Discovery may replace
+    // it below if the backend rejects it and the user retypes it.
+    let mut token = match (&api_key_env, interactive, args.no_store_token) {
         (Some(_), true, false) => {
             let answer = ask_secret("API key")?;
             if answer.is_empty() {
@@ -335,7 +336,15 @@ async fn build_plan(args: &InitArgs) -> Result<Resolved> {
                 "--model is required with --non-interactive".to_string(),
             ));
         }
-        None => choose_model(&base_url, &api_key_env, key.as_deref(), &headers).await?,
+        None => {
+            let (model, replacement) = choose_model(&base_url, &api_key_env, key, &headers).await?;
+            // A key retyped after a rejection supersedes the one we would store;
+            // `--no-store-token` keeps it out of the credentials file entirely.
+            if replacement.is_some() && !args.no_store_token {
+                token = replacement;
+            }
+            model
+        }
     };
 
     let workspace_root = match &args.workspace {
@@ -397,52 +406,221 @@ fn resolve_api_key_env(
 }
 
 /// Offer the models the backend advertises, falling back to free text.
+///
+/// Returns the chosen model and, when discovery had to re-ask for the key after
+/// the backend rejected it, the replacement credential to persist.
 async fn choose_model(
     base_url: &str,
     api_key_env: &Option<String>,
-    token: Option<&str>,
+    token: Option<String>,
     headers: &BTreeMap<String, String>,
-) -> Result<String> {
-    let discovered = match discovery_blocked_reason(api_key_env, token) {
-        Some(reason) => {
-            eprintln!("minion: {reason}, skipping model discovery.");
-            Vec::new()
-        }
-        None => {
-            let provider = probe_provider(base_url, token, headers);
-            match provider.list_models().await {
-                Ok(models) => models,
-                Err(err) => {
-                    eprintln!("minion: could not list models ({err}); type the id instead.");
-                    Vec::new()
+) -> Result<(String, Option<String>)> {
+    let (discovered, replacement) = discover_models(base_url, api_key_env, token, headers).await?;
+    let model = pick_model(&discovered)?;
+    Ok((model, replacement))
+}
+
+/// List the backend's models, re-asking for the key when it is rejected.
+///
+/// Discovery is best-effort: a listing that fails for any reason still lets the
+/// wizard finish with a hand-typed id, so a failure is a warning, never an
+/// error. An auth failure is the one special-cased, because the fix is in the
+/// user's hands — a wrong or mistyped key can simply be entered again.
+///
+/// The returned credential is `Some` only when the user typed a replacement; it
+/// then supersedes whatever key was passed in.
+async fn discover_models(
+    base_url: &str,
+    api_key_env: &Option<String>,
+    mut token: Option<String>,
+    headers: &BTreeMap<String, String>,
+) -> Result<(Vec<String>, Option<String>)> {
+    if let Some(reason) = discovery_blocked_reason(api_key_env, token.as_deref()) {
+        eprintln!("minion: {reason}, skipping model discovery.");
+        return Ok((Vec::new(), None));
+    }
+
+    let mut replacement = None;
+    loop {
+        let provider = probe_provider(base_url, token.as_deref(), headers);
+        match provider.list_models().await {
+            Ok(models) => return Ok((models, replacement)),
+            // A rejected key is worth another prompt: asking for a model id
+            // while the key that would list the models is wrong helps nobody.
+            Err(Error::Auth(detail)) if api_key_env.is_some() => {
+                eprintln!("minion: the backend rejected the API key: {detail}");
+                let answer = ask_secret("API key")?;
+                if answer.is_empty() {
+                    eprintln!("minion: no key entered; type the model id instead.");
+                    return Ok((Vec::new(), replacement));
                 }
+                token = Some(answer.clone());
+                replacement = Some(answer);
+            }
+            Err(err) => {
+                eprintln!("minion: could not list models ({err}); type the id instead.");
+                return Ok((Vec::new(), replacement));
             }
         }
-    };
+    }
+}
 
+/// Present the discovered models as a picker, or ask for an id when there are
+/// none.
+///
+/// The list is shown a page at a time and the prompt accepts a small set of
+/// navigation keywords. A typed number is a position in the *current view* —
+/// every discovered model, or the matches of a `search` — not merely the models
+/// on screen, which is why selecting model 34 works even while only 30 are
+/// listed.
+fn pick_model(discovered: &[String]) -> Result<String> {
     if discovered.is_empty() {
         return ask("Model", None);
     }
 
-    eprintln!("\nAvailable models:");
-    for (index, model) in discovered.iter().take(MAX_SUGGESTIONS).enumerate() {
-        eprintln!("  {}) {model}", index + 1);
-    }
-    if discovered.len() > MAX_SUGGESTIONS {
-        eprintln!("  … and {} more", discovered.len() - MAX_SUGGESTIONS);
-    }
+    let mut view: Vec<usize> = (0..discovered.len()).collect();
+    let mut page = 0usize;
+    // Set after `all`, so the full listing is not immediately repeated.
+    let mut listed_everything = false;
 
-    let answer = ask(
-        "Model (number or id)",
-        discovered.first().map(String::as_str),
-    )?;
-    if let Ok(index) = answer.parse::<usize>()
-        && index >= 1
-        && index <= discovered.len()
-    {
-        return Ok(discovered[index - 1].clone());
+    loop {
+        if !listed_everything {
+            print_model_page(discovered, &view, page);
+        }
+        listed_everything = false;
+
+        let default = view
+            .get(page * MODELS_PER_PAGE)
+            .map(|&index| discovered[index].as_str());
+        let answer = ask("Model (number or id)", default)?;
+
+        match resolve_model_choice(&answer, discovered, &view) {
+            ModelChoice::Select(index) => return Ok(discovered[index].clone()),
+            ModelChoice::Literal(id) => return Ok(id),
+            ModelChoice::Default => {
+                // `ask` substitutes the default for an empty line, so this is a
+                // belt-and-braces path to the same model it advertised.
+                return view
+                    .get(page * MODELS_PER_PAGE)
+                    .map(|&index| discovered[index].clone())
+                    .ok_or_else(|| Error::Config("no model to select".to_string()));
+            }
+            ModelChoice::More => {
+                if (page + 1) * MODELS_PER_PAGE < view.len() {
+                    page += 1;
+                } else {
+                    eprintln!("minion: end of list.");
+                }
+            }
+            ModelChoice::All => {
+                print_all_models(discovered, &view);
+                listed_everything = true;
+            }
+            ModelChoice::Search(query) => {
+                let matches = search_models(discovered, &query);
+                if matches.is_empty() {
+                    eprintln!("minion: no models match `{query}`.");
+                } else {
+                    view = matches;
+                    page = 0;
+                }
+            }
+        }
     }
-    Ok(answer)
+}
+
+/// What one line at the model picker means.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelChoice {
+    /// Enter was pressed; take the first model in the current view.
+    Default,
+    /// A position in the current view maps to this index into `discovered`.
+    Select(usize),
+    /// Show the next page.
+    More,
+    /// List every model in the current view.
+    All,
+    /// Narrow the view to models whose id contains this substring.
+    Search(String),
+    /// An id that is not in the advertised list, used verbatim.
+    Literal(String),
+}
+
+/// Interpret one line of picker input.
+///
+/// The order matters: a plain number is a position, an exact advertised id wins
+/// over the keywords — so a model genuinely named `more` stays selectable — and
+/// only then are the navigation words recognised. Anything else is a free-text
+/// id, which is what keeps a hand-written model name working.
+fn resolve_model_choice(input: &str, discovered: &[String], view: &[usize]) -> ModelChoice {
+    let answer = input.trim();
+    if answer.is_empty() {
+        return ModelChoice::Default;
+    }
+    if let Ok(position) = answer.parse::<usize>()
+        && position >= 1
+        && position <= view.len()
+    {
+        return ModelChoice::Select(view[position - 1]);
+    }
+    if let Some(index) = discovered.iter().position(|model| model == answer) {
+        return ModelChoice::Select(index);
+    }
+    let (keyword, argument) = match answer.split_once(char::is_whitespace) {
+        Some((keyword, argument)) => (keyword, argument.trim()),
+        None => (answer, ""),
+    };
+    match keyword.to_ascii_lowercase().as_str() {
+        "more" | "next" if argument.is_empty() => ModelChoice::More,
+        "all" if argument.is_empty() => ModelChoice::All,
+        "search" | "find" => ModelChoice::Search(argument.to_string()),
+        _ => ModelChoice::Literal(answer.to_string()),
+    }
+}
+
+/// Narrow `discovered` to the ids containing `query`, case-insensitively.
+///
+/// A blank query restores the full list, so `search` with no argument is a way
+/// back from a previous filter. The search always runs over the whole catalogue
+/// rather than the current view, so narrowing twice does not compound.
+fn search_models(discovered: &[String], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return (0..discovered.len()).collect();
+    }
+    discovered
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| model.to_ascii_lowercase().contains(&needle))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Print one page of the current view, numbered by position in that view.
+fn print_model_page(discovered: &[String], view: &[usize], page: usize) {
+    let start = page * MODELS_PER_PAGE;
+    let end = (start + MODELS_PER_PAGE).min(view.len());
+    eprintln!(
+        "\nAvailable models ({}-{} of {}):",
+        start + 1,
+        end,
+        view.len()
+    );
+    for (offset, &index) in view[start..end].iter().enumerate() {
+        eprintln!("  {}) {}", start + offset + 1, discovered[index]);
+    }
+    if let Some(remaining) = view.len().checked_sub(end).filter(|left| *left > 0) {
+        eprintln!("  … {remaining} more — \"more\" for the next page, \"all\" to list everything");
+    }
+    eprintln!("Type a number, \"search <text>\" to filter, or a model id.");
+}
+
+/// List every model in the current view, numbered as in the paged listing.
+fn print_all_models(discovered: &[String], view: &[usize]) {
+    eprintln!("\nAvailable models ({}):", view.len());
+    for (position, &index) in view.iter().enumerate() {
+        eprintln!("  {}) {}", position + 1, discovered[index]);
+    }
 }
 
 /// Probe the backend, so a broken config is never written.
@@ -987,5 +1165,145 @@ mod tests {
 
         assert_eq!(preset.base_url, "https://opencode.ai/zen/go/v1");
         assert_eq!(preset.headers, &[("x-opencode-session", "${session}")]);
+    }
+
+    fn ids(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("model-{index}")).collect()
+    }
+
+    fn every_view(discovered: &[String]) -> Vec<usize> {
+        (0..discovered.len()).collect()
+    }
+
+    #[test]
+    fn a_number_selects_a_model_past_the_first_page() {
+        // The bug this guards: only 30 were listed, so anything beyond looked
+        // unselectable even though the index range was never capped at 30.
+        let discovered = ids(36);
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("34", &discovered, &view),
+            ModelChoice::Select(33)
+        );
+    }
+
+    #[test]
+    fn a_number_indexes_the_current_view_not_the_catalogue() {
+        // After a search the numbering is positions in the matches, so "1" picks
+        // the first match rather than the first advertised model.
+        let discovered = ids(4);
+        let view = vec![3, 1];
+
+        assert_eq!(
+            resolve_model_choice("1", &discovered, &view),
+            ModelChoice::Select(3)
+        );
+        assert_eq!(
+            resolve_model_choice("2", &discovered, &view),
+            ModelChoice::Select(1)
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_number_is_taken_as_a_literal_id() {
+        let discovered = ids(3);
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("99", &discovered, &view),
+            ModelChoice::Literal("99".to_string())
+        );
+    }
+
+    #[test]
+    fn an_exact_advertised_id_beats_a_navigation_keyword() {
+        // A model actually called `more` must stay selectable.
+        let discovered = vec!["more".to_string(), "alpha".to_string()];
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("more", &discovered, &view),
+            ModelChoice::Select(0)
+        );
+    }
+
+    #[test]
+    fn navigation_keywords_are_recognised() {
+        let discovered = ids(3);
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("more", &discovered, &view),
+            ModelChoice::More
+        );
+        assert_eq!(
+            resolve_model_choice("NEXT", &discovered, &view),
+            ModelChoice::More
+        );
+        assert_eq!(
+            resolve_model_choice("all", &discovered, &view),
+            ModelChoice::All
+        );
+        assert_eq!(
+            resolve_model_choice("search claude", &discovered, &view),
+            ModelChoice::Search("claude".to_string())
+        );
+        assert_eq!(
+            resolve_model_choice("find  gpt ", &discovered, &view),
+            ModelChoice::Search("gpt".to_string())
+        );
+        // A bare `search` is the way back from a filter.
+        assert_eq!(
+            resolve_model_choice("search", &discovered, &view),
+            ModelChoice::Search(String::new())
+        );
+    }
+
+    #[test]
+    fn a_keyword_with_an_argument_is_a_literal_id() {
+        // `all the things` is not the `all` command; treat it as free text.
+        let discovered = ids(3);
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("all the things", &discovered, &view),
+            ModelChoice::Literal("all the things".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_id_is_used_verbatim() {
+        let discovered = ids(3);
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("a-hand-written-id", &discovered, &view),
+            ModelChoice::Literal("a-hand-written-id".to_string())
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_takes_the_default() {
+        let discovered = ids(3);
+        let view = every_view(&discovered);
+
+        assert_eq!(
+            resolve_model_choice("   ", &discovered, &view),
+            ModelChoice::Default
+        );
+    }
+
+    #[test]
+    fn search_is_case_insensitive_and_a_blank_query_restores_everything() {
+        let discovered = vec![
+            "Claude-3".to_string(),
+            "gpt-4".to_string(),
+            "deepseek-claude".to_string(),
+        ];
+
+        assert_eq!(search_models(&discovered, "CLAUDE"), vec![0, 2]);
+        assert_eq!(search_models(&discovered, "  "), vec![0, 1, 2]);
+        assert!(search_models(&discovered, "absent").is_empty());
     }
 }
