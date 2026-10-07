@@ -41,6 +41,12 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with = "yes")]
     pub deny: bool,
 
+    /// Aggressive profile for a small or local model: a token budget, capped
+    /// tool results and replies, argument repair, one bounded nudge and a terse
+    /// prompt. Equivalent to `[agent] profile = "lean"`.
+    #[arg(long, global = true)]
+    pub lean: bool,
+
     /// Emit newline-delimited JSON events instead of prose.
     #[arg(long, global = true)]
     pub json: bool,

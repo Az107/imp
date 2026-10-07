@@ -266,9 +266,13 @@ impl Runtime {
             model: model.unwrap_or_else(|| self.config.provider.model.clone()),
             max_iterations: max_iterations.unwrap_or(self.config.agent.max_iterations),
             temperature: self.config.provider.temperature,
-            max_tokens: None,
+            max_tokens: self.config.agent.max_tokens,
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
+            context_tokens: self.config.agent.context_tokens,
+            tool_result_chars: self.config.agent.tool_result_chars,
+            nudge_on_empty: self.config.agent.nudge_on_empty,
+            repair_arguments: self.config.agent.repair_arguments,
             workspace_root: self.workspace_root.clone(),
         };
         let agent =
@@ -815,10 +819,18 @@ impl MinionServer {
     /// resolved, the gate decides under the tool's *policy* name, and the call
     /// runs under the same timeout contract as any other tool.
     async fn dispatch(&self, name: &str, args: Value) -> Result<ToolOutput> {
-        let tool = self
-            .surface
-            .get(name)
-            .ok_or_else(|| Error::UnknownTool(name.to_string()))?;
+        let Some(tool) = self.surface.get(name) else {
+            let available = self
+                .surface
+                .risks()
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            return Err(Error::UnknownTool {
+                name: name.to_string(),
+                available,
+            });
+        };
         let subject = tool.approval_subject(&args);
         self.runtime
             .gate

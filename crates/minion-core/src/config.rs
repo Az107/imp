@@ -18,6 +18,19 @@ use crate::error::{Error, Result};
 /// Application directory name used for config, state, and logs.
 const APP: &str = "minion";
 
+/// Request-body keys `[provider.extra_body]` may not override.
+///
+/// These are built by the agent loop or the provider client; letting a config
+/// shadow one would change the request's meaning rather than its sampling.
+const PROTECTED_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "tools",
+    "tool_choice",
+    "stream_options",
+];
+
 /// Fully resolved configuration for one run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -73,6 +86,14 @@ pub struct ProviderConfig {
     pub supports_usage_in_stream: bool,
     /// Whether to request multiple tool calls per assistant turn.
     pub parallel_tool_calls: bool,
+    /// Idle budget between stream chunks. Slow local prefill can exceed the old
+    /// hardcoded 60s before the first token, so it is configurable.
+    pub stream_idle_timeout_secs: u64,
+    /// Extra keys merged into the request body, for backend-specific sampling
+    /// (`top_p`, `repeat_penalty`, …). Core keys cannot be overridden.
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+    /// Backend compatibility switches.
+    pub quirks: ProviderQuirks,
     /// Extra headers sent on every request.
     ///
     /// Values may contain `${session}`, which expands to the stable identifier
@@ -80,6 +101,32 @@ pub struct ProviderConfig {
     /// upstream need this: OpenCode Go, for example, requires
     /// `x-opencode-session` so it can route and cache prompts consistently.
     pub headers: BTreeMap<String, String>,
+}
+
+/// Compatibility switches for strict or non-conforming backends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderQuirks {
+    /// Strip non-essential schema keywords and collapse nullable unions.
+    pub sanitize_schemas: bool,
+    /// Omit `parallel_tool_calls` even when it is set.
+    pub omit_parallel_tool_calls: bool,
+    /// Omit `tool_choice` entirely.
+    pub omit_tool_choice: bool,
+    /// Serialize `"content": null` on assistant tool-call messages instead of
+    /// omitting the field, for templates that require it.
+    pub empty_assistant_content: bool,
+}
+
+impl Default for ProviderQuirks {
+    fn default() -> Self {
+        Self {
+            sanitize_schemas: true,
+            omit_parallel_tool_calls: false,
+            omit_tool_choice: false,
+            empty_assistant_content: false,
+        }
+    }
 }
 
 impl Default for ProviderConfig {
@@ -97,6 +144,9 @@ impl Default for ProviderConfig {
             max_retries: 3,
             supports_usage_in_stream: true,
             parallel_tool_calls: true,
+            stream_idle_timeout_secs: 120,
+            extra_body: serde_json::Map::new(),
+            quirks: ProviderQuirks::default(),
             headers: BTreeMap::new(),
         }
     }
@@ -106,6 +156,8 @@ impl Default for ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentSettings {
+    /// Named preset controlling the small-model defaults.
+    pub profile: AgentProfile,
     /// Optional file whose contents replace the built-in system prompt.
     pub system_prompt_file: Option<String>,
     /// Maximum provider round-trips per turn.
@@ -116,16 +168,52 @@ pub struct AgentSettings {
     pub history_window: usize,
     /// Summarize dropped history instead of discarding it silently.
     pub summarize_on_truncate: bool,
+    /// Token budget for the whole request. `None` disables token trimming.
+    ///
+    /// Covers the system prompt, history and reserved room for the tool
+    /// schemas. This is what keeps a small-context model from overflowing.
+    pub context_tokens: Option<usize>,
+    /// Largest number of characters of any one tool result sent to the model.
+    ///
+    /// `None` leaves results uncapped.
+    pub tool_result_chars: Option<usize>,
+    /// Upper bound on tokens generated per provider response. `None` sends none.
+    pub max_tokens: Option<u32>,
+    /// Give an empty model reply one bounded second chance.
+    pub nudge_on_empty: bool,
+    /// Repair fenced or trailing-comma tool arguments before giving up.
+    pub repair_arguments: bool,
+}
+
+/// Named agent presets.
+///
+/// `Lean` is the small/local-model profile: a hard context budget, capped tool
+/// results and replies, argument repair, a bounded nudge and a terse persona.
+/// It changes defaults only — every key can still be set explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentProfile {
+    /// The default profile: no token budget, no caps, no nudge.
+    #[default]
+    Default,
+    /// Aggressive budgets for a weak model on a small context.
+    Lean,
 }
 
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
+            profile: AgentProfile::Default,
             system_prompt_file: None,
             max_iterations: 25,
             max_tokens_per_turn: 200_000,
             history_window: 40,
             summarize_on_truncate: true,
+            context_tokens: None,
+            tool_result_chars: None,
+            max_tokens: None,
+            nudge_on_empty: false,
+            repair_arguments: true,
         }
     }
 }
@@ -544,11 +632,34 @@ impl Config {
         Self::load_with(user_config_path().as_deref(), explicit, cwd)
     }
 
+    /// Load with a CLI profile override (`--lean`).
+    ///
+    /// The override is written into the merged tree before deserialization so
+    /// the lean preset can still be layered underneath explicit keys.
+    pub fn load_profiled(explicit: Option<&Path>, cwd: &Path, lean: bool) -> Result<Self> {
+        Self::load_with_profile(
+            user_config_path().as_deref(),
+            explicit,
+            cwd,
+            lean.then_some(AgentProfile::Lean),
+        )
+    }
+
     /// Load with every config path supplied, for tests and embedders.
     ///
     /// Exists so tests can opt out of the developer's real user config instead
     /// of silently inheriting whatever `minion init` last wrote to it.
     pub fn load_with(user: Option<&Path>, explicit: Option<&Path>, cwd: &Path) -> Result<Self> {
+        Self::load_with_profile(user, explicit, cwd, None)
+    }
+
+    /// Load with every path supplied and an optional profile override.
+    pub fn load_with_profile(
+        user: Option<&Path>,
+        explicit: Option<&Path>,
+        cwd: &Path,
+        profile: Option<AgentProfile>,
+    ) -> Result<Self> {
         let mut merged = toml::Value::Table(toml::Table::new());
 
         if let Some(path) = user {
@@ -557,6 +668,28 @@ impl Config {
         merge_file(&mut merged, &cwd.join("minion.toml"))?;
         if let Some(path) = explicit {
             merge_file(&mut merged, path)?;
+        }
+
+        // The profile has to be resolved before deserialization: the lean preset
+        // is a *base* layer, so any key the user set explicitly still wins.
+        let effective = profile.unwrap_or_else(|| profile_of(&merged));
+        if profile.is_some()
+            && let Some(table) = merged.as_table_mut()
+        {
+            let agent = table
+                .entry("agent")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let toml::Value::Table(agent) = agent {
+                agent.insert(
+                    "profile".to_string(),
+                    toml::Value::String(profile_name(effective).to_string()),
+                );
+            }
+        }
+        if effective == AgentProfile::Lean {
+            let mut layered = lean_preset();
+            deep_merge(&mut layered, merged);
+            merged = layered;
         }
 
         let mut config: Config = match merged.as_table() {
@@ -630,6 +763,37 @@ impl Config {
             return Err(Error::Config(
                 "guard.timeout_secs must be at least 1".to_string(),
             ));
+        }
+        if self.provider.stream_idle_timeout_secs == 0 {
+            return Err(Error::Config(
+                "provider.stream_idle_timeout_secs must be at least 1".to_string(),
+            ));
+        }
+        // Zero is not "unlimited" for these: an absent budget is spelled by
+        // omitting the key, so a zero is a mistake worth surfacing.
+        for (name, value) in [
+            ("agent.context_tokens", self.agent.context_tokens),
+            ("agent.tool_result_chars", self.agent.tool_result_chars),
+        ] {
+            if value == Some(0) {
+                return Err(Error::Config(format!("{name} must be at least 1 when set")));
+            }
+        }
+        if self.agent.max_tokens == Some(0) {
+            return Err(Error::Config(
+                "agent.max_tokens must be at least 1 when set".to_string(),
+            ));
+        }
+        // `extra_body` exists for backend-specific sampling. Letting it shadow a
+        // core request field would silently break the agent loop, so a collision
+        // is rejected rather than merged.
+        for key in self.provider.extra_body.keys() {
+            if PROTECTED_BODY_KEYS.contains(&key.as_str()) {
+                return Err(Error::Config(format!(
+                    "provider.extra_body may not set `{key}`; it is part of the request the \
+                     agent loop builds"
+                )));
+            }
         }
         // Thresholds are probabilities. A NaN fails both range checks, which is
         // the point: an unset threshold must not silently become a comparison
@@ -857,6 +1021,56 @@ fn merge_file(base: &mut toml::Value, path: &Path) -> Result<()> {
         toml::from_str(&text).map_err(|err| Error::Config(format!("{}: {err}", path.display())))?;
     deep_merge(base, value);
     Ok(())
+}
+
+/// The lean profile's base layer. Every key can still be overridden.
+///
+/// Parsed from a literal rather than built by hand so the values read like the
+/// config a user would write, and a typo is a test failure rather than a
+/// silently ignored key.
+const LEAN_PRESET: &str = r#"
+[agent]
+context_tokens = 8192
+tool_result_chars = 6000
+max_tokens = 1024
+max_iterations = 8
+nudge_on_empty = true
+repair_arguments = true
+
+[provider]
+stream_idle_timeout_secs = 300
+supports_usage_in_stream = false
+
+[provider.quirks]
+sanitize_schemas = true
+omit_parallel_tool_calls = true
+"#;
+
+fn lean_preset() -> toml::Value {
+    toml::from_str(LEAN_PRESET).expect("the built-in lean preset is valid TOML")
+}
+
+/// Read the profile a merged config asks for, defaulting when it states none.
+fn profile_of(merged: &toml::Value) -> AgentProfile {
+    merged
+        .get("agent")
+        .and_then(|agent| agent.get("profile"))
+        .and_then(|value| value.as_str())
+        .map(|name| {
+            if name.eq_ignore_ascii_case("lean") {
+                AgentProfile::Lean
+            } else {
+                AgentProfile::Default
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn profile_name(profile: AgentProfile) -> &'static str {
+    match profile {
+        AgentProfile::Default => "default",
+        AgentProfile::Lean => "lean",
+    }
 }
 
 /// Recursively overlay tables; scalars and arrays replace wholesale.
@@ -1300,6 +1514,109 @@ mod tests {
         write(&cwd.join("minion.toml"), "[future]\nsome_key = true\n");
 
         assert!(Config::load_with(None, None, cwd).is_ok());
+    }
+
+    #[test]
+    fn the_lean_profile_fills_the_budget_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[agent]\nprofile = \"lean\"\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.agent.profile, AgentProfile::Lean);
+        assert_eq!(config.agent.context_tokens, Some(8192));
+        assert_eq!(config.agent.tool_result_chars, Some(6000));
+        assert_eq!(config.agent.max_tokens, Some(1024));
+        assert_eq!(config.agent.max_iterations, 8);
+        assert!(config.agent.nudge_on_empty);
+        assert_eq!(config.provider.stream_idle_timeout_secs, 300);
+        assert!(!config.provider.supports_usage_in_stream);
+        assert!(config.provider.quirks.omit_parallel_tool_calls);
+    }
+
+    #[test]
+    fn an_explicit_key_beats_the_lean_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[agent]\nprofile = \"lean\"\nmax_iterations = 3\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.agent.max_iterations, 3, "the explicit key wins");
+        // A key the user did not set still comes from the preset.
+        assert_eq!(config.agent.context_tokens, Some(8192));
+    }
+
+    #[test]
+    fn the_default_profile_does_not_budget() {
+        let config = Config::default();
+        assert_eq!(config.agent.profile, AgentProfile::Default);
+        assert_eq!(config.agent.context_tokens, None);
+        assert!(!config.agent.nudge_on_empty);
+        assert!(config.agent.repair_arguments, "repair is safe by default");
+    }
+
+    #[test]
+    fn the_lean_flag_overrides_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[agent]\nprofile = \"default\"\n",
+        );
+
+        let config = Config::load_profiled(None, dir.path(), true).unwrap();
+
+        assert_eq!(config.agent.profile, AgentProfile::Lean);
+        assert_eq!(config.agent.context_tokens, Some(8192));
+    }
+
+    #[test]
+    fn extra_body_may_not_shadow_a_core_request_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[provider.extra_body]\nmodel = \"hijacked\"\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+        assert!(err.to_string().contains("model"), "was: {err}");
+    }
+
+    #[test]
+    fn extra_body_carries_sampling_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[provider.extra_body]\ntop_p = 0.9\nrepeat_penalty = 1.05\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.provider.extra_body["top_p"], serde_json::json!(0.9));
+        assert_eq!(
+            config.provider.extra_body["repeat_penalty"],
+            serde_json::json!(1.05)
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[agent]\ncontext_tokens = 0\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
     }
 
     #[test]

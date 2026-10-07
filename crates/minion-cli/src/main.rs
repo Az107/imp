@@ -45,7 +45,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
         return init::run(&cli, args.clone()).await;
     }
 
-    let mut config = Config::load(cli.config.as_deref(), &cwd)?;
+    let mut config = Config::load_profiled(cli.config.as_deref(), &cwd, cli.lean)?;
     if let Some(model) = &cli.model {
         config.provider.model = model.clone();
     }

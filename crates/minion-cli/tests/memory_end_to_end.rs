@@ -127,11 +127,8 @@ fn agent(provider: Arc<ScriptedProvider>, store: Arc<Store>, root: &std::path::P
         AgentOptions {
             model: "scripted".to_string(),
             max_iterations: 8,
-            temperature: None,
-            max_tokens: None,
-            parallel_tool_calls: None,
-            include_usage: false,
             workspace_root: root.to_path_buf(),
+            ..AgentOptions::default()
         },
     )
 }

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use minion_core::agent::{Agent, AgentEvent, AgentOptions, StopReason};
 use minion_core::clock::SystemClock;
-use minion_core::config::{Config, Decision};
+use minion_core::config::{AgentProfile, Config, Decision};
 use minion_core::error::{Error, Result};
 use minion_core::guard::GuardThresholds;
 use minion_core::job::{Job, SessionMode};
@@ -70,6 +70,13 @@ struct ProviderSpec {
     request_timeout: Duration,
     usage_in_stream: bool,
     headers: Vec<(String, String)>,
+    stream: bool,
+    stream_idle_timeout: Duration,
+    sanitize_schemas: bool,
+    omit_parallel_tool_calls: bool,
+    omit_tool_choice: bool,
+    empty_assistant_content: bool,
+    extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ProviderSpec {
@@ -80,6 +87,13 @@ impl ProviderSpec {
             .with_usage_in_stream(self.usage_in_stream)
             .with_headers(self.headers.clone())
             .with_session_id(session_id.to_string())
+            .with_stream(self.stream)
+            .with_stream_idle_timeout(self.stream_idle_timeout)
+            .with_sanitize_schemas(self.sanitize_schemas)
+            .with_omit_parallel_tool_calls(self.omit_parallel_tool_calls)
+            .with_omit_tool_choice(self.omit_tool_choice)
+            .with_empty_assistant_content(self.empty_assistant_content)
+            .with_extra_body(self.extra_body.clone())
     }
 }
 
@@ -187,6 +201,13 @@ pub async fn build(
         request_timeout: Duration::from_secs(config.provider.request_timeout_secs),
         usage_in_stream: config.provider.supports_usage_in_stream,
         headers: config.request_headers(),
+        stream: config.provider.stream,
+        stream_idle_timeout: Duration::from_secs(config.provider.stream_idle_timeout_secs),
+        sanitize_schemas: config.provider.quirks.sanitize_schemas,
+        omit_parallel_tool_calls: config.provider.quirks.omit_parallel_tool_calls,
+        omit_tool_choice: config.provider.quirks.omit_tool_choice,
+        empty_assistant_content: config.provider.quirks.empty_assistant_content,
+        extra_body: config.provider.extra_body.clone(),
     };
 
     let workspace_root = config.workspace_root(cwd)?;
@@ -252,15 +273,7 @@ pub async fn build(
         "session ready"
     );
 
-    let options = AgentOptions {
-        model: config.provider.model.clone(),
-        max_iterations: config.agent.max_iterations,
-        temperature: config.provider.temperature,
-        max_tokens: None,
-        parallel_tool_calls: Some(config.provider.parallel_tool_calls),
-        include_usage: config.provider.supports_usage_in_stream,
-        workspace_root: workspace_root.clone(),
-    };
+    let options = agent_options(config, workspace_root.clone());
 
     // Whether anyone can answer a prompt. `--yes` forces the permissive path;
     // a non-TTY still cannot be prompted, so it falls back to `noninteractive`.
@@ -326,6 +339,23 @@ pub async fn build(
 /// the engine so the rule order stays untouched — see [`RecordingGate`].
 fn recording(engine: Arc<PolicyEngine>, store: &Arc<Store>) -> Arc<dyn ToolGate> {
     RecordingGate::arc(engine, store.approvals())
+}
+
+/// The agent-loop settings, including the small-model budget and caps.
+pub(crate) fn agent_options(config: &Config, workspace_root: PathBuf) -> AgentOptions {
+    AgentOptions {
+        model: config.provider.model.clone(),
+        max_iterations: config.agent.max_iterations,
+        temperature: config.provider.temperature,
+        max_tokens: config.agent.max_tokens,
+        parallel_tool_calls: Some(config.provider.parallel_tool_calls),
+        include_usage: config.provider.supports_usage_in_stream,
+        context_tokens: config.agent.context_tokens,
+        tool_result_chars: config.agent.tool_result_chars,
+        nudge_on_empty: config.agent.nudge_on_empty,
+        repair_arguments: config.agent.repair_arguments,
+        workspace_root,
+    }
 }
 
 /// The `[workspace]`, `[exec]` and `[http_fetch]` values that shape the tool set.
@@ -536,15 +566,7 @@ impl JobAgentRunner {
         let start = if fresh { 0 } else { history.len() };
         history.push(Message::user(format!("[cron:{tag}] {}", job.prompt)));
 
-        let options = AgentOptions {
-            model: self.config.provider.model.clone(),
-            max_iterations: self.config.agent.max_iterations,
-            temperature: self.config.provider.temperature,
-            max_tokens: None,
-            parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
-            include_usage: self.config.provider.supports_usage_in_stream,
-            workspace_root: workspace,
-        };
+        let options = agent_options(&self.config, workspace);
         let agent = Agent::new(
             Arc::new(self.spec.build(&session_id)),
             self.tools.clone(),
@@ -629,10 +651,10 @@ pub fn system_prompt(config: &Config, root: &Path, tools: &ToolRegistry) -> Stri
             Ok(text) => text,
             Err(err) => {
                 tracing::warn!(path, error = %err, "cannot read system_prompt_file; using the built-in persona");
-                builtin_persona()
+                personality(config)
             }
         },
-        None => builtin_persona(),
+        None => personality(config),
     };
 
     let mode = if std::io::stdin().is_terminal() {
@@ -667,6 +689,26 @@ fn builtin_persona() -> String {
     "You are minion, a minimalist Unix-native agent. Work in small, verifiable steps, \
      prefer tools over guesses, and report what you actually observed. \
      When a task needs a capability you do not have, say so plainly."
+        .to_string()
+}
+
+/// The persona for the chosen profile, unless a file overrides it.
+fn personality(config: &Config) -> String {
+    match config.agent.profile {
+        AgentProfile::Lean => lean_persona(),
+        AgentProfile::Default => builtin_persona(),
+    }
+}
+
+/// A terse, instruction-heavy persona for a small model.
+///
+/// Small models need the loop discipline stated outright: one tool at a time,
+/// no repeating a call that already worked, and a plain answer when done.
+fn lean_persona() -> String {
+    "You are minion, a concise Unix worker. Use one tool at a time. \
+     After a tool result, either call the next tool or give a short final answer. \
+     Do not repeat a tool call that already succeeded. If no tool can do the task, \
+     say so in one sentence. Keep answers short."
         .to_string()
 }
 

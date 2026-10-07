@@ -122,11 +122,8 @@ fn agent(provider: Arc<dyn Provider>, registry: ToolRegistry, gate: Arc<dyn Tool
         AgentOptions {
             model: "scripted".to_string(),
             max_iterations: 4,
-            temperature: None,
-            max_tokens: None,
-            parallel_tool_calls: None,
-            include_usage: false,
             workspace_root: std::env::temp_dir(),
+            ..AgentOptions::default()
         },
     )
     .with_gate(gate)

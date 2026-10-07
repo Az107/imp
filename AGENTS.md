@@ -46,6 +46,13 @@ is `McpServerSection` in `minion-core/src/config.rs`; the subcommand is `McpActi
 `RunCommand`/`WriteFile`, so the surface adds a name and nothing else. The golden surface lives in
 `crates/minion-cli/src/snapshots/minion__mcp_serve__tests__the_default_surface_is_a_golden.snap`.
 
+**The lean profile is on branch `lean-worker`** (D23). `[agent] profile = "lean"` or `--lean` presets
+the loop for a small/local model: a token budget enforced inside the turn, capped tool results and
+replies, a configurable stream idle timeout, sanitized tool schemas, streaming quirks, argument
+repair and one bounded nudge. It is a TOML *base* layer, so explicit keys still win. This is where
+`minion-core/src/tokens.rs` (the estimator), `minion-core/src/args.rs` (repair) and `sanitize_schema`
+in `minion-core/src/provider.rs` come from.
+
 `minion-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. Both halves
 of MCP exist: `minion-mcp` is the client (§5.10), `minion-cli::mcp_serve` is the server (§5.9).
 
@@ -386,6 +393,42 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   `tokio::spawn`ed, never awaited, before the client is built: it completes the handshake before
   returning, and it cannot handshake with a client that does not exist yet — awaiting it deadlocks.
   The fake provider is injected through `Runtime::build`'s `ProviderFactory`, so no network is needed.
+
+## Lean profile rules (D23)
+
+- **The profile is a TOML base layer, not a code path.** `[agent] profile = "lean"` (or `--lean`)
+  inserts the preset *underneath* the merged user config, so an explicit key always wins. Do not add a
+  second "lean" branch inside the loop; every knob it sets (`context_tokens`, `tool_result_chars`,
+  `max_tokens`, `max_iterations`, `nudge_on_empty`, `repair_arguments`, `stream_idle_timeout_secs`,
+  `supports_usage_in_stream`, `omit_parallel_tool_calls`) is a normal setting a user can also write by
+  hand. The preset literal is `LEAN_PRESET` in `minion-core/src/config.rs`.
+- **The token budget is enforced inside `Agent::run`, before every provider call** — not at load.
+  Tool results accumulate between iterations, so a load-time-only trim cannot see the messages that
+  actually overflow the window. `trim_to_budget` drops whole oldest turns and lands the cut on a
+  `user` boundary, the same invariant as `apply_history_window`: never an assistant `tool_calls`
+  without its results. If the system prompt plus schemas alone exceed the budget, the turn fails with
+  an explanation instead of sending a request that will be rejected.
+- **The estimator is a heuristic and stays dependency-free.** `minion_core::tokens` uses a
+  conservative characters-per-token ratio; `minion-core` must not grow a tokenizer. It is for
+  budgeting, never for billing.
+- **`repair_arguments` runs only after a normal parse fails.** `minion_core::args::repair_json` strips
+  fences and trailing commas; it must return `None` when nothing changed so the original parse error
+  survives. Do not pre-emptively rewrite well-formed JSON.
+- **`nudge_on_empty` fabricates exactly one turn.** It is lean-only, bounded to one per user turn and
+  subject to `max_iterations`; it inserts a marked `user` message, the same shape as the cron tag. It
+  is the only place the loop speaks on the user's behalf.
+- **The schema sanitizer is lossless for tool calling.** `sanitize_schema` removes `$schema`, `title`
+  and `format`, collapses `["T","null"]` to `T`, and adds `additionalProperties: false` to a closed
+  object. It must keep `description`, `enum`, `required` and bounds — a grammar compiler and the model
+  both rely on them. It is applied in `OpenAiProvider::body`, gated by `provider.quirks.sanitize_schemas`.
+- **`[provider.extra_body]` cannot shadow a core request key.** `model`, `messages`, `stream`,
+  `tools`, `tool_choice` and `stream_options` are built by the loop; `Config::validate` rejects a
+  collision. It exists for sampling (`top_p`, `repeat_penalty`), nothing else.
+- **None of this is a security change.** The gate is untouched; a small model gets no exemption. The
+  disabled-family deny rules and the non-interactive default still run first (D15, D21, D22).
+- **`max_tokens_per_turn` and `summarize_on_truncate` are still documented but unimplemented.** The
+  real context control is `context_tokens`; summarization remains a known gap. Don't assume either
+  key does anything.
 
 ## Memory rules
 
