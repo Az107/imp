@@ -1265,7 +1265,9 @@ var's value, secret-shaped header values and any `Bearer` token before the line 
 Implemented (M7): `cargo build --release` produces one binary (`lto = "thin"`,
 `codegen-units = 1`, `strip = true`); `make dist` builds the per-target tarballs and
 `.sha256` that `install.sh` consumes; `minion --version` reports the git SHA and the
-enabled features from `build.rs`; `write_private_file` and `Store::open` set
+enabled features from `build.rs` (which watches `.git/refs`, `.git/logs/HEAD` and
+`.git/packed-refs` so the SHA tracks the commit, not just `.git/HEAD` — the suite
+asserts the banner against `git rev-parse`); `write_private_file` and `Store::open` set
 `0600`/`0700` before writing content, and `minion doctor` warns when a private file is
 not owner-only. A musl C compiler is required for the static Linux targets — see
 `NFR.md` for the no-root recipe used here.

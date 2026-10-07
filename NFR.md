@@ -11,17 +11,20 @@ cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-musl
 # -> target/aarch64-unknown-linux-musl/release/minion
 ```
 
+That binary names the commit it was built from, so a figure can be traced back
+to its source: `minion --version` prints `<version> (<git sha>; features: ...)`.
+
 ## The table
 
 | ID | Target | Measured | Meets? |
 |---|---|---|---|
-| NFR-1 | cold start < 60 ms | min 46.5 ms · **median 57.3 ms** · p90 64.8 ms | yes (median), tight |
-| NFR-2 | idle RSS < 40 MB | **9.1 MB** (VmHWM, 3 runs identical) | yes |
-| NFR-3 | release binary < 15 MB (stripped, musl) | **14,514,400 B = 14.51 MB (13.84 MiB)**, static, stripped | yes |
+| NFR-1 | cold start < 60 ms | min 45.7 ms · **median 54.8 ms** · p90 67.2 ms (n=90, pinned to one core) | yes (median), tight |
+| NFR-2 | idle RSS < 40 MB | **9.2 MB** (VmHWM, max over 90 runs) | yes |
+| NFR-3 | release binary < 15 MB (stripped, musl) | **14,579,936 B = 14.58 MB (13.90 MiB)**, static, stripped | yes |
 | NFR-4 | tool output capped by default | **262,144 B (256 KiB)** — `[exec] output_cap_bytes` | yes |
 | NFR-5 | default command timeout | **120 s** — `[exec] default_timeout_secs` | yes |
 | NFR-6 | no lost job/message on `SIGKILL` | WAL + `synchronous=NORMAL`; a committed message survives a reopen; a run is durable before dispatch | yes |
-| NFR-7 | offline test suite | **426 tests, 0 failures**, no network — the only socket is a refused loopback connection | yes |
+| NFR-7 | offline test suite | **427 tests, 0 failures**, no network — the only socket is a refused loopback connection | yes |
 | NFR-8 | no colour dependence | `NO_COLOR`/`--no-color` drop escapes, keep layout; piped output is never rendered | yes |
 | NFR-9 | secrets never logged | API key, the configured env var's value, secret-shaped header values and `Bearer <token>` are masked at the sink | yes |
 | NFR-10 | `init` offline unless `--check` | default `init` writes a config against an unreachable backend | yes |
@@ -32,7 +35,8 @@ cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-musl
 
 The binary is started as the REPL with stdin on a pipe; the time to its first
 stdout line is "cold start to prompt", and `VmHWM` taken while it blocks is idle
-RSS. This python is the harness used:
+RSS. This python is the harness used (one reused database, one discarded warmup
+run, `n` samples):
 
 ```python
 import os, subprocess, time
@@ -54,14 +58,17 @@ def run(db, cwd):
     return ms, hwm
 ```
 
-The measurement includes the ~10 ms cost of `fork`/`exec` from python, so the
-binary's own cold start is a little lower. The median is what is compared to the
-target; NFR-1 is met but with little headroom, and the p90 is over.
+Run pinned to one core (`taskset -c 3 python3 …`) the median is **54.8 ms**
+(n=90); unpinned on the same host it is **61.2 ms** (n=90), and a single 7-sample
+pass ranged 54–64 ms. The spread is scheduler noise — the harness forks,
+execs and migrates — not the binary: pinning removes it. The measurement still
+includes python's `fork`/`exec`, so the binary's own cold start is lower. NFR-1
+is met at the median but with little headroom, and the p90 is over.
 
 ### NFR-3
 
 ```sh
-stat -c '%s bytes' target/aarch64-unknown-linux-musl/release/minion   # 14514400
+stat -c '%s bytes' target/aarch64-unknown-linux-musl/release/minion   # 14579936
 file target/aarch64-unknown-linux-musl/release/minion                 # statically linked, stripped
 ```
 
@@ -84,7 +91,7 @@ cargo +1.89.0 test -p minion-cron   # the durable-before-dispatch test
 ### NFR-7
 
 ```sh
-cargo +1.89.0 test --workspace --locked    # 426 passed, 0 failed, no network
+cargo +1.89.0 test --workspace --locked    # 427 passed, 0 failed, no network
 ```
 
 ### NFR-8
