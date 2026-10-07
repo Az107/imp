@@ -993,7 +993,7 @@ The server task is started with `minion mcp serve`, over **stdio** or **Streamab
 
 | Tool | Purpose | Default gate |
 |---|---|---|
-| `agent_ask` | Run one agent turn; params `prompt`, `session_id?`, `model?`, `max_iterations?`, `allow_tools?` | `auto` (read-only tool subset) |
+| `agent_ask` | Run one agent turn; params `prompt`, `session_id?`, `model?`, `max_tokens?`, `max_iterations?`, `allow_tools?` | `auto` (read-only tool subset) |
 | `agent_list_sessions` | Enumerate sessions | `auto` |
 | `agent_get_session` | Fetch transcript | `auto` |
 | `agent_list_tools` | Introspect enabled tools + risk classes | `auto` |
@@ -1240,6 +1240,70 @@ Global options:
 
 ---
 
+### 5.13 Peers — asking a larger model
+
+A **peer** is another minion's `mcp serve` endpoint. Nothing new is spoken: a peer is
+an MCP server like any other (M10.1, D25). What this section adds is the *shape of the
+delegation* — how a small local model hands a hard question to a big remote one.
+
+```toml
+[peers.big]                                  # one delegation tool, `peer__big_ask`
+url = "http://big.tailnet.ts.net:8788/mcp"   # a remote minion; `command` is the local form
+token_file = "~/.config/minion/big.credentials"   # api_key = "…", mode 0600
+max_tokens = 512          # forwarded to the peer's `agent_ask` when a call does not name one
+result_cap_bytes = 8192   # what the local model sees; around 8 KB by default
+approval = "ask"          # this peer's fallback, substituting policy.default (D21)
+```
+
+- **One tool per peer, flattened `peer__<name>_ask`.** This is deliberate, and the
+  alternative is refused on principle: a generic `delegate(target = "…")` would move the
+  approval decision off the tool *name* and into an argument, which is precisely the trap
+  `mcp_call` is deferred over (D20) — the engine keys its rules on names, and a parameter
+  recreates the ambiguity the flattened tools exist to remove. The name is also the family
+  key: `peer__big_ask` is the string a `[policy.allow]`/`[policy.deny]` rule and a per-peer
+  `approval` key on, and an operator's `mcp__…` rules are untouched by it.
+- **Params `{ brief, context?, max_tokens? }`.** `brief` is required and non-empty.
+  A `tools` argument is *refused*, not ignored: `agent_ask` already runs the read-only
+  subset of the peer's own registry (D22), and the caller does not get to widen it.
+- **A brief, not a trajectory.** Only the brief — with `context`, if given, prefixed — is
+  sent; nothing from the local transcript rides along. This is the evidence-backed choice:
+  the handoff-tax study (arXiv 2608.24358) measures that escalating with the full
+  trajectory recovers *less than half* of the quality gap and that the escalation works
+  better the less of the weak model's history it carries. It is also mechanical: the local
+  model that receives the answer has a 4–8K context, so a long answer back is what kills
+  it. Hence the result cap.
+- **Risk is `Network`** — the MCP floor (D21). The brief leaves the machine, so the gate
+  is consulted *before* anything is sent, and with `policy.noninteractive = "deny"` (the
+  default) a cron job cannot escalate: `build_cron_gate` is non-interactive, so
+  `peer__<name>_ask` is refused there exactly as `http_fetch` is. This is the same
+  reasoning the System One guard carries — the payload leaves the machine (D16).
+- **The peer's answer is data.** It is placed in the tool result and nowhere else; it
+  never becomes a system prompt and is never executed. A peer is a remote endpoint, and
+  its text is untrusted input, exactly like any other tool output (T14). A delegated turn
+  is told so in the tool's own description.
+- **Depth cap 1.** A peer answers through its own `agent_ask`, whose inner agent holds
+  only the read-only subset of the built-in registry (D22). A delegation tool is
+  `Network`, so it is never in that subset: a peer cannot pass the brief on to a third
+  model. The cap is the read/write line itself (D15), not a counter a caller could reset,
+  and `mcp serve` never assembles `[peers.*]` — so two small models passing the ball is
+  not reachable by construction. `crates/minion-cli/src/mcp_serve.rs` pins the property
+  with a test on the inner surface.
+- **Cost is visible.** The peer's `agent_ask` reports the tokens it spent; the delegation
+  tool puts them in the tool result's metadata (`usage`), and the loop folds them into the
+  turn's usage (`ToolOutput::reported_usage`). `/cost` therefore includes what the peer
+  spent. Advisory, as always (R8): a peer that reports nothing simply does not count, and
+  no turn is blocked on it.
+- **Failure is a tool error.** A peer that cannot be reached, refuses the brief, or dies
+  mid-call becomes a tool result the model can read; the turn carries on, and the
+  connection is retried on the next call. Nothing panics, and nothing hangs the loop.
+  A `result_cap_bytes` that the answer exceeds cuts the answer and marks it `truncated`.
+
+`mcp serve` ignores `[peers.*]`, for the same reason it ignores `[mcp.client.servers.*]`:
+the delegated turn's surface is the built-ins' read-only subset, and a peer there would be
+the second hop the depth cap exists to forbid.
+
+---
+
 ## 6. Security and threat model
 
 ### 6.1 Assets
@@ -1365,6 +1429,7 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | M8 — Self-update | done | `minion update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
 | M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `minion update` installs; a mismatched version or a failing test publishes nothing |
 | M10 — Peer transport | done | Streamable HTTP for both halves: `url` on `[mcp.client.servers.*]` with bearer-token auth (`token_env`/`token_file`), `transport = "http"` + `bind` on `[mcp.server]`, a fail-closed bind policy, no TLS by design | Two minion instances on a tailnet discover and call each other's gated tools over HTTP; a non-loopback bind with no token refuses to start; a wrong token lists nothing |
+| M10.2 — Peer delegation | done | One `peer__<name>_ask` tool per `[peers.*]` entry, carrying a *brief* to the peer's `agent_ask`; a configurable result cap (~8 KB), the read-only depth cap, remote usage folded into the turn, and the whole thing behind the `Network` gate | A small model escalates a self-contained brief to a bigger peer through the gate and gets its answer as tool-result data; a cron job cannot escalate; the gate decides before the network is touched; a peer that fails or goes missing is a tool error, never a panic or a hang |
 
 ---
 
@@ -1486,3 +1551,6 @@ than editing individual tools.
 | D25 | MCP gains a **Streamable HTTP** transport for both halves, and a client server is `command` (stdio) *xor* `url` (HTTP) | Two minion instances on the same tailnet need to talk to each other, and today both halves are stdio-only: `transport-child-process` for the client, `mcp serve` owning stdin/stdout for the server. `rmcp` 3.5.0 already ships both the Streamable HTTP client (`transport-streamable-http-client-reqwest`) and server (`transport-streamable-http-server`), so the transport is adopted, not invented — no second protocol, no hand-rolled framing. The two client paths are mutually exclusive on purpose and checked at config load: a `command` is spawned over stdio, a `url` is spoken to over HTTP, and "both" or "neither" is a startup error rather than a server that quietly picks one; `args` beside a `url`, or a scheme that is not `http(s)`, is refused for the same reason. The server half is a config value (`transport = "http"`) rather than a flag because it changes what resource the process owns — a socket where stdio was a pipe — but R5's exclusion still holds: neither path can reach the REPL. Everything above `McpClient` is untouched, so listing, `tool_allow`, the per-server policy, the transition notices and the next-turn retry are the stdio behaviour verbatim; a test proves a down HTTP peer degrades exactly as a child that failed to spawn does |
 | D26 | HTTP auth is a **bearer token**, never the source address, and there is **no TLS** — deliberately | Inside a tailnet the traffic is already encrypted by WireGuard, so TLS would add a dependency on the Tailscale daemon and on certificates to a binary whose whole selling point is a minimal dependency surface, and it would buy nothing against the threat that matters here. The real authentication is the token: any process on a tailnet node can open that port, so the source IP proves nothing about who is calling, and the `Host` header is no better — off a loopback bind the `Host` allowlist is switched off precisely because a MagicDNS name cannot be derived from an `IP:port` bind, leaving the token as the boundary. The client sends `Authorization: Bearer` on every request, and the server, when a token is configured, requires it even on loopback — a token that is only checked on a tailnet is a token that can be forgotten locally. The comparison is constant-time so a token cannot be recovered a byte at a time, and the check runs *before* the MCP service, so a wrong token lists no tool and reaches no handler (the test asserts the raw `401`). The config carries only names — `token_env` (a variable name) or `token_file` (a `0600` credentials-file path) — resolved through the same `resolve_secret` the provider key uses; a source that is named but yields nothing is an error, not a silent anonymous request, so a typo cannot masquerade as a server that rejects you. An `https://` URL is still accepted by the client, so a future decision can add certificates without a config change |
 | D27 | The HTTP bind is **fail-closed**: default `127.0.0.1:8788`; wildcard and globally routable addresses are always refused, and any other non-loopback bind needs a token or the server refuses to start | The policy runs at config load, before `TcpListener::bind`, so a bad bind is a startup error rather than a socket that is already listening when the mistake is noticed. `0.0.0.0` and `::` are refused unconditionally because they are not an address — they are every interface, the public one included, and no tailnet bind wants them. A globally routable address is refused because minion's wide-area transport is the tailnet, not the public internet, and that is a different decision than this milestone makes. Everything else that is not loopback — a tailnet `100.64.0.0/10` or `fd7a:115c:a1e0::/48` address, a LAN, a link-local one — is refused *unless* a token source is configured, because off loopback the token is the only thing minion has (D26). Loopback needs nothing: it is a local process. The default is loopback so the zero-config case is the safe one, and the private-address list is the one `http_fetch`'s `block_private_ips` already uses, so the two agree on where the public boundary is |
+| D29 | A peer reaches the model as **one flattened tool per peer**, `peer__<name>_ask`, never as a generic `delegate(target = "…")` | The approval engine decides on a tool *name*: deny rules, allow rules and the per-server/per-peer `ToolPolicy` all key on it. A single generic tool with a `target` parameter would move that decision off the name and into an argument, which is exactly the ambiguity that `mcp_call` was deferred over (D20) and that the flattened `mcp__<server>__<tool>` tools exist to remove. Flattening per peer keeps three things true at once: an operator writes a rule that names one peer (or `peer__*` names them all), the audit row names the tool that actually ran, and the naming style is the MCP client's own — a namespace plus a fixed leaf, here `peer__<name>_ask` rather than `mcp__<name>__agent_ask`, because a peer contributes *one* capability (a brief) rather than a server's catalogue. A peer is still an MCP server underneath (D25): same transport, same handshake, same client, same bearer-token resolution. The alternative — modelling a peer as an ordinary `[mcp.client.servers.*]` entry and letting `agent_ask` reach the model as `mcp__peer__agent_ask` — was rejected because it would offer the peer's whole catalogue (listing sessions, reading transcripts, the cron tools) instead of the one bounded delegation the milestone is about, and because it would lose the per-peer result cap and the two-argument brief that keep the handoff small |
+| D30 | A delegation sends a **brief, not a trajectory**, and the answer is capped (~8 KB) and treated as **data** | The handoff-tax measurement (arXiv 2608.24358) is the evidence: escalating with the full trajectory recovers less than half of the quality gap, and the escalation does *better* the less of the weak model's history it carries — so the tool takes `{ brief, context? }` and sends exactly that, with `context` a short optional prefix and no part of the local transcript. The other half of the argument is mechanical: the model that receives the answer is local and small (a 2B model has a 4–8K context), so a long answer back is what breaks it; hence `result_cap_bytes` with an ~8 KB default, cutting on a character boundary and marking the cut. The peer's text enters the transcript as a *tool result* and nowhere else — never as a system prompt, never executed — because a peer is a remote endpoint whose output is untrusted input (T14), and the tool's own description says so. `max_tokens` is forwarded to the peer's `agent_ask` (which now accepts it) so a caller can bound the answer at the source, and a caller that tries to pass a `tools` argument is refused rather than ignored: the peer's surface is the peer's read-only subset (D22), and the caller does not get to widen it |
+| D31 | The **depth cap is 1** and it is the read/write line, not a counter; a peer's tokens are folded into the turn's usage | Two small models passing a brief back and forth is the failure mode — an unbounded escalation with no answer at the end. The cap is not a hop counter a caller could reset or forget to thread through: a delegated turn runs under the peer's `agent_ask`, whose inner registry is the read-only subset of the built-ins (D22), and a delegation tool is `Risk::Network`, so it is never in that subset. `mcp serve` also deliberately does not assemble `[peers.*]` (it already ignores `[mcp.client.servers.*]`), so the reachability hole is closed at the source as well as by the risk filter; `mcp_serve`'s tests pin the property so a future widening of the inner surface fails loudly. Cost rides the same decision: the peer's `agent_ask` already reports `usage`, so the delegation tool puts it in the tool result's metadata and the agent loop folds it into the turn's usage — which is what `/cost` reads — through `ToolOutput::reported_usage`, advisory and fail-open exactly as R8 requires (a peer that reports nothing simply does not count, and no turn is blocked on a missing value) |
