@@ -488,6 +488,11 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - **`/cron` in the REPL and the scheduler's start/stop wiring are manually verified.** The
   subcommand (`minion cron add|list|remove`) is the tested surface; the REPL path has no automated
   test, the same limitation as the interactive approval prompt.
+- **`--yes`/`--deny` do not move the MCP surface.** The disabled families are deny *rules*, which are
+  rule 1 and beat the default a flag would set, and the read-only tools are allowed before the
+  fallback is ever consulted. The only thing that widens the surface is `[mcp.server].expose_exec` /
+  `expose_write`. Passing `--yes` to `mcp serve` is therefore inert rather than dangerous, but it is
+  also not a way to enable anything.
 - **`mcp serve` does not run the scheduler.** A job created over MCP (`cron_add`) is stored in the
   session database and runs the next time a process that *does* start a scheduler — `minion run`, the
   REPL, or a future `doctor`/daemon — opens it. The server is a protocol endpoint, not a daemon (D22).
