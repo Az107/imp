@@ -282,8 +282,9 @@ impl Runtime {
             max_tool_calls_per_turn: self.config.agent.max_tool_calls_per_turn,
             workspace_root: self.workspace_root.clone(),
         };
-        let agent =
-            Agent::new((self.provider)(&session_id), tools, options).with_gate(self.gate.clone());
+        let agent = Agent::new((self.provider)(&session_id), tools, options)
+            .with_gate(self.gate.clone())
+            .with_session(session_id.clone());
 
         let (sender, mut events) = mpsc::unbounded_channel();
         let collected = tokio::spawn(async move {

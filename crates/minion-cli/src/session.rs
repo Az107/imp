@@ -26,7 +26,7 @@ pub async fn run(cli: &Cli, config: &Config, args: SessionArgs) -> Result<ExitCo
     match &args.action {
         SessionAction::List { limit } => list(cli, &store, *limit).await,
         SessionAction::Show { id } => show(cli, &store, id).await,
-        SessionAction::Rm { id } => remove(&store, id).await,
+        SessionAction::Rm { id } => remove(cli, &store, id).await,
         SessionAction::Resume { id } => {
             // Resolution first, so a bad id fails before the REPL takes the
             // terminal and the user is left staring at a prompt.
@@ -141,15 +141,25 @@ async fn show(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn remove(store: &Store, id: &str) -> Result<ExitCode> {
+async fn remove(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
     let id = resolve(store, id).await?;
     let deleted = store.delete_session(&id).await?;
 
-    if !deleted {
-        return Ok(ExitCode::from(EXIT_NOT_FOUND));
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({ "type": "session_deleted", "id": id, "deleted": deleted })
+        );
+    } else if deleted {
+        println!("deleted {}", &id[..8.min(id.len())]);
+    } else {
+        println!("no session matches `{id}`");
     }
-    println!("deleted {}", &id[..8.min(id.len())]);
-    Ok(ExitCode::SUCCESS)
+    Ok(if deleted {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(EXIT_NOT_FOUND)
+    })
 }
 
 /// Accept a full id, a unique prefix, or a 1-based position from `list`.

@@ -97,6 +97,7 @@ impl Session {
             self.options.clone(),
         )
         .with_gate(self.gate.clone())
+        .with_session(self.session_id.clone())
     }
 
     /// Point this session at a different conversation.
@@ -583,7 +584,8 @@ impl JobAgentRunner {
             self.tools.clone(),
             options,
         )
-        .with_gate(self.gate.clone());
+        .with_gate(self.gate.clone())
+        .with_session(session_id.clone());
 
         let (sender, mut events) = mpsc::unbounded_channel();
         // Drain to a buffer rather than the renderer: a job's output must not

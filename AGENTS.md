@@ -49,6 +49,17 @@ is `McpServerSection` in `minion-core/src/config.rs`; the subcommand is `McpActi
 `minion-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. Both halves
 of MCP exist: `minion-mcp` is the client (§5.10), `minion-cli::mcp_serve` is the server (§5.9).
 
+**M7 is done.** The CLI surface of §5.12 is complete: `minion config show|path` (`config_cmd.rs`),
+`minion doctor` (`doctor.rs`), and the global `--quiet/-q`, `--resume <session>`, `--max-iterations`
+flags, with the documented exit codes (`main.rs::exit_code`, asserted by a unit test). The audit
+trail now carries the *result* of each call, not just the decision: `RecordingGate` holds an allowed
+row until `ToolGate::record_outcome` finishes it, so one row carries decision + outcome + duration,
+plus the session and turn (`minion-core/src/policy.rs`, `minion-store/src/approvals.rs`).
+`/cost` aggregates per conversation through the new `session_usage` table (schema v2). A log sink
+(`minion-cli/src/logging.rs`) masks credentials and `Bearer` tokens before anything is written
+(NFR-9). Packaging is `build.rs` (git SHA + features in `--version`), `install.sh`, and a `Makefile`
+with `make dist`. The NFR numbers are measured in `NFR.md`.
+
 `default_registry` takes a second argument, an `Arc<Store>`, because the memory and cron tools need
 one, and a third, a `CronContext`, carrying the clock and default timezone the `cron_*` tools use.
 This is why `minion-tools` depends on `minion-store` and `minion-cron`; the store is opened *before*
@@ -80,6 +91,12 @@ cargo +1.89.0 test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result
 cargo +1.89.0 clippy --all-targets -- -D warnings    # lint gate; currently clean
 cargo +1.89.0 fmt --all
 ./target/debug/minion --help
+./target/debug/minion --version                       # version, git SHA, features
+./target/debug/minion doctor                          # env / config / db / provider
+./target/debug/minion config show                     # effective config, redacted
+make dist                                             # per-target release tarballs + .sha256
+./install.sh --from target/release/minion --prefix ~/.local
+cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-musl  # see NFR.md for the musl CC
 ```
 
 `cargo test -p minion-mcp` needs no network, but it *does* spawn processes: the tests run
@@ -434,6 +451,50 @@ behaviour is `StopReason::ToolBudget`, `AgentEvent::Notice`, and the per-turn re
   returning, and it cannot handshake with a client that does not exist yet — awaiting it deadlocks.
   The fake provider is injected through `Runtime::build`'s `ProviderFactory`, so no network is needed.
 
+## Audit and redaction rules (M7)
+
+- **One row per tool call, written once.** `RecordingGate` writes a refusal as it happens
+  (`outcome = denied`), but holds an *allowed* decision until `ToolGate::record_outcome` reports how
+  the call ended. The row therefore carries `decision` **and** `outcome`/`duration_ms`; writing the
+  allow row at `check` time would either lose the result or duplicate the row. `Agent::run` stamps
+  `begin_turn(session_id, turn_id)` once per turn, and `Agent::dispatch` times the invoke — if you
+  add a tool-call path, it must go through `dispatch` or its audit row never gets an outcome.
+- **`record_outcome` only finishes the row for the tool that was allowed.** A pending row for
+  `read_file` is not credited to a `write_file` outcome; it is dropped rather than mislabelled.
+- **The audit write is best-effort and never fails the turn** (`ApprovalStore::audit` swallows the
+  error). Do not make the audit a precondition for running a tool.
+- **Redaction is a property of the sink, not the call site.** `logging::RedactingMakeWriter` scrubs
+  every line: the resolved API key, the configured env var's *value*, secret-shaped header values,
+  and the token after any `Bearer`. A new `tracing` call cannot leak by forgetting to be careful —
+  but a **new sink** must go through the same writer, or it will.
+- **`logging.file` is scrubbed too.** The writer tees to both stderr and the file, redacting once.
+- **A bare `[redacted]` marker is the only thing written**; never log the raw value and redact later.
+
+## Packaging rules (M7)
+
+- **`--version` is assembled in `version.rs` from stamps `build.rs` writes.** It prints
+  `<version> (<git sha> <commit date>) [features: cron,guard,mcp,update]`, and `minion update` parses
+  exactly that line back out of a downloaded binary, so the shape is a contract, not cosmetics: M7
+  shipped a second shape (`(<sha>; features: …)`) and merging the two milestones left one.
+  Never hard-code the SHA; a source tarball with no `.git` reports `unknown` on purpose.
+- **`build.rs` must list every path that moves with a commit.** `.git/HEAD` holds a ref *name* on a
+  branch, not a commit, so watching it alone leaves the baked SHA stale on every incremental build —
+  the release then names the wrong commit. It watches `.git/HEAD`, `.git/refs` (a directory: cargo
+  re-scans it) and `.git/packed-refs`, plus `MINION_GIT_SHA`/`MINION_GIT_DATE`/`GITHUB_SHA` so the
+  release workflow can inject the commit. `cli_surface.rs`'s
+  `version_reports_the_git_sha_and_enabled_features` compares against `git rev-parse --short=12 HEAD`
+  so a stale SHA fails the suite instead of shipping.
+- **The `mcp` and `cron` cargo features are compile-time flags reported by `--version`, but they do
+  not yet remove code**: both default on, and today a `--no-default-features` build still contains
+  both subsystems. That is a documented gap (see "Known gaps"), not a lie: the feature list states
+  what the build was *configured* with. Do not claim a reduced build until the cfg-gating is real.
+- **Config and database paths are created `0600`/`0700`.** `write_private_file` and `Store::open`
+  tighten permissions *before* content is written; `doctor` warns when a private file is group- or
+  world-readable. Keep the secret out of the config file, always.
+- **`make dist` is the release layout** `install.sh` expects: `dist/minion-<version>-<target>.tar.gz`
+  plus a `.sha256`. The Linux musl targets need a musl C compiler — see `NFR.md` for the no-root
+  recipe used on this host.
+
 ## Memory rules
 
 - **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and
@@ -512,9 +573,18 @@ behaviour is `StopReason::ToolBudget`, `AgentEvent::Notice`, and the per-turn re
 
 ## Known gaps (don't mistake these for bugs)
 
-- The CLI has `run`, `init`, `session`, `cron`, `mcp list` / `mcp tools` / `mcp serve`, and the
-  default REPL. There is still no `doctor` and no `config` subcommand, so §5.12's CLI surface is only
-  partly built.
+- The CLI surface of §5.12 is now complete: `run`, `init`, `config show|path`, `doctor`, `session`,
+  `cron`, `mcp list` / `mcp tools` / `mcp serve`, and the default REPL, plus the global flags
+  (`--quiet/-q`, `--resume`, `--max-iterations`). What is *not* built is a daemon that runs cron jobs
+  while no session is open — cron is in-process by design (D5/R6).
+- **The `mcp`/`cron` cargo features do not gate code yet.** They exist and `--version` reports them,
+  but a `--no-default-features` build still compiles both subsystems; the cfg-gating across
+  `setup.rs`/`run.rs`/`repl.rs` is deferred. Treat the feature list as "how the build was
+  configured", not "what was compiled out".
+- **`minion doctor` needs the provider to answer to be fully green.** `/models` is optional in the
+  OpenAI-compatible world, so a non-auth 4xx counts as reachable; an endpoint that answers nothing
+  useful on `/models` is still reported as up. The probe is a reachability and credential check, not
+  a capability check.
 - **`mcp_call` is not implemented.** §5.5 lists a generic `mcp_call(server, tool, arguments)` escape
   hatch. The per-server approval policy keys on a tool *name*, so a generic tool would either have to
   be special-cased to read `args.server` for its decision, or would let a server marked `deny` be

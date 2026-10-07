@@ -10,7 +10,7 @@ already cost time, for anyone (human or agent) working on this next.
 
 ## Status
 
-Milestones M0 through M6 are done. What works today:
+Milestones M0 through M7 are done. What works today:
 
 - **Streaming agent loop** against any OpenAI-compatible endpoint
 - **Eleven built-in tools** — `read_file`, `edit_file`, `apply_patch`, `write_file`,
@@ -40,23 +40,40 @@ Milestones M0 through M6 are done. What works today:
   (shell execution and file writes are opt-in flags, printed at startup)
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
 - **`minion init`** — one command from a bare machine to a working config
+- **`minion config show|path`** and **`minion doctor`** — inspection and a one-command health check
+  that exits `3` when the backend does not answer
+- **Observability** — an audit row for every tool decision *and its outcome*, a per-session `/cost`,
+  and a log sink that masks credentials (`NFR.md`)
 - **Self-update** — `minion update` checks a release channel, verifies the download against
   `checksums.txt` and the commit it embeds, and replaces the installed binary atomically, keeping the
   previous one for `--rollback`
 - **Markdown rendering** on a terminal, including tables
 
-Not built yet: `minion doctor`, `minion config`, and a daemon that runs cron jobs while no session is
-open (that is M7).
+Every non-functional target was measured rather than assumed; the numbers and the
+commands behind them are in [`NFR.md`](NFR.md).
+
+Still not built: a daemon that runs cron jobs while no session is open (`cron` is
+in-process by design — see `AGENTS.md`).
 
 ## Install
 
 Needs Rust 1.89 or newer (the code uses let-chains, so edition 2024).
 
 ```sh
-cargo install --path crates/minion-cli
+cargo install --path crates/minion-cli     # from a checkout
 ```
 
-Or build in place with `cargo build`; the binary lands at `target/debug/minion`.
+Or with the installer, which fetches a release tarball for this host and
+checksum-verifies it, or installs a binary you already built:
+
+```sh
+./install.sh                    # download the release for this host
+./install.sh --from target/release/minion --prefix ~/.local
+```
+
+`make dist` builds the per-target tarballs (`dist/minion-<version>-<target>.tar.gz`)
+and their `.sha256` that `install.sh` expects; `make release` builds this host's
+binary. Build in place with `cargo build`; the binary lands at `target/debug/minion`.
 
 Prebuilt binaries are published as assets of a tagged GitHub release; `minion update` (below) installs
 them, and there is nothing to do by hand once one exists.
@@ -73,7 +90,23 @@ minion 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
 minion init                     # pick a preset, paste a token, done
 minion                          # REPL
 minion run "summarize the TODOs" # one shot
+minion doctor                   # env, config, database, provider reachability
+minion config show              # the effective config, secrets redacted
+minion config path              # where config, credentials and the database live
 ```
+
+Global flags worth knowing:
+
+```
+--resume <SESSION>     continue a stored conversation (id, prefix, or position)
+--max-iterations <N>   override agent.max_iterations for one run
+--quiet/-q             no banner; warnings and results only
+--json                 machine-readable output for one-shot and management commands
+```
+
+Exit codes: `0` success · `1` a turn failed · `2` usage/config error · `3`
+provider or auth error · `4` refused · `5` internal error. `doctor` uses `3` when
+the backend does not answer.
 
 `init` writes a config to your state directory and the API key to a separate
 `0600` credentials file. **The config never contains the secret** — project
@@ -350,6 +383,31 @@ gh release view v0.1.0                 # assets: the six minion-* binaries plus 
 minion update --check                  # exits 0 (up to date) or 1 (update available)
 minion update --check --json           # installed, latest, asset and the commit the release declares
 ```
+
+## Observability
+
+Every tool decision is written to the `audit_log` table — the tool, its risk
+class, the subject the rules saw, whether it was allowed or denied, how it ended
+(`ok`, `error`, `denied`) and how long it took. An allowed call's row is written
+only once the tool has finished, so the decision and its result are always the
+same row; a refusal is a finished decision and is written as it happens. Each row
+also carries the conversation and provider round-trip it belonged to.
+
+```sh
+sqlite3 ~/.local/state/minion/minion.db \
+  "SELECT ts, tool, decision, outcome, duration_ms FROM audit_log ORDER BY id DESC LIMIT 20"
+```
+
+`/cost` in the REPL reports token usage **per session** (persisted in
+`session_usage`), not just for the process that happens to be running, so resuming
+a conversation shows its real total.
+
+Logs go to stderr, and every line is scrubbed before it is written: the resolved
+API key, the value of the configured key environment variable, any
+`[provider.headers]` value whose name looks like a credential, and the token half
+of any `Bearer <token>` are replaced with `[redacted]`. This happens in the sink,
+so it does not depend on any call site remembering to be careful. Set
+`[logging] file` to also write the (scrubbed) log to a file.
 
 ## Safety model
 

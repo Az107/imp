@@ -21,8 +21,9 @@ pub async fn one_shot(
     config: &Config,
     cwd: &Path,
     prompt: String,
+    resume: Option<&str>,
 ) -> Result<StopReason> {
-    let mut session = setup::build(cli, config, cwd, None).await?;
+    let mut session = setup::build(cli, config, cwd, resume).await?;
 
     // Jobs fire while minion runs, one-shot included: the scheduler is
     // in-process (D5), so this is the same service the REPL starts.
@@ -69,7 +70,18 @@ pub async fn one_shot(
 
     session.persist_since(turn_start).await?;
 
-    if !cli.json {
+    // Persist the turn's token usage against the session, so `/cost` and
+    // `minion session` can aggregate it later without this process (§7). A
+    // failure here must not lose the answer, so it is only logged.
+    if let Err(err) = session
+        .store
+        .record_usage(&session.session_id, outcome.usage)
+        .await
+    {
+        tracing::warn!(error = %err, "could not record token usage");
+    }
+
+    if !cli.json && !cli.quiet {
         // stderr, so `minion run ... > answer.txt` stays clean.
         eprintln!(
             "session {} · resume with: minion session resume {}",
@@ -138,4 +150,39 @@ fn terminal_width() -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|width| *width >= 20)
         .unwrap_or(80)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown::Style;
+    use clap::Parser;
+
+    /// NFR-8: piped output is never rendered, so `minion run … > out.md` keeps
+    /// the markdown source. A test process has no terminal on stdout.
+    #[test]
+    fn piped_output_is_not_rendered() {
+        let cli = Cli::parse_from(["minion", "run", "hi"]);
+
+        assert_eq!(style_for(&cli), Style::plain());
+    }
+
+    /// NFR-8: colour is refused without a terminal, and neither `--no-color`
+    /// nor `NO_COLOR` can make a pipe coloured in the first place.
+    #[test]
+    fn colour_is_refused_without_a_terminal() {
+        let cli = Cli::parse_from(["minion", "run", "hi"]);
+
+        assert!(!colour_enabled(&cli));
+    }
+
+    /// NFR-8: disabling colour keeps the layout, so a `NO_COLOR` user still
+    /// gets aligned tables rather than a wall of raw markdown.
+    #[test]
+    fn no_color_keeps_the_layout_and_drops_the_escapes() {
+        let style = Style::rendered(false, 80);
+
+        assert!(style.enabled, "markdown still renders");
+        assert!(!style.color, "but with no escapes");
+    }
 }
