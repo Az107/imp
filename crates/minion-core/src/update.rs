@@ -886,21 +886,44 @@ mod tests {
     // ---------------------------------------------------------------- naming
 
     #[test]
-    fn the_asset_name_matches_the_published_scheme() {
+    fn the_asset_table_is_exactly_the_six_published_names() {
+        // The release pipeline publishes these six assets (M9.1). The names are
+        // the contract between the two halves: `minion update` asks for
+        // `<prefix>-<os>-<arch>` and a release that publishes anything else is a
+        // 404 to it, not a fallback. Pinning the whole table here means the
+        // workflow and this mapping cannot drift apart unnoticed.
+        let table = [
+            ("linux", "x86_64", "minion-linux-amd64"),
+            ("linux", "aarch64", "minion-linux-arm64"),
+            ("macos", "x86_64", "minion-darwin-amd64"),
+            ("macos", "aarch64", "minion-darwin-arm64"),
+            ("windows", "x86_64", "minion-windows-amd64"),
+            ("windows", "aarch64", "minion-windows-arm64"),
+        ];
+        for (os, arch, expected) in table {
+            assert_eq!(
+                asset_for("minion", os, arch).unwrap(),
+                expected,
+                "the asset name for {os}/{arch} moved"
+            );
+        }
+
+        // Fail closed on everything else — including the near misses: the OS is
+        // `macos`, never `darwin`, and the arch is `x86_64`/`aarch64`, never the
+        // asset spellings `amd64`/`arm64`.
+        for os in ["darwin", "macosx", "win32", "freebsd", "sunos"] {
+            assert!(asset_for("minion", os, "x86_64").is_err(), "os={os}");
+        }
+        for arch in ["amd64", "arm64", "x86", "arm", "riscv64"] {
+            assert!(asset_for("minion", "linux", arch).is_err(), "arch={arch}");
+        }
+
+        // The prefix is passed through verbatim, so a renamed channel does not
+        // silently keep the old names.
         assert_eq!(
-            asset_for("minion", "linux", "x86_64").unwrap(),
-            "minion-linux-amd64"
+            asset_for("other", "linux", "x86_64").unwrap(),
+            "other-linux-amd64"
         );
-        assert_eq!(
-            asset_for("minion", "linux", "aarch64").unwrap(),
-            "minion-linux-arm64"
-        );
-        assert_eq!(
-            asset_for("minion", "macos", "aarch64").unwrap(),
-            "minion-darwin-arm64"
-        );
-        assert!(asset_for("minion", "sunos", "x86_64").is_err());
-        assert!(asset_for("minion", "linux", "riscv64").is_err());
     }
 
     #[test]
