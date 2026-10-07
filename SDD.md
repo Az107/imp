@@ -1171,6 +1171,10 @@ minion init [--check] [--project] [--force] [--non-interactive]
                                        # first-run setup for the model backend (§5.1.1)
 minion config show|path                # read-only; `config init` aliases `minion init`
 minion doctor                          # env, config, db, provider reachability
+minion update [--check] [--yes] [--force] [--rollback]
+                                       # check a release channel and replace the installed
+                                       # binary (§9); `--check` writes nothing and exits 1
+                                       # when an update is available
 
 Global options:
   --model <NAME>        --base-url <URL>      --api-key-env <VAR>
@@ -1182,7 +1186,7 @@ Global options:
   --config <FILE>       --db <FILE>
 ```
 
-**Exit codes:** `0` success · `1` turn failed · `2` usage error · `3` provider/auth error · `4` refused (policy denied in non-interactive mode, or an operation declined to proceed — e.g. `init` against an existing config without `--force`) · `5` internal error.
+**Exit codes:** `0` success · `1` turn failed, or `minion update --check` found an update available · `2` usage error · `3` provider/auth error, or an update could not reach its release channel · `4` refused (policy denied in non-interactive mode, or an operation declined to proceed — e.g. `init` against an existing config without `--force`, an update whose checksum or commit did not verify, or one cancelled at the prompt) · `5` internal error.
 
 ---
 
@@ -1250,10 +1254,46 @@ For each capability, an operator should be able to answer "who can trigger this?
 
 ## 9. Packaging and distribution
 
-- `cargo build --release` produces one binary; `cargo-dist` or a Makefile builds `x86_64`/`aarch64` for macOS and Linux (musl static for Linux).
+- `cargo build --release` produces one binary; a release workflow builds the platform targets and publishes them as assets of a tagged GitHub release, with a `checksums.txt` alongside. (The workflow itself is a separate deliverable; this section states the contract it must meet.)
 - Homebrew tap, `cargo install minion-cli`, and a curl installer script.
-- Version reporting via `minion --version` including git SHA and enabled features (`mcp`, `cron`).
+- **Version reporting.** `minion --version` prints the workspace version, the git SHA and commit date the binary was built from, and the capability families compiled in:
+
+  ```
+  minion 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
+  ```
+
+  The stamps are embedded at compile time (`minion-cli/build.rs`), so `--version` needs no git, no network and no config, and it degrades to `unknown` rather than failing when git is absent. `minion update` reads the same line back out of a downloaded binary to tie it to a commit.
 - Config/db paths created on first run with `0600`/`0700` permissions.
+
+### 9.1 `minion update`
+
+`update` is the self-update path: it asks a release channel what the latest version is and, when it is newer, downloads the prebuilt binary for the current platform, verifies it, and replaces the installed one.
+
+**Channel.** A GitHub-compatible releases API, configured under `[update]`:
+
+```toml
+[update]
+api_url = "https://api.github.com"   # or a mirror; https, or http only on loopback
+repo = "Az107/minion"                # owner/name
+asset_prefix = "minion"              # assets are `<prefix>-<os>-<arch>` and `checksums.txt`
+```
+
+No token is sent: the repository is public. A `401`/`403`/`404` is reported as "this works without a token only for a public repository" rather than retried, and authentication is deliberately not implemented (D23).
+
+**What it installs.** Only the asset whose name is `<prefix>-<os>-<arch>` for the running platform (`linux`/`darwin`/`windows` × `amd64`/`arm64`). A release without that asset is a refusal, not a best-effort choice among the others.
+
+**Verification, in order, before anything is replaced:**
+
+1. The `checksums.txt` asset of the *same release* is fetched and the downloaded binary's SHA-256 must match its entry; a mismatch aborts with the binary untouched. The hash is computed in-tree (`minion-core::sha256`) so the check adds no dependency.
+2. The commit the release declares (`target_commitish` as a hex SHA, or a `build-commit:` line in the notes) must match the SHA the downloaded binary reports for `--version`. A release that declares no commit is refused rather than trusted, and a binary reporting a different commit is not installed.
+
+**Replacement.** The verified bytes are written to a staging file beside the target and moved over it with `rename()`, which is atomic and works for a running binary on Linux. The previous binary is kept as `minion.old-<version>`, which `--rollback` restores (keeping the replaced one in turn). The target is `current_exe()`, canonicalized, or `$MINION_UPDATE_BINARY` when set. Nothing else is touched: not the config, not the database, not the credentials file.
+
+**When the directory is not writable**, minion does not elevate. The verified binary is staged under the temp directory and the operator is handed the two literal commands to run with `sudo` (back up first, then install), exiting `4`.
+
+**Consent.** Without `--yes` and without a terminal, nothing is installed: the same fail-closed rule as the rest of the tool. On a terminal the release notes are shown and one `y`/`yes` proceeds.
+
+**Flags.** `--check` reports installed/remote/asset and writes nothing (`0` up to date, `1` update available); `--force` reinstalls the current version; `--rollback` restores the most recent backup without contacting the channel; `--json` emits one machine-readable object. `--yes` is the global consent flag.
 
 ---
 
@@ -1271,6 +1311,7 @@ For each capability, an operator should be able to answer "who can trigger this?
 | M5 — MCP client | done | External servers, namespaced tools, per-server policy | External tool callable with approval |
 | M6 — MCP server | done | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
 | M7 — Hardening | | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met; installers published |
+| M8 — Self-update | done | `minion update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
 
 ---
 
@@ -1387,3 +1428,4 @@ than editing individual tools.
 | D20 | The tool catalogue the model sees is read live from a `ToolCatalog`, and `lazy` defers a server's spawn to the first turn rather than hiding its tools | §5.10 asks for two things that a registry frozen at session assembly cannot both have: the servers are "spawned at startup", and a server that failed is "retried on the next turn". A `Vec<Box<dyn Tool>>` built once can do neither — a retry that cannot re-add a tool is not a retry. So the registry keeps its registered tools and *consults* a catalogue on every read of the tool list; an MCP failure adds or removes entries in a structure that changes under the frozen `Arc<ToolRegistry>` every caller already holds. That also settles shadowing by construction rather than by convention: registered tools are enumerated first and a name already present is skipped, so a server cannot publish a name a built-in owns, and two servers cannot fight over one. `lazy` is the one place where a literal reading had to be traded for a useful one. "Spawned lazily on first use" cannot mean "hidden until a tool is called", because a tool cannot be called before it is listed and a server cannot list tools before it is spawned — the two requirements would deadlock. It therefore means the spawn is deferred from session assembly to the first turn: opening a session (or `minion mcp list`, which is an explicit ask) does not start a process, and the tools reach the catalogue from that point rather than being invisible. The alternative — lazy servers reachable only through a generic `mcp_call` — was rejected because it moves the policy decision off the tool name the per-server policy keys on. `mcp_call` itself is deferred for that reason; the flattened tools are the surface §5.10 describes as primary |
 | D21 | An external tool is always `Risk::Network`, and a server's `policy` substitutes the global default *and* the non-interactive decision for its own tools | §5.5 says an external tool inherits the target's declared risk with `Network` as a floor. MCP declares risk only in `ToolAnnotations`, and the protocol's own documentation says a client must not make tool-use decisions from them — they come from a server the operator has not vouched for (T6). Since the floor is `Network`, an inherited hint could only ever *lower* the class, never raise it, so the floor is the whole rule and the annotations are ignored. The consequence is deliberate: every external call is gated at least as strictly as an outbound HTTP request, and D15 puts `Network` on the side of the line that a missing terminal refuses. The per-server policy then has to mean something for an unattended run, or "a trusted local server can be `auto`" would be false the moment a pipe is involved. It therefore substitutes both fallbacks — `policy.default` and `policy.noninteractive` — and nothing else: deny rules, allow rules and the command classifier still run first and still win, so a family marked `auto` cannot resurrect a refusal that already happened, and a family marked `deny` refuses its tools outright. This is the trust boundary §6.3 describes applied literally: each MCP client is its own entry point, and the config states its policy in one place |
 | D22 | The MCP server's disabled capabilities are *listed and refused*, not absent, and the exposed shell tool is decided under the name `run_command` | §5.9's table says `agent_run_command` and `agent_write_file` are "denied unless" the flag is set, and T5's mitigation is a startup banner — both describe a capability that exists and is refused, not one that is missing. A hidden tool would leave the host unable to tell "minion cannot do this" from "I mistyped the name", and it would make the denial invisible in the audit trail. So the two tools are always in the list, and without their flag the engine carries a deny rule that refuses every call and records the refusal. The name the *gate* sees is the real tool's — `run_command`, `write_file` — because the policy engine is not a second, weaker world: an operator's existing `run_command` deny rules keep protecting the MCP surface, the classifier still sees the command it is judging, and `subject_for`/`pattern_for` still extract the right subject. The `agent_` prefix is a naming convention of this surface, not a second identity, and the audit row therefore names the tool that actually ran. The gate is non-interactive (`stdin` is the protocol pipe, so no prompt can be shown), and an enabled family substitutes the non-interactive fallback through `ToolPolicy` (D21) — deny and allow rules still run first, so turning a flag on grants nothing that was refused. `agent_ask`'s inner agent is restricted to the read-only subset of the built-in registry, filtered by `Risk::is_observation` rather than by a list of names, so the default surface cannot drift wider than the read/write line itself. The scheduler is deliberately not started here: a job created over MCP is stored and runs under the non-interactive cron gate the next time a process with a scheduler opens the database, which keeps `mcp serve` a protocol server rather than a daemon |
+| D23 | `minion update` installs a **prebuilt binary from a release channel**, never compiles on the target, and verifies it with two independent checks before replacing anything | The alternative — `git pull` and `cargo build` in place — was rejected because it turns an update into a build environment problem: it needs a toolchain on every machine, it needs a writable checkout, and a failure halfway leaves a half-built tree rather than a known-good binary. A prebuilt asset is one file that either matches or does not. The channel is a GitHub-compatible releases API with prebuilt per-platform assets and a `checksums.txt`, which is the shape `Az107/space-elevator` already publishes, so there is a working precedent to mirror. Two checks, not one, because each closes a different hole: the **checksum** binds the bytes to the release, and the **commit** binds the release to a revision, so a swapped asset that comes with a swapped manifest still fails the commit check. The commit is read from `target_commitish` when it is a hex SHA, or from a `build-commit:` line in the notes otherwise; a release that declares neither is refused rather than installed on a guess, which is the fail-closed reading of §5.12's "refused" exit. The hash is SHA-256 implemented in-tree (`minion-core::sha256`) rather than taken from `sha2`: the algorithm is 60 lines, the tests pin the NIST vectors, and it keeps `Cargo.lock` free of a new external crate, which matters for a binary whose whole selling point is a small dependency surface. The replacement is a staging file plus `rename()` so the path is never a half-written file, and the previous binary is kept as `minion.old-<version>` — which is also what `--rollback` restores, so undo does not need the network. Nothing else is touched: not the config, not the database, not the credentials file, because an update replaces exactly one file and anything more would make it an installer with opinions. When the directory is not writable, minion does not elevate and does not silently skip: it stages the verified bytes where it can write and prints the two literal `sudo` commands, matching the rule that Hermes never runs `sudo`. Two smaller decisions are recorded here too. `https` is required, with plain `http` permitted only to a literal loopback host — the exception exists for a local mirror and a test fixture, and it mirrors the rule `http_fetch` already uses (D17). And the target defaults to `current_exe()` canonicalized, overridable with `$MINION_UPDATE_BINARY`, so an update can replace an installation other than the one currently running without becoming a privileged operation: whoever can set the environment already runs the code. `--check` stays read-only, which is why it exits `1` on "update available" rather than `0`: a script asking "should I update?" needs the answer in the status, not in the prose |

@@ -19,6 +19,7 @@ minion-mcp = { version = "0.1.0", path = "../minion-mcp" }
 minion-provider = { version = "0.1.0", path = "../minion-provider" }
 minion-store = { version = "0.1.0", path = "../minion-store" }
 minion-tools = { version = "0.1.0", path = "../minion-tools" }
+minion-update = { version = "0.1.0", path = "../minion-update" }
 pulldown-cmark = "0.13.4"
 rmcp = { version = "3.5.0", features = ["server", "transport-async-rw"] }
 rustyline = "18.0.1"

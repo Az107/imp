@@ -40,6 +40,8 @@ pub struct Config {
     pub cron: CronConfig,
     /// Consuming external MCP servers (SDD §5.10).
     pub mcp: McpConfig,
+    /// Self-update channel (SDD §9).
+    pub update: UpdateConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
 }
@@ -499,6 +501,35 @@ impl McpServerConfig {
     }
 }
 
+/// `[update]`: where `minion update` looks for a newer release (SDD §9).
+///
+/// The channel is a GitHub-compatible releases API serving prebuilt binaries.
+/// The defaults point at the public repository, which needs no token; `api_url`
+/// exists so a mirror (or a test fixture on `127.0.0.1`) can be used instead.
+/// The scheme is enforced at use: `https`, or plain `http` only to a literal
+/// loopback host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// API root, *without* `/repos/...`. GitHub is `https://api.github.com`.
+    pub api_url: String,
+    /// Repository in `owner/name` form.
+    pub repo: String,
+    /// Prefix of the published asset names. The platform suffix is appended as
+    /// `-<os>-<arch>`, e.g. `minion-linux-arm64`.
+    pub asset_prefix: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            api_url: "https://api.github.com".to_string(),
+            repo: "Az107/minion".to_string(),
+            asset_prefix: "minion".to_string(),
+        }
+    }
+}
+
 /// Log destination and verbosity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -698,6 +729,32 @@ impl Config {
             return Err(Error::Config(format!(
                 "mcp.server.transport must be \"stdio\", was `{}`",
                 self.mcp.server.transport
+            )));
+        }
+        // The update channel is a network endpoint whose response decides what
+        // binary gets installed, so its shape is checked here rather than at the
+        // first request: a misconfigured channel fails before anything is
+        // downloaded, and plain `http` is refused except on loopback.
+        if self.update.api_url.trim().is_empty() {
+            return Err(Error::Config(
+                "update.api_url must not be empty".to_string(),
+            ));
+        }
+        if !crate::update::url_is_permitted(&self.update.api_url) {
+            return Err(Error::Config(format!(
+                "update.api_url must be https (or http on loopback), was `{}`",
+                self.update.api_url
+            )));
+        }
+        if self.update.asset_prefix.trim().is_empty() {
+            return Err(Error::Config(
+                "update.asset_prefix must not be empty".to_string(),
+            ));
+        }
+        let repo = self.update.repo.trim();
+        if repo.split('/').count() != 2 || repo.split('/').any(|part| part.trim().is_empty()) {
+            return Err(Error::Config(format!(
+                "update.repo must be `owner/name`, was `{repo}`"
             )));
         }
         Ok(())

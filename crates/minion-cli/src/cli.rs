@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 /// A minimal, Unix-native AI agent harness.
 #[derive(Debug, Parser)]
-#[command(name = "minion", version, about, long_about = None)]
+#[command(name = "minion", version = crate::version::VERSION, about, long_about = None)]
 pub struct Cli {
     /// Model to use, overriding the config file.
     #[arg(long, global = true)]
@@ -91,6 +91,30 @@ pub enum Command {
 
     /// Inspect the external MCP servers minion consumes (§5.10, §5.12).
     Mcp(McpArgs),
+
+    /// Check a release channel and replace the installed binary (§9).
+    Update(UpdateArgs),
+}
+
+/// Arguments for `minion update`.
+///
+/// `--yes` is the global consent flag, so it is not repeated here; without it,
+/// and without a terminal, nothing is installed.
+#[derive(Debug, Clone, clap::Args)]
+pub struct UpdateArgs {
+    /// Only report what is available. Writes nothing, and exits `1` when an
+    /// update is available.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Reinstall even when the installed version is already current.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Restore the most recent `minion.old-*` binary beside the target, instead
+    /// of contacting the release channel.
+    #[arg(long, conflicts_with = "check")]
+    pub rollback: bool,
 }
 
 /// Arguments for `minion mcp`.

@@ -12,6 +12,8 @@ mod repl;
 mod run;
 mod session;
 mod setup;
+mod update;
+mod version;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -62,6 +64,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
         Some(Command::Session(args)) => session::run(&cli, &config, args.clone()).await,
         Some(Command::Cron(args)) => cron::run(&cli, &config, args.clone()).await,
         Some(Command::Mcp(args)) => mcp::run(&cli, &config, &cwd, args.clone()).await,
+        Some(Command::Update(args)) => update::run(&cli, &config, args.clone()).await,
         Some(Command::Run { prompt }) => {
             let prompt = resolve_prompt(prompt)?;
             let stop = run::one_shot(&cli, &config, &cwd, prompt).await?;
@@ -130,14 +133,14 @@ fn init_logging(level: &str, format: LogFormat, verbose: u8) {
 }
 
 /// Exit codes documented in the SDD.
-fn exit_code(err: &Error) -> u8 {
+pub(crate) fn exit_code(err: &Error) -> u8 {
     match err {
         Error::Config(_) => 2,
         Error::Auth(_)
         | Error::Provider(_)
         | Error::RateLimit { .. }
         | Error::BadRequest { .. } => 3,
-        Error::Denied(_) => 4,
+        Error::Denied(_) | Error::Refused(_) => 4,
         _ => 5,
     }
 }

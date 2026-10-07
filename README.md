@@ -40,6 +40,9 @@ Milestones M0 through M6 are done. What works today:
   (shell execution and file writes are opt-in flags, printed at startup)
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
 - **`minion init`** — one command from a bare machine to a working config
+- **Self-update** — `minion update` checks a release channel, verifies the download against
+  `checksums.txt` and the commit it embeds, and replaces the installed binary atomically, keeping the
+  previous one for `--rollback`
 - **Markdown rendering** on a terminal, including tables
 
 Not built yet: `minion doctor`, `minion config`, and a daemon that runs cron jobs while no session is
@@ -54,6 +57,15 @@ cargo install --path crates/minion-cli
 ```
 
 Or build in place with `cargo build`; the binary lands at `target/debug/minion`.
+
+Prebuilt binaries are published as assets of a tagged GitHub release; `minion update` (below) installs
+them, and there is nothing to do by hand once one exists.
+
+`minion --version` reports what a running binary was built from:
+
+```
+minion 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
+```
 
 ## Use
 
@@ -222,6 +234,53 @@ Three things are worth knowing:
 
 Jobs created over MCP are stored in the same database, but `mcp serve` does not run the
 scheduler — they fire the next time a process that does (a REPL or `minion run`) opens it.
+
+## Update
+
+`minion update` checks a release channel and, when a newer version is published, downloads the
+prebuilt binary for your platform, verifies it, and replaces the installed one.
+
+```sh
+minion update --check     # report only; exits 1 when an update is available
+minion update             # prompts, then installs
+minion update --yes       # no prompt (required when stdin is not a terminal)
+minion update --force     # reinstall even if already current
+minion update --rollback  # restore the previous binary
+minion update --check --json
+```
+
+What it checks before replacing anything:
+
+1. **The checksum.** The downloaded binary must match its entry in the release's `checksums.txt`. A
+   mismatch aborts with the installed binary untouched.
+2. **The commit.** The downloaded binary is run with `--version`, and the SHA it reports must match the
+   commit the release declares. A release that declares no commit is refused rather than trusted.
+
+Only then is the new binary moved over the old one with `rename()`, which is atomic. The previous
+binary is kept beside it as `minion.old-<version>`, which is what `--rollback` restores.
+
+Three things are worth knowing:
+
+- **`--check` writes nothing.** It reports the installed version, the latest, and the asset for your
+  platform, and exits `0` when up to date or `1` when an update is available.
+- **Nothing is installed unattended without `--yes`.** With no terminal there is no prompt, so minion
+  refuses rather than guessing — `printf y | minion update` does not update anything.
+- **If the install directory is not writable, minion does not call `sudo`.** It verifies and stages the
+  binary where it can write, then prints the two commands for you to run as an administrator (back up
+  the old binary, then install the new one).
+
+The channel is a GitHub-compatible releases API and needs no token — the repository is public. To point
+at a mirror:
+
+```toml
+[update]
+api_url = "https://api.github.com"   # https, or http only on loopback
+repo = "Az107/minion"
+asset_prefix = "minion"              # assets are `<prefix>-<os>-<arch>` plus checksums.txt
+```
+
+An update replaces exactly one file. It does not touch the config, the database, or the credentials
+file.
 
 ## Safety model
 

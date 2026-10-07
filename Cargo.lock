@@ -1168,6 +1168,7 @@ dependencies = [
  "minion-provider",
  "minion-store",
  "minion-tools",
+ "minion-update",
  "pulldown-cmark",
  "rmcp",
  "rustyline",
@@ -1300,6 +1301,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "minion-update"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "minion-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 
