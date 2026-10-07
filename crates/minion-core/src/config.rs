@@ -890,7 +890,14 @@ mod tests {
     fn defaults_match_the_spec() {
         let config = Config::default();
         assert_eq!(config.agent.max_iterations, 25);
-        assert_eq!(config.exec.output_cap_bytes, 262_144);
+        assert_eq!(
+            config.exec.output_cap_bytes, 262_144,
+            "NFR-4: a 256 KiB cap"
+        );
+        assert_eq!(
+            config.exec.default_timeout_secs, 120,
+            "NFR-5: a two-minute default command timeout"
+        );
         assert_eq!(config.policy.default, Decision::Ask);
         assert_eq!(config.policy.noninteractive, Decision::Deny);
         assert!(!config.workspace.follow_symlinks);

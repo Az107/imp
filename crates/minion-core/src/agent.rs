@@ -102,6 +102,8 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     options: AgentOptions,
     gate: Option<Arc<dyn ToolGate>>,
+    /// Conversation id, so an auditing gate can stamp the rows it writes.
+    session_id: Option<String>,
 }
 
 impl Agent {
@@ -116,6 +118,7 @@ impl Agent {
             tools,
             options,
             gate: None,
+            session_id: None,
         }
     }
 
@@ -125,6 +128,15 @@ impl Agent {
     /// registering them is expected to set this.
     pub fn with_gate(mut self, gate: Arc<dyn ToolGate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Name the conversation this agent works on.
+    ///
+    /// The gate is told this at the start of each turn so an audit trail can
+    /// record the session a decision belonged to (§7).
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 
@@ -146,6 +158,14 @@ impl Agent {
         let mut usage = Usage::default();
         let mut iterations = 0u32;
         let mut last_text: Option<String> = None;
+
+        // One turn id per `run`, so every audit row this turn writes can be
+        // grouped back to it. Generated before the loop so a cancelled turn
+        // still has one.
+        let turn_id = crate::new_session_id();
+        if let (Some(gate), Some(session_id)) = (&self.gate, &self.session_id) {
+            gate.begin_turn(session_id, &turn_id).await;
+        }
 
         loop {
             if cancel.is_cancelled() {
@@ -290,13 +310,21 @@ impl Agent {
             cancel,
         };
         let budget = tool.timeout();
-        match tokio::time::timeout(budget, tool.invoke(ctx, args)).await {
+        let started = std::time::Instant::now();
+        let result = match tokio::time::timeout(budget, tool.invoke(ctx, args)).await {
             Ok(result) => result,
             Err(_) => Err(Error::Tool {
                 tool: name.to_string(),
                 message: format!("timed out after {budget:?}"),
             }),
+        };
+        // The gate held this call's audit row on `check`; finishing it here is
+        // what makes the row carry both the decision and its result (§7).
+        if let Some(gate) = &self.gate {
+            gate.record_outcome(name, result.is_ok(), started.elapsed().as_millis() as u64)
+                .await;
         }
+        result
     }
 }
 

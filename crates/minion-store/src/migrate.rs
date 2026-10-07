@@ -10,10 +10,10 @@ use minion_core::error::{Error, Result};
 
 /// The schema version this build expects. A database newer than this is refused
 /// rather than silently misread.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Applied in order; never edited once released.
-const MIGRATIONS: &[&str] = &[BASELINE];
+const MIGRATIONS: &[&str] = &[BASELINE, SESSION_USAGE];
 
 /// Tables, indices, and the FTS triggers for `memory`.
 const BASELINE: &str = r#"
@@ -135,6 +135,19 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_session ON audit_log(session_id, ts);
 "#;
 
+/// v2: token usage per conversation, so `/cost` can aggregate a session rather
+/// than only the process that is currently running (§7). Added in M7.
+const SESSION_USAGE: &str = r#"
+CREATE TABLE session_usage (
+  session_id        TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens      INTEGER NOT NULL DEFAULT 0,
+  turns             INTEGER NOT NULL DEFAULT 0,
+  updated_at        TEXT NOT NULL
+);
+"#;
+
 /// Bring `conn` up to [`SCHEMA_VERSION`], creating the database if needed.
 ///
 /// Fails loudly on an unreadable file rather than starting with a half-applied
@@ -234,6 +247,40 @@ mod tests {
         assert_eq!(before, after, "migrations must be idempotent");
     }
 
+    /// An existing v1 database is brought up to v2 in place: the M7 migration
+    /// adds `session_usage` without disturbing what was already there.
+    #[test]
+    fn a_v1_database_gains_the_usage_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .unwrap();
+        conn.execute_batch(BASELINE).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let has_usage: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'session_usage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(has_usage, 1);
+    }
+
     #[test]
     fn a_newer_database_is_refused_rather_than_misread() {
         let conn = Connection::open_in_memory().unwrap();
@@ -266,6 +313,7 @@ mod tests {
             "memory",
             "memory_fts",
             "audit_log",
+            "session_usage",
         ] {
             let found: i64 = conn
                 .query_row(

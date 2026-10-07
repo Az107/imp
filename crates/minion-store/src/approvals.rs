@@ -57,14 +57,20 @@ impl ApprovalStore for StoreApprovals {
             .0
             .blocking(move |conn| {
                 conn.execute(
-                    "INSERT INTO audit_log (ts, tool, risk, decision, args_digest)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO audit_log
+                       (ts, session_id, turn_id, tool, risk, decision, args_digest, outcome,
+                        duration_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     rusqlite::params![
                         migrate::timestamp(),
+                        entry.session_id,
+                        entry.turn_id,
                         entry.tool,
                         entry.risk,
                         entry.decision,
                         entry.subject,
+                        entry.outcome,
+                        entry.duration_ms.map(|ms| ms as i64),
                     ],
                 )
                 .map(|_| ())
