@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
-use crate::provider::ToolSchema;
+use crate::provider::{ToolSchema, Usage};
 
 /// How dangerous a tool is.
 ///
@@ -88,6 +88,33 @@ impl ToolOutput {
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    /// Token usage a tool reports having spent *elsewhere*, or `None`.
+    ///
+    /// A delegating tool (a peer call, M10.2) spends tokens on a backend that is
+    /// not this turn's provider, so the loop cannot see them in the stream. The
+    /// tool puts them in its `metadata` under `usage` —
+    /// `{"prompt_tokens":…, "completion_tokens":…, "total_tokens":…}` — and the
+    /// loop folds them into the turn's usage, which is what `/cost` reads.
+    ///
+    /// Advisory only (R8): a missing, non-object or non-numeric value is
+    /// `None`, never an error, so a tool that forgets to report simply does not
+    /// count.
+    pub fn reported_usage(&self) -> Option<Usage> {
+        let usage = self.metadata.get("usage")?.as_object()?;
+        let field = |name: &str| -> u32 {
+            usage
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32
+        };
+        Some(Usage {
+            prompt_tokens: field("prompt_tokens"),
+            completion_tokens: field("completion_tokens"),
+            total_tokens: field("total_tokens"),
+        })
     }
 }
 
@@ -220,6 +247,16 @@ impl ToolRegistry {
     /// Add a tool. Registration order is the order schemas are advertised in.
     pub fn register(&mut self, tool: impl Tool + 'static) -> &mut Self {
         self.tools.push(Arc::new(tool));
+        self
+    }
+
+    /// Add a tool that is already shared.
+    ///
+    /// The same ordering rule as [`register`](Self::register), for a tool the
+    /// caller keeps a handle on — a peer delegation tool, whose connection the
+    /// session has to close on the way out (M10.2).
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.tools.push(tool);
         self
     }
 

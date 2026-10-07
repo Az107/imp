@@ -237,6 +237,12 @@ impl Agent {
 
                 match self.dispatch(&name, &arguments, cancel.clone()).await {
                     Ok(output) => {
+                        // A tool may have spent tokens on a backend this turn's
+                        // provider never saw — a peer call, for one. Fold the
+                        // value it reported into the turn's usage (R8, §5.13).
+                        if let Some(reported) = output.reported_usage() {
+                            usage.absorb(reported);
+                        }
                         let _ = sink.send(AgentEvent::ToolFinished {
                             name: name.clone(),
                             ok: true,
@@ -427,6 +433,34 @@ mod tests {
             Ok(ToolOutput::text(
                 args["text"].as_str().unwrap_or_default().to_string(),
             ))
+        }
+    }
+
+    /// A tool that spent tokens on a backend this turn's provider never saw —
+    /// a peer delegation (M10.2) — and reports them in its metadata.
+    struct Reporting;
+
+    #[async_trait]
+    impl Tool for Reporting {
+        fn name(&self) -> &'static str {
+            "peer__big_ask"
+        }
+        fn description(&self) -> &'static str {
+            "Delegate a brief to a peer."
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn risk(&self) -> Risk {
+            Risk::Network
+        }
+        async fn invoke(&self, _ctx: ToolCtx, _args: serde_json::Value) -> Result<ToolOutput> {
+            Ok(
+                ToolOutput::text("the peer's answer").with_metadata(serde_json::json!({
+                    "peer": "big",
+                    "usage": { "prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12 }
+                })),
+            )
         }
     }
 
@@ -719,5 +753,40 @@ mod tests {
         assert_eq!(request.model, "mock");
         assert_eq!(request.messages.len(), 1);
         assert_eq!(provider.request_count(), 1);
+    }
+
+    /// R8, §5.13: tokens a *tool* spent elsewhere join the turn's usage, which
+    /// is what `/cost` reads. The provider's own report is still counted, and
+    /// the two are added, not replaced.
+    #[tokio::test]
+    async fn a_tools_reported_usage_joins_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            Script::Events(vec![
+                tool_call("peer__big_ask", "{\"brief\":\"hi\"}"),
+                ChatEvent::Usage(crate::provider::Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 4,
+                    total_tokens: 7,
+                }),
+                done(FinishReason::ToolCalls),
+            ]),
+            Script::Events(vec![done(FinishReason::Stop)]),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Reporting);
+        let agent = agent(provider, tools, dir.path());
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut history = vec![Message::user("ask the peer")];
+
+        let outcome = agent
+            .run(&mut history, &sink, CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.usage.prompt_tokens, 3 + 5);
+        assert_eq!(outcome.usage.completion_tokens, 4 + 7);
+        assert_eq!(outcome.usage.total_tokens, 7 + 12);
+        // The value is advisory: the answer is still in the transcript.
+        assert_eq!(history[2].content.as_deref(), Some("the peer's answer"));
     }
 }
