@@ -296,13 +296,20 @@ A **push to `main`** does the following, in order:
    to agree — a release whose tag and embedded version disagree would make `minion update` offer the
    same release forever.
 3. **Runs the tests** (`cargo +1.89.0 test --workspace --locked`). A red tree publishes nothing.
-4. **Builds `linux/amd64` and `linux/arm64`** binaries: amd64 natively, arm64 cross-compiled with
-   `gcc-aarch64-linux-gnu`, both with the commit and date embedded (`MINION_GIT_SHA`/`MINION_GIT_DATE`).
-   The job is pinned to the `ubuntu-22.04` runner so the glibc floor of the binaries stays at 2.35
-   instead of moving when `ubuntu-latest` rotates.
-5. **Publishes a GitHub Release** at the derived tag with `minion-linux-amd64`, `minion-linux-arm64`
-   and `checksums.txt`, then verifies the release is not left as a draft and that the uploaded
-   `checksums.txt` matches the one built.
+4. **Builds the six targets** — `{linux, macOS, Windows} × {amd64, arm64}` — on a runner per target,
+   and runs each built binary with `--version` to assert it carries the release version and commit
+   (`MINION_GIT_SHA`/`MINION_GIT_DATE`). The Linux pair is built on the pinned `ubuntu-22.04` runner
+   (so the glibc floor of the binaries stays at 2.35 instead of moving when `ubuntu-latest` rotates);
+   linux/arm64 is cross-compiled with `gcc-aarch64-linux-gnu` and run under qemu. macOS and Windows
+   are built natively on their own runners — Apple's linker cannot be obtained on Linux, and
+   Windows/arm64 is built on the arm64 runner because an x64 host cannot execute an arm64 binary to
+   check it. The asset names are exactly the ones `minion update` looks up:
+   `minion-linux-amd64`, `minion-linux-arm64`, `minion-darwin-amd64`, `minion-darwin-arm64`,
+   `minion-windows-amd64`, `minion-windows-arm64` (the Windows ones are the bytes of the `.exe`,
+   renamed).
+5. **Publishes a GitHub Release** at the derived tag with the six assets and a `checksums.txt` that
+   covers them, then verifies the release is not left as a draft and that the uploaded `checksums.txt`
+   matches the one built.
 
 **So a normal release is: bump `[workspace.package].version` to the next patch in a commit and push it
 to `main`.** The bump is what step 2 checks; forgetting it fails the run rather than publishing a
@@ -317,22 +324,29 @@ git switch main && git pull
 git tag v0.2.0                       # or the version you need
 git push origin v0.2.0
 cargo +1.89.0 test --workspace --locked
-cargo +1.89.0 build --release --locked
+# Linux (this machine); macOS and Windows must be built on their own machines:
+cargo +1.89.0 build --release --locked                                   # linux/amd64
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-gnu
 mkdir -p dist
 cp target/release/minion                             dist/minion-linux-amd64
 cp target/aarch64-unknown-linux-gnu/release/minion   dist/minion-linux-arm64
-( cd dist && sha256sum minion-linux-* >checksums.txt )
+# ... plus, from macOS and Windows respectively:
+#   target/{x86_64,aarch64}-apple-darwin/release/minion     -> minion-darwin-{amd64,arm64}
+#   target/{x86_64,aarch64}-pc-windows-msvc/release/minion.exe -> minion-windows-{amd64,arm64}
+# All six must be present; `minion update` gets a 404 on a platform whose asset is missing,
+# and refuses the release outright if its manifest is missing (`checksums.txt` is not a
+# `minion-*` file, so the glob below does not pick it up — name it explicitly).
+( cd dist && sha256sum minion-* >checksums.txt )
 gh release create v0.2.0 --title v0.2.0 \
   --notes "build-commit: $(git rev-parse --short=12 HEAD)" \
-  dist/minion-linux-amd64 dist/minion-linux-arm64 dist/checksums.txt
+  dist/minion-* dist/checksums.txt
 ```
 
 **Verifying a release:**
 
 ```sh
-gh release view v0.1.0                 # assets: minion-linux-amd64, minion-linux-arm64, checksums.txt
+gh release view v0.1.0                 # assets: the six minion-* binaries plus checksums.txt
 minion update --check                  # exits 0 (up to date) or 1 (update available)
 minion update --check --json           # installed, latest, asset and the commit the release declares
 ```
