@@ -402,9 +402,25 @@ pub struct McpConfig {
 pub struct McpServerSection {
     /// Whether `minion mcp serve` is allowed to run at all.
     pub enabled: bool,
-    /// Transport. Only `stdio` exists: R5 makes the server and the REPL
-    /// mutually exclusive because both own stdin/stdout.
+    /// Transport. `stdio` (the default) owns stdin/stdout; `http` serves the
+    /// same surface over Streamable HTTP on `bind`. R5 makes the server and the
+    /// REPL mutually exclusive because both own stdin/stdout — with `http` the
+    /// server instead owns a socket, which is why the transport is a deliberate
+    /// config value and not a flag.
     pub transport: String,
+    /// Address `transport = "http"` listens on.
+    ///
+    /// Defaults to loopback. A non-loopback bind is fail-closed: it is refused
+    /// at load time unless a token is configured, because on a tailnet the token
+    /// — not the source address — is what authenticates a caller (see
+    /// [`Self::bind_socket`]).
+    pub bind: String,
+    /// Name of the environment variable holding the bearer token a client must
+    /// present. Only the *name* lives here, never the value.
+    pub token_env: String,
+    /// Path to the credentials file (`api_key = "…"`, mode 0600) holding the
+    /// bearer token. Only the *path* lives here.
+    pub token_file: String,
     /// Publish `agent_run_command` as a callable tool. `false` still lists it,
     /// but every call is refused by the policy engine.
     pub expose_exec: bool,
@@ -421,6 +437,9 @@ impl Default for McpServerSection {
         Self {
             enabled: true,
             transport: "stdio".to_string(),
+            bind: "127.0.0.1:8788".to_string(),
+            token_env: String::new(),
+            token_file: String::new(),
             expose_exec: false,
             expose_write: false,
             // §5.1's example has this on: scheduling is a `Write`, but the
@@ -429,6 +448,124 @@ impl Default for McpServerSection {
             expose_cron_write: true,
         }
     }
+}
+
+impl McpServerSection {
+    /// Whether `transport = "http"`.
+    pub fn is_http(&self) -> bool {
+        self.transport.trim().eq_ignore_ascii_case("http")
+    }
+
+    /// Whether a bearer token source is configured (name or path).
+    ///
+    /// This is what the bind policy keys on: it is the *configuration*, not the
+    /// resolved value, that has to be present for a non-loopback bind to be
+    /// allowed at load time. A named source that turns out to be empty is a
+    /// separate, later error ([`Self::bearer_token`]).
+    pub fn has_token_source(&self) -> bool {
+        !self.token_env.trim().is_empty() || !self.token_file.trim().is_empty()
+    }
+
+    /// The token clients must present, resolved from `token_env` then
+    /// `token_file`, using the same resolution the provider uses.
+    pub fn bearer_token(&self) -> Result<Option<String>> {
+        resolve_secret(
+            &self.token_env,
+            &self.token_file,
+            "MCP bearer token",
+            " (set `mcp.server.token_env` or `mcp.server.token_file`)",
+        )
+    }
+
+    /// The address `transport = "http"` listens on, after the bind policy.
+    ///
+    /// The rules, and why they exist:
+    ///
+    /// - **`0.0.0.0` and `::` are always refused.** They are not an address; they
+    ///   are every interface, the public one included. There is no tailnet bind
+    ///   that wants them.
+    /// - **A globally routable address is always refused.** minion's wide-area
+    ///   transport is the tailnet; a bind that reaches the public internet is a
+    ///   different decision, and not one this milestone makes.
+    /// - **Anything else non-loopback requires a token.** Loopback is a local
+    ///   process, so it needs nothing. A tailnet, LAN or link-local address can
+    ///   still be reached by another device, and there the only thing minion has
+    ///   is the bearer token — the source IP proves nothing, because any process
+    ///   on a tailnet node can open that socket. Without a configured token the
+    ///   server refuses to start rather than serving unauthenticated.
+    pub fn bind_socket(&self) -> Result<std::net::SocketAddr> {
+        let text = self.bind.trim();
+        let addr: std::net::SocketAddr = text.parse().map_err(|err| {
+            Error::Config(format!(
+                "mcp.server.bind must be an `IP:port` address, was `{text}`: {err}"
+            ))
+        })?;
+        let ip = addr.ip();
+
+        if ip.is_unspecified() {
+            return Err(Error::Config(format!(
+                "mcp.server.bind = `{text}` is a wildcard and would listen on the public \
+                 interface; bind the tailnet address (or 127.0.0.1 for local use) instead"
+            )));
+        }
+        if is_public_address(ip) {
+            return Err(Error::Config(format!(
+                "mcp.server.bind = `{text}` is a globally routable address; minion serves over \
+                 the tailnet, not the public interface"
+            )));
+        }
+        if !ip.is_loopback() && !self.has_token_source() {
+            return Err(Error::Config(format!(
+                "mcp.server.bind = `{text}` is not loopback, and no token is configured; \
+                 set `mcp.server.token_env` or `mcp.server.token_file` (fail-closed)"
+            )));
+        }
+        Ok(addr)
+    }
+}
+
+/// Whether `ip` reaches the public internet, as opposed to a loopback, private,
+/// link-local, CGNAT/tailnet or unique-local address.
+///
+/// The list is the one `block_private_ips` in `http_fetch` uses; it answers the
+/// same question ("is this address a place the wider network lives?"), so the
+/// two agree on where the boundary is.
+fn is_public_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || is_cgnat_v4(v4)
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                // 198.18.0.0/15, the benchmarking range.
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19)))
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || is_tailnet_v6(v6))
+        }
+    }
+}
+
+/// `100.64.0.0/10`, the range Tailscale draws from (and RFC 6598 CGNAT).
+fn is_cgnat_v4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..128).contains(&octets[1])
+}
+
+/// Tailscale's IPv6 prefix, `fd7a:115c:a1e0::/48`.
+fn is_tailnet_v6(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0xfd7a && segments[1] == 0x115c && segments[2] == 0xa1e0
 }
 
 /// `[mcp.client]`.
@@ -446,6 +583,11 @@ pub struct McpClientConfig {
 }
 
 /// One external server, `[mcp.client.servers.<name>]`.
+///
+/// A server is reached one of two ways, and they are mutually exclusive: a
+/// `command` minion spawns over stdio, or a `url` it speaks Streamable HTTP to
+/// (the transport that lets two minion instances on the same tailnet talk).
+/// `Config::validate` accepts exactly one of the two.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -454,6 +596,17 @@ pub struct McpServerConfig {
     pub command: String,
     /// Arguments passed to `command`, verbatim.
     pub args: Vec<String>,
+    /// The server's Streamable-HTTP endpoint, e.g.
+    /// `http://peer.tailnet.ts.net:8788/mcp`. Mutually exclusive with
+    /// `command`/`args`.
+    pub url: String,
+    /// Name of the environment variable holding the bearer token sent as
+    /// `Authorization: Bearer`. Only the *name* lives here.
+    pub token_env: String,
+    /// Path to the credentials file (`api_key = "…"`, mode 0600) holding the
+    /// bearer token, resolved the same way `provider.api_key_file` is. Only the
+    /// *path* lives here.
+    pub token_file: String,
     /// Contact this server at the start of the first turn instead of while the
     /// session is assembled. A session that is opened and closed without a turn
     /// then never spawns it.
@@ -478,6 +631,26 @@ pub struct McpServerConfig {
 }
 
 impl McpServerConfig {
+    /// Whether this server is reached over HTTP rather than spawned over stdio.
+    pub fn is_http(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+
+    /// The bearer token to send, resolved from `token_env` then `token_file`.
+    ///
+    /// `Ok(None)` means "no auth configured" — the client simply sends no
+    /// `Authorization` header. A source that is named but yields nothing is an
+    /// error rather than a silent anonymous request, which is the fail-closed
+    /// half: a misconfigured token must not look like a server that rejects you.
+    pub fn bearer_token(&self) -> Result<Option<String>> {
+        resolve_secret(
+            &self.token_env,
+            &self.token_file,
+            "MCP bearer token",
+            " (set `token_env` or `token_file` on the server, or unset both to send no token)",
+        )
+    }
+
     /// Whether `tool` — the server's own name for it, not the flattened one —
     /// may reach the model.
     pub fn allows(&self, tool: &str) -> bool {
@@ -700,10 +873,10 @@ impl Config {
                 "cron.missed_run_cap must be at least 1".to_string(),
             ));
         }
-        // An MCP server is spawned by its `command`, and its table key is half of
-        // every tool name it publishes. Both are checked here rather than at
-        // first use, so a typo is a startup error and not a server that quietly
-        // never contributes a tool (§5.10).
+        // A server is spawned by its `command` or reached at its `url`, and its
+        // table key is half of every tool name it publishes. Both are checked
+        // here rather than at first use, so a typo is a startup error and not a
+        // server that quietly never contributes a tool (§5.10).
         for (name, server) in &self.mcp.client.servers {
             if name.trim().is_empty() {
                 return Err(Error::Config(
@@ -716,20 +889,54 @@ impl Config {
                      which is the separator in `mcp__<server>__<tool>`"
                 )));
             }
-            if server.command.trim().is_empty() {
+            let has_command = !server.command.trim().is_empty();
+            let has_url = !server.url.trim().is_empty();
+            if has_command && has_url {
                 return Err(Error::Config(format!(
-                    "mcp.client.servers.{name}.command must not be empty"
+                    "mcp.client.servers.{name}: `command` (stdio) and `url` (HTTP) are \
+                     mutually exclusive; set exactly one"
                 )));
             }
+            if !has_command && !has_url {
+                return Err(Error::Config(format!(
+                    "mcp.client.servers.{name}: one of `command` (stdio) or `url` (HTTP) \
+                     is required"
+                )));
+            }
+            if has_url {
+                let url = server.url.trim();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(Error::Config(format!(
+                        "mcp.client.servers.{name}.url must be an `http://` or `https://` \
+                         endpoint, was `{url}`"
+                    )));
+                }
+                if !server.args.is_empty() {
+                    return Err(Error::Config(format!(
+                        "mcp.client.servers.{name}: `args` belongs to a stdio `command`, \
+                         not to a `url`"
+                    )));
+                }
+            }
         }
-        // Only stdio exists for the server half. R5 makes that a property and
-        // not a default: `mcp serve` and the REPL both own stdin/stdout, so a
-        // second transport is a second decision, not a config value.
-        if self.mcp.server.enabled && self.mcp.server.transport != "stdio" {
-            return Err(Error::Config(format!(
-                "mcp.server.transport must be \"stdio\", was `{}`",
-                self.mcp.server.transport
-            )));
+        // The server half: `stdio` (the default) or `http`. A second transport is
+        // a deliberate config value, and an unknown one is a startup error
+        // rather than a server that quietly does something else.
+        if self.mcp.server.enabled {
+            match self.mcp.server.transport.trim() {
+                "stdio" => {}
+                transport if transport.eq_ignore_ascii_case("http") => {
+                    // The bind policy runs at load time, so a wildcard, a public
+                    // address, or a non-loopback bind without a token is refused
+                    // before the socket is ever opened (fail-closed).
+                    self.mcp.server.bind_socket()?;
+                }
+                other => {
+                    return Err(Error::Config(format!(
+                        "mcp.server.transport must be \"stdio\" or \"http\", was `{other}`"
+                    )));
+                }
+            }
         }
         // The update channel is a network endpoint whose response decides what
         // binary gets installed, so its shape is checked here rather than at the
@@ -773,38 +980,12 @@ impl Config {
     /// 3. otherwise an error, unless *both* sources are unset, which is how a
     ///    keyless local backend is expressed.
     pub fn api_key(&self) -> Result<Option<String>> {
-        let env_name = self.provider.api_key_env.trim();
-        if !env_name.is_empty()
-            && let Ok(value) = std::env::var(env_name)
-            && !value.trim().is_empty()
-        {
-            return Ok(Some(value));
-        }
-
-        let file_path = self.provider.api_key_file.trim();
-        if !file_path.is_empty() {
-            let path = expand_home(file_path);
-            let credentials = Credentials::load(&path)?;
-            if !credentials.api_key.trim().is_empty() {
-                return Ok(Some(credentials.api_key));
-            }
-        }
-
-        if env_name.is_empty() && file_path.is_empty() {
-            return Ok(None);
-        }
-
-        let mut sources = Vec::new();
-        if !env_name.is_empty() {
-            sources.push(format!("the environment variable `{env_name}`"));
-        }
-        if !file_path.is_empty() {
-            sources.push(format!("`provider.api_key` in {}", file_path));
-        }
-        Err(Error::Auth(format!(
-            "no credentials found — set {} (or run `minion init`)",
-            sources.join(" or ")
-        )))
+        resolve_secret(
+            &self.provider.api_key_env,
+            &self.provider.api_key_file,
+            "credentials",
+            " (or run `minion init`)",
+        )
     }
 
     /// Headers to send on every provider request.
@@ -888,6 +1069,60 @@ impl Credentials {
         );
         crate::fs::write_private_file(path, &body)
     }
+}
+
+/// Resolve a secret from an environment-variable *name* and a credentials-file
+/// *path*, neither of which is the secret itself.
+///
+/// This is the one resolution both `provider.api_key` and every bearer token
+/// (the MCP client's and the MCP server's) go through, so "where does a secret
+/// come from" has a single answer: the environment variable wins when it is set
+/// and non-empty, then `api_key` in the credentials file — the `0600` file
+/// `minion init` writes. The config only ever carries names and paths.
+///
+/// `Ok(None)` means "no source is configured", which is how a keyless backend —
+/// or a peer that needs no token — is expressed. A source that *is* named but
+/// yields nothing is an error: silently sending no credentials would turn a
+/// typo into an auth failure somewhere else.
+fn resolve_secret(
+    env_name: &str,
+    file_path: &str,
+    what: &str,
+    remedy: &str,
+) -> Result<Option<String>> {
+    let env_name = env_name.trim();
+    let file_path = file_path.trim();
+
+    if !env_name.is_empty()
+        && let Ok(value) = std::env::var(env_name)
+        && !value.trim().is_empty()
+    {
+        return Ok(Some(value));
+    }
+
+    if !file_path.is_empty() {
+        let path = expand_home(file_path);
+        let credentials = Credentials::load(&path)?;
+        if !credentials.api_key.trim().is_empty() {
+            return Ok(Some(credentials.api_key));
+        }
+    }
+
+    if env_name.is_empty() && file_path.is_empty() {
+        return Ok(None);
+    }
+
+    let mut sources = Vec::new();
+    if !env_name.is_empty() {
+        sources.push(format!("the environment variable `{env_name}`"));
+    }
+    if !file_path.is_empty() {
+        sources.push(format!("`api_key` in {file_path}"));
+    }
+    Err(Error::Auth(format!(
+        "no {what} found — set {}{remedy}",
+        sources.join(" or ")
+    )))
 }
 
 /// Expand a leading `~` to the user's home directory.
@@ -1217,6 +1452,174 @@ mod tests {
 
         assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
         assert!(err.to_string().contains("stdio"), "was: {err}");
+    }
+
+    // ------------------------------------------------- mcp transport (M10.1)
+
+    /// §5.10/D25: a client server is reached by `command` (stdio) or `url`
+    /// (HTTP), never both and never neither.
+    #[test]
+    fn a_client_server_is_stdio_or_http_but_not_both() {
+        let cases: [(&str, &str, bool); 5] = [
+            ("stdio", "[mcp.client.servers.a]\ncommand = \"x\"\n", true),
+            (
+                "http",
+                "[mcp.client.servers.a]\nurl = \"http://127.0.0.1:8788/mcp\"\n",
+                true,
+            ),
+            (
+                "both",
+                "[mcp.client.servers.a]\ncommand = \"x\"\nurl = \"http://127.0.0.1:8788/mcp\"\n",
+                false,
+            ),
+            ("neither", "[mcp.client.servers.a]\nlazy = true\n", false),
+            (
+                "args-with-url",
+                "[mcp.client.servers.a]\nurl = \"http://127.0.0.1:8788/mcp\"\nargs = [\"-x\"]\n",
+                false,
+            ),
+        ];
+
+        for (label, body, ok) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("minion.toml"), body);
+            let loaded = Config::load_with(None, None, dir.path());
+            assert_eq!(loaded.is_ok(), ok, "{label}: {loaded:?}");
+        }
+    }
+
+    /// The URL scheme is checked, so `ftp://` or a bare host is a startup error
+    /// rather than a transport that fails at the first request.
+    #[test]
+    fn a_client_url_must_be_http() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[mcp.client.servers.a]\nurl = \"127.0.0.1:8788/mcp\"\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+        assert!(err.to_string().contains("http://"), "was: {err}");
+    }
+
+    /// A client token is resolved from `token_file` (the `0600` credentials
+    /// file), reusing the provider's resolution, and never from the config.
+    #[test]
+    fn a_client_token_comes_from_the_credentials_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        Credentials::write(&credentials, "peer-secret").unwrap();
+
+        let server = McpServerConfig {
+            url: "http://127.0.0.1:8788/mcp".to_string(),
+            token_env: "MINION_ABSENT_PEER_VAR".to_string(),
+            token_file: credentials.display().to_string(),
+            ..McpServerConfig::default()
+        };
+
+        assert_eq!(
+            server.bearer_token().unwrap().as_deref(),
+            Some("peer-secret")
+        );
+    }
+
+    /// A named-but-empty token source is an error, not a silent anonymous call.
+    #[test]
+    fn a_named_but_absent_token_is_an_error() {
+        let server = McpServerConfig {
+            token_env: "MINION_ABSENT_PEER_VAR".to_string(),
+            token_file: "/nonexistent/credentials".to_string(),
+            ..McpServerConfig::default()
+        };
+
+        let err = server.bearer_token().unwrap_err();
+
+        assert!(matches!(err, Error::Auth(_)), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("MINION_ABSENT_PEER_VAR"),
+            "was: {err}"
+        );
+    }
+
+    /// `transport = "http"` is accepted; anything else is still a startup error.
+    #[test]
+    fn http_is_a_transport_and_nothing_else_is() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[mcp.server]\ntransport = \"http\"\nbind = \"127.0.0.1:0\"\n",
+        );
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+        assert!(config.mcp.server.is_http());
+
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[mcp.server]\ntransport = \"ws\"\n",
+        );
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+    }
+
+    /// The bind policy (D27): wildcard and public addresses are always refused;
+    /// a non-loopback bind needs a token; loopback and a token-backed tailnet
+    /// address are allowed.
+    #[test]
+    fn the_http_bind_is_fail_closed() {
+        let with = |bind: &str| McpServerSection {
+            transport: "http".to_string(),
+            bind: bind.to_string(),
+            ..McpServerSection::default()
+        };
+
+        // Loopback needs nothing.
+        assert!(with("127.0.0.1:8788").bind_socket().is_ok());
+        assert!(with("[::1]:8788").bind_socket().is_ok());
+
+        // Wildcards are always refused — they are the public interface.
+        assert!(with("0.0.0.0:8788").bind_socket().is_err());
+        assert!(with("[::]:8788").bind_socket().is_err());
+
+        // A globally routable address is never served.
+        assert!(with("93.184.216.34:8788").bind_socket().is_err());
+
+        // A tailnet address without a token is refused...
+        assert!(with("100.101.102.103:8788").bind_socket().is_err());
+        assert!(with("[fd7a:115c:a1e0::1]:8788").bind_socket().is_err());
+
+        // ...and allowed once a token source is named.
+        let tailnet = McpServerSection {
+            transport: "http".to_string(),
+            bind: "100.101.102.103:8788".to_string(),
+            token_env: "MINION_PEER_TOKEN".to_string(),
+            ..McpServerSection::default()
+        };
+        assert!(tailnet.bind_socket().is_ok());
+        assert!(tailnet.has_token_source());
+
+        // A malformed address is a clear config error, not a panic.
+        let err = with("not-an-address").bind_socket().unwrap_err();
+        assert!(err.to_string().contains("mcp.server.bind"), "was: {err}");
+    }
+
+    /// (b) A non-loopback bind without a token is refused when the config is
+    /// loaded, so `minion mcp serve` never reaches `TcpListener::bind`: the
+    /// listener does not start, rather than starting unauthenticated.
+    #[test]
+    fn a_non_loopback_http_bind_without_a_token_never_loads() {
+        for bind in ["0.0.0.0:8788", "[::]:8788", "100.101.102.103:8788"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                &dir.path().join("minion.toml"),
+                &format!("[mcp.server]\ntransport = \"http\"\nbind = \"{bind}\"\n"),
+            );
+
+            let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+            assert!(matches!(err, Error::Config(_)), "{bind}: {err}");
+        }
     }
 
     #[test]
