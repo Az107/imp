@@ -282,6 +282,61 @@ asset_prefix = "minion"              # assets are `<prefix>-<os>-<arch>` plus ch
 An update replaces exactly one file. It does not touch the config, the database, or the credentials
 file.
 
+## Releasing
+
+Releases are cut by `.github/workflows/release.yml`. There is no command to run by hand.
+
+A **push to `main`** does the following, in order:
+
+1. **Derives the next version** from the newest `vX.Y.Z` tag (`scripts/next-version.sh`): no tag yet →
+   `v0.1.0`; otherwise the patch is bumped, `vX.Y.Z` → `vX.Y.(Z+1)`. If `HEAD` already carries a tag
+   (a re-run of the same commit), the whole job is skipped, so a published commit is never republished.
+2. **Refuses to publish** unless that version equals `[workspace.package].version` in `Cargo.toml`.
+   The binary embeds that version and `minion update` compares it to the release tag, so the two have
+   to agree — a release whose tag and embedded version disagree would make `minion update` offer the
+   same release forever.
+3. **Runs the tests** (`cargo +1.89.0 test --workspace --locked`). A red tree publishes nothing.
+4. **Builds `linux/amd64` and `linux/arm64`** binaries: amd64 natively, arm64 cross-compiled with
+   `gcc-aarch64-linux-gnu`, both with the commit and date embedded (`MINION_GIT_SHA`/`MINION_GIT_DATE`).
+   The job is pinned to the `ubuntu-22.04` runner so the glibc floor of the binaries stays at 2.35
+   instead of moving when `ubuntu-latest` rotates.
+5. **Publishes a GitHub Release** at the derived tag with `minion-linux-amd64`, `minion-linux-arm64`
+   and `checksums.txt`, then verifies the release is not left as a draft and that the uploaded
+   `checksums.txt` matches the one built.
+
+**So a normal release is: bump `[workspace.package].version` to the next patch in a commit and push it
+to `main`.** The bump is what step 2 checks; forgetting it fails the run rather than publishing a
+binary whose version disagrees with its tag.
+
+**Cutting a tag by hand** (only when the automatic patch bump cannot produce the version you want, or
+to re-cut after a failed run). The workflow runs on a push to `main` and skips a commit that is already
+tagged, so a hand-cut tag is not picked up on its own — create its Release yourself:
+
+```sh
+git switch main && git pull
+git tag v0.2.0                       # or the version you need
+git push origin v0.2.0
+cargo +1.89.0 test --workspace --locked
+cargo +1.89.0 build --release --locked
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+  cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-gnu
+mkdir -p dist
+cp target/release/minion                             dist/minion-linux-amd64
+cp target/aarch64-unknown-linux-gnu/release/minion   dist/minion-linux-arm64
+( cd dist && sha256sum minion-linux-* >checksums.txt )
+gh release create v0.2.0 --title v0.2.0 \
+  --notes "build-commit: $(git rev-parse --short=12 HEAD)" \
+  dist/minion-linux-amd64 dist/minion-linux-arm64 dist/checksums.txt
+```
+
+**Verifying a release:**
+
+```sh
+gh release view v0.1.0                 # assets: minion-linux-amd64, minion-linux-arm64, checksums.txt
+minion update --check                  # exits 0 (up to date) or 1 (update available)
+minion update --check --json           # installed, latest, asset and the commit the release declares
+```
+
 ## Safety model
 
 There is no sandbox. The model can only act through tools, and every tool that

@@ -1,0 +1,161 @@
+name: release
+
+# Publish a release only when `main` moves. The patch version is derived from the
+# newest `vX.Y.Z` tag, the workspace is tested, and linux/amd64 + linux/arm64
+# binaries plus a `checksums.txt` are attached to a GitHub Release — the shape
+# `minion update` consumes (SDD §9).
+on:
+  push:
+    branches: [main]
+
+# One release at a time. Never cancel a half-finished publish: a cancelled run
+# can leave a draft release, or a tag with some assets missing, which
+# `minion update` would then see as the latest release.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    # Pinned so the glibc floor of the published binaries does not move under us
+    # when GitHub rotates `ubuntu-latest`. 22.04 ships glibc 2.35.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # Full history and tags: the next version is computed from them.
+          fetch-depth: 0
+
+      - name: Set up Rust 1.89
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89.0"
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Install the aarch64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu
+
+      - name: Compute the next version
+        id: version
+        run: bash scripts/next-version.sh
+
+      # The tag we are about to cut must equal the version the binary will
+      # report, or `minion update` would install a binary whose `--version`
+      # disagrees with the release and then offer the same update forever.
+      # Failing here is the point: publish something coherent or nothing.
+      - name: The tag and Cargo.toml must agree
+        if: steps.version.outputs.skip != 'true'
+        shell: bash
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          version="$(awk '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0} s && $1=="version"{gsub(/[" ]/,"",$3);print $3;exit}' Cargo.toml)"
+          if [ "v${version}" != "${NEXT}" ]; then
+            echo "the tag ${NEXT} does not match [workspace.package].version ${version}" >&2
+            echo "bump the workspace version to ${NEXT#v} in the release commit, or cut the tag by hand" >&2
+            exit 1
+          fi
+          echo "tag ${NEXT} matches Cargo.toml ${version}"
+
+      # A failing test stops the publish: no release is cut from a red tree.
+      - name: Test
+        if: steps.version.outputs.skip != 'true'
+        run: cargo +1.89.0 test --workspace --locked
+
+      # Two targets, one runner. amd64 is native; arm64 is cross-compiled with
+      # the distro's aarch64 gcc, which is also the C compiler the bundled
+      # SQLite (`minion-store`) and `aws-lc-sys` (through rustls) need. Both
+      # carry the version, the commit and the date the binary was built from.
+      - name: Build linux/amd64 and linux/arm64
+        if: steps.version.outputs.skip != 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.next }}
+          MINION_GIT_SHA: ${{ github.sha }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: |
+          set -euo pipefail
+          # The commit date, in the same `%cs` shape build.rs derives from git.
+          export MINION_GIT_DATE="$(git log -1 --format=%cs)"
+          mkdir -p dist
+
+          echo "building x86_64-unknown-linux-gnu (${VERSION})"
+          cargo +1.89.0 build --release --locked
+          cp target/release/minion dist/minion-linux-amd64
+
+          echo "building aarch64-unknown-linux-gnu (${VERSION})"
+          cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-gnu
+          cp target/aarch64-unknown-linux-gnu/release/minion dist/minion-linux-arm64
+
+          chmod +x dist/minion-linux-amd64 dist/minion-linux-arm64
+
+          # Assert on the native arch that the stamps actually landed. A binary
+          # reporting the wrong version, or no commit, is not published.
+          got="$(./dist/minion-linux-amd64 --version)"
+          echo "amd64 --version: ${got}"
+          printf '%s\n' "${got}" | grep -q "^minion ${VERSION#v} " \
+            || { echo "version stamp mismatch: got '${got}', want version ${VERSION#v}" >&2; exit 1; }
+          printf '%s\n' "${got}" | grep -q "${MINION_GIT_SHA:0:12}" \
+            || { echo "commit stamp missing from --version: '${got}'" >&2; exit 1; }
+
+          (cd dist && sha256sum minion-linux-* >checksums.txt)
+          ls -l dist
+
+      - name: Publish release
+        if: steps.version.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.next }}
+          name: ${{ steps.version.outputs.next }}
+          # A hex SHA here is what `minion update` ties the binary to; the
+          # `build-commit:` trailer is the fallback if a mirror reports the
+          # branch instead.
+          target_commitish: ${{ github.sha }}
+          body: |
+            build-commit: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/minion-linux-amd64
+            dist/minion-linux-arm64
+            dist/checksums.txt
+
+      - name: Verify the release is published
+        if: steps.version.outputs.skip != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          # action-gh-release creates the release as a draft and unmarks it
+          # after uploading. If that finalize fails silently the tag is never
+          # created and /releases/latest returns 404, so `minion update` would
+          # never see it. Fail loudly.
+          state="$(gh release view "${TAG}" --json isDraft -q .isDraft)"
+          if [ "${state}" != "false" ]; then
+            echo "release ${TAG} is still a draft" >&2
+            exit 1
+          fi
+          # The uploaded manifest must be the one we hashed locally.
+          mkdir -p /tmp/published
+          gh release download "${TAG}" --pattern checksums.txt --dir /tmp/published
+          diff -u dist/checksums.txt /tmp/published/checksums.txt
+          echo "release ${TAG} published with minion-linux-amd64, minion-linux-arm64 and checksums.txt"
