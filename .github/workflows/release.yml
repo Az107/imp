@@ -1,9 +1,11 @@
 name: release
 
 # Publish a release only when `main` moves. The patch version is derived from the
-# newest `vX.Y.Z` tag, the workspace is tested, and linux/amd64 + linux/arm64
-# binaries plus a `checksums.txt` are attached to a GitHub Release — the shape
-# `minion update` consumes (SDD §9).
+# newest `vX.Y.Z` tag, the workspace is tested once, and the six published assets
+# — {linux,macOS,Windows} × {amd64,arm64} — plus a `checksums.txt` are attached
+# to a GitHub Release. That is the shape `minion update` consumes (SDD §9, D24,
+# D28): the six asset names are what its `asset_for` mapping looks up, so a name
+# published differently here is a 404 there rather than a fallback.
 on:
   push:
     branches: [main]
@@ -22,10 +24,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    # Pinned so the glibc floor of the published binaries does not move under us
-    # when GitHub rotates `ubuntu-latest`. 22.04 ships glibc 2.35.
+  # The gate, before anything is built: derive the version, refuse unless it
+  # equals `[workspace.package].version`, and test the tree. A wrong tag or a red
+  # tree publishes nothing, and no asset is built until both pass.
+  gate:
     runs-on: ubuntu-22.04
+    outputs:
+      skip: ${{ steps.version.outputs.skip }}
+      next: ${{ steps.version.outputs.next }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -37,17 +43,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.89.0"
-          targets: aarch64-unknown-linux-gnu
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: release
-
-      - name: Install the aarch64 cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-aarch64-linux-gnu
+          key: gate
 
       - name: Compute the next version
         id: version
@@ -77,53 +77,172 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         run: cargo +1.89.0 test --workspace --locked
 
-      # Two targets, one runner. amd64 is native; arm64 is cross-compiled with
-      # the distro's aarch64 gcc, which is also the C compiler the bundled
-      # SQLite (`minion-store`) and `aws-lc-sys` (through rustls) need. Both
-      # carry the version, the commit and the date the binary was built from.
-      - name: Build linux/amd64 and linux/arm64
-        if: steps.version.outputs.skip != 'true'
+  # One runner per target — the six are built where they can also be *run*, so
+  # the two stamps can be read back off every binary and not just the one the
+  # runner happens to be (D28). macOS links only on macOS; Windows/arm64 links
+  # natively on the `windows-11-arm` runner rather than cross-compiled, because
+  # an x64 runner cannot execute the result to check it.
+  build:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: minion-linux-amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/minion
+          - asset: minion-linux-arm64
+            runner: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            binary: target/aarch64-unknown-linux-gnu/release/minion
+          - asset: minion-darwin-amd64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/minion
+          - asset: minion-darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/minion
+          - asset: minion-windows-amd64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/minion.exe
+          - asset: minion-windows-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: target/aarch64-pc-windows-msvc/release/minion.exe
+    runs-on: ${{ matrix.runner }}
+    name: ${{ matrix.asset }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Rust 1.89
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89.0"
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Linux/arm64 is the one cross link. The distro's aarch64 gcc is also the
+      # C compiler the bundled SQLite (`minion-store`) and `aws-lc-sys` (through
+      # rustls) need; qemu lets the arm64 binary be run here to check its stamps,
+      # which a bare cross build cannot do.
+      - name: Install the aarch64 cross toolchain and qemu
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-aarch64-linux-gnu qemu-user-static
+
+      - name: Point the aarch64 cross link at the distro toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          {
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc"
+            echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+            echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+          } >>"$GITHUB_ENV"
+
+      # Build, then run the binary and read both stamps back out of it. The
+      # published asset is the built binary renamed; on Windows that is the bytes
+      # of the `.exe` without the suffix, because `minion update` replaces
+      # `current_exe()`, so the installed file keeps its real name.
+      - name: Build, run and stamp-check ${{ matrix.asset }}
         shell: bash
         env:
-          VERSION: ${{ steps.version.outputs.next }}
+          VERSION: ${{ needs.gate.outputs.next }}
           MINION_GIT_SHA: ${{ github.sha }}
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
           # The commit date, in the same `%cs` shape build.rs derives from git.
           export MINION_GIT_DATE="$(git log -1 --format=%cs)"
           mkdir -p dist
 
-          echo "building x86_64-unknown-linux-gnu (${VERSION})"
-          cargo +1.89.0 build --release --locked
-          cp target/release/minion dist/minion-linux-amd64
+          echo "building ${TARGET} (${VERSION})"
+          cargo +1.89.0 build --release --locked --target "${TARGET}"
 
-          echo "building aarch64-unknown-linux-gnu (${VERSION})"
-          cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-gnu
-          cp target/aarch64-unknown-linux-gnu/release/minion dist/minion-linux-arm64
+          cp "${BIN}" "dist/${ASSET}"
+          case "${TARGET}" in
+            *windows*) ;;
+            *) chmod +x "dist/${ASSET}" ;;
+          esac
 
-          chmod +x dist/minion-linux-amd64 dist/minion-linux-arm64
-
-          # Assert on the native arch that the stamps actually landed. A binary
-          # reporting the wrong version, or no commit, is not published.
-          got="$(./dist/minion-linux-amd64 --version)"
-          echo "amd64 --version: ${got}"
+          # Run the binary on the runner that built it. Every target is checked,
+          # not only the native amd64: a binary reporting the wrong version, or no
+          # commit, is not published.
+          case "${TARGET}" in
+            aarch64-unknown-linux-gnu)
+              got="$(qemu-aarch64-static -L /usr/aarch64-linux-gnu "dist/${ASSET}" --version)"
+              ;;
+            *windows*)
+              # The asset has no `.exe`, which Windows will not execute; the
+              # built file still does, and it is the same bytes just copied.
+              got="$("${BIN}" --version)"
+              ;;
+            *)
+              got="$("dist/${ASSET}" --version)"
+              ;;
+          esac
+          echo "${ASSET} --version: ${got}"
           printf '%s\n' "${got}" | grep -q "^minion ${VERSION#v} " \
             || { echo "version stamp mismatch: got '${got}', want version ${VERSION#v}" >&2; exit 1; }
           printf '%s\n' "${got}" | grep -q "${MINION_GIT_SHA:0:12}" \
             || { echo "commit stamp missing from --version: '${got}'" >&2; exit 1; }
 
-          (cd dist && sha256sum minion-linux-* >checksums.txt)
+          ls -l dist
+
+      - name: Upload ${{ matrix.asset }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  # All six built and stamp-checked; hash them together and publish. The release
+  # is only cut once every asset is here, so a partial set is never published.
+  publish:
+    needs: [gate, build]
+    if: needs.gate.outputs.skip != 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Collect the six built assets
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # `minion update` verifies the downloaded asset against `checksums.txt`, so
+      # the manifest has to cover all six names — a missing entry is a refusal on
+      # that platform, not "skip the check".
+      - name: Checksums over the six assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="minion-linux-amd64 minion-linux-arm64 minion-darwin-amd64 minion-darwin-arm64 minion-windows-amd64 minion-windows-arm64"
+          for asset in ${assets}; do
+            test -f "dist/${asset}" \
+              || { echo "the build did not upload ${asset}" >&2; exit 1; }
+          done
+          (cd dist && sha256sum ${assets} >checksums.txt)
+          test "$(wc -l <dist/checksums.txt)" -eq 6 \
+            || { echo "checksums.txt does not cover the six assets" >&2; exit 1; }
           ls -l dist
 
       - name: Publish release
-        if: steps.version.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.next }}
-          name: ${{ steps.version.outputs.next }}
+          tag_name: ${{ needs.gate.outputs.next }}
+          name: ${{ needs.gate.outputs.next }}
           # A hex SHA here is what `minion update` ties the binary to; the
           # `build-commit:` trailer is the fallback if a mirror reports the
           # branch instead.
@@ -135,14 +254,17 @@ jobs:
           files: |
             dist/minion-linux-amd64
             dist/minion-linux-arm64
+            dist/minion-darwin-amd64
+            dist/minion-darwin-arm64
+            dist/minion-windows-amd64
+            dist/minion-windows-arm64
             dist/checksums.txt
 
       - name: Verify the release is published
-        if: steps.version.outputs.skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.next }}
+          TAG: ${{ needs.gate.outputs.next }}
         run: |
           set -euo pipefail
           # action-gh-release creates the release as a draft and unmarks it
@@ -158,4 +280,4 @@ jobs:
           mkdir -p /tmp/published
           gh release download "${TAG}" --pattern checksums.txt --dir /tmp/published
           diff -u dist/checksums.txt /tmp/published/checksums.txt
-          echo "release ${TAG} published with minion-linux-amd64, minion-linux-arm64 and checksums.txt"
+          echo "release ${TAG} published with the six assets and checksums.txt"
