@@ -58,6 +58,15 @@ Assistant text is rendered as markdown on a terminal (`crates/minion-cli/src/mar
 headings, emphasis, code, lists, quotes, rules, and pipe tables. It is rendered per block, so
 nothing already on screen is ever revised.
 
+**M10.3 is done** (branch `m10-small-models`, cut from `feat/update-command` at 77e054c). The
+small-model loop ergonomics live in `minion-core/src/agent.rs` (truncated-call recovery, the per-turn
+repeat cache, the tool budget, `StopReason::ToolBudget`, `AgentEvent::Notice`),
+`minion-core/src/tool.rs` (`ToolSelection` and the filtered `ToolRegistry`),
+`minion-core/src/config.rs` (`[tools]`, `agent.max_tool_calls_per_turn`, `agent.small_model`,
+`provider.strict_tool_arguments`), `minion-cli/src/setup.rs` (where the selection is applied and the
+numbered rules are appended) and `minion-provider/src/openai.rs` (`to_wire_strict`). See the
+"Small-model loop rules (M10.3)" section below before touching any of it.
+
 ## Commands
 
 ```sh
@@ -130,6 +139,12 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - **`tool_allow` is fail-closed.** An empty list allows nothing; `["*"]` is how an operator says
   everything. It is applied before the catalogue is built, so a tool that is not listed is absent from
   the schemas *and* unresolvable by name.
+- **`[tools] only`/`hide` narrow the surface, never the permissions (M10.3).** The registry drops a
+  rejected name from `schemas()` *and* from `get()`, and applies the selection *last*, over the
+  merged registered-plus-catalog list, so hiding a built-in cannot be undone by a same-named MCP
+  tool. Because it only removes entries, there is no path from `hide` to an allowance: the gate is
+  untouched, and `hide` beating `only` keeps the negative rule fail-closed. Do not "optimise" this by
+  re-registering a fresh registry by name — that would have to reproduce D20's shadowing rule.
 - Approval is fail-closed: non-TTY never prompts and defaults to `deny`; deny rules always beat
   allowlists.
 - **The MCP server is read-only by default.** `expose_exec`/`expose_write` stay `false`;
@@ -253,6 +268,38 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   network dependency; `minion-guard` is the only crate that opens the socket, behind the
   `SystemOneGuard` trait. Keep the client there — a `reqwest::Client` in `minion-core` breaks the
   rule that lets the loop be tested against a mock provider.
+
+## Small-model loop rules (M10.3)
+
+The point of this milestone is that a 2–4B local model can drive a turn without the loop turning its
+weakness into a parse error or a runaway. The knobs are `[tools] only`/`hide`,
+`agent.max_tool_calls_per_turn`, `agent.small_model`, and `[provider] strict_tool_arguments`; the
+behaviour is `StopReason::ToolBudget`, `AgentEvent::Notice`, and the per-turn repeat cache in
+`minion-core/src/agent.rs`. Traps that cost time:
+
+- **The `[tools]` filter is applied in `ToolRegistry::all()`, last, not at registration.** It must
+  run *after* `attach_catalog` and after the shadowing pass, or it would miss MCP tools and could let
+  a server reintroduce a built-in name the operator hid. `hide` beats `only`. This is narrowing only:
+  it must never touch `Risk` or the gate — a test asserts a hidden `run_command` is gone, not softened.
+- **A `finish_reason: length` tool-call batch is never committed to history.** The loop drops it
+  before `Message::assistant_with_tool_calls`. Committing it would leave `tool_calls` ids unanswered,
+  so the *persisted* session would be rejected by the provider on resume — the one invariant the loop
+  cannot break. The notice goes in as a `system` message and the loop asks again.
+- **The dedup cache must be cleared *before* a state-changing call runs, and the current result
+  inserted after it.** Clearing after would drop the entry that was just inserted, so two identical
+  `grep`s would both re-run. "State-changing" is `!Risk::is_observation()` — the same read/write line
+  D15 draws, so a `ReadOnly` read is cached and a `Network`/`Write`/`Execute` call voids the cache.
+- **A budget-refused call is still answered.** When `max_tool_calls_per_turn` is hit mid-batch the
+  remaining calls get a `tool` message carrying the budget error, not silence. Dropping them would
+  leave the assistant message's ids dangling and corrupt the stored transcript.
+- **`StopReason` and `AgentEvent` gained variants (`ToolBudget`, `Notice`).** Both matches are
+  exhaustive; add the arm in `render.rs` (prose and `--json`) and anywhere else that matches on them.
+  `AgentOptions` gained `max_tool_calls_per_turn`, which is set at every construction site, tests
+  included — the compiler is the checklist.
+- **`ToolSchema::to_wire` now delegates to `to_wire_strict(false)`.** Keep the envelope test: the flat
+  form still 400s on a compliant provider, and `strict` must sit *inside* the `function` object.
+- **The small-model rules are appended, so a test asserts the prompt `ends_with` them.** If you move
+  them earlier "for emphasis", that test is the one telling you a resumed prompt's tail changed.
 
 ## Cron rules (M4)
 

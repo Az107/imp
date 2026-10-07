@@ -279,6 +279,7 @@ impl Runtime {
             max_tokens,
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
+            max_tool_calls_per_turn: self.config.agent.max_tool_calls_per_turn,
             workspace_root: self.workspace_root.clone(),
         };
         let agent =
@@ -513,6 +514,7 @@ fn provider_factory(config: &Config) -> Result<ProviderFactory> {
     let max_retries = config.provider.max_retries;
     let timeout = Duration::from_secs(config.provider.request_timeout_secs);
     let usage = config.provider.supports_usage_in_stream;
+    let strict = config.provider.strict_tool_arguments;
     let headers = config.request_headers();
 
     Ok(Arc::new(move |session_id: &str| -> Arc<dyn Provider> {
@@ -521,6 +523,7 @@ fn provider_factory(config: &Config) -> Result<ProviderFactory> {
                 .with_max_retries(max_retries)
                 .with_request_timeout(Some(timeout))
                 .with_usage_in_stream(usage)
+                .with_strict_tool_arguments(strict)
                 .with_headers(headers.clone())
                 .with_session_id(session_id.to_string()),
         )

@@ -127,6 +127,7 @@ fn agent(provider: Arc<dyn Provider>, registry: ToolRegistry, gate: Arc<dyn Tool
             max_tokens: None,
             parallel_tool_calls: None,
             include_usage: false,
+            max_tool_calls_per_turn: 0,
             workspace_root: std::env::temp_dir(),
         },
     )
