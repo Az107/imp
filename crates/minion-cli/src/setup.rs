@@ -329,7 +329,7 @@ fn recording(engine: Arc<PolicyEngine>, store: &Arc<Store>) -> Arc<dyn ToolGate>
 }
 
 /// The `[workspace]`, `[exec]` and `[http_fetch]` values that shape the tool set.
-fn tool_config(config: &Config) -> ToolConfig {
+pub(crate) fn tool_config(config: &Config) -> ToolConfig {
     ToolConfig {
         max_file_bytes: config.workspace.max_file_bytes,
         shell: config.exec.shell.clone(),
@@ -341,7 +341,7 @@ fn tool_config(config: &Config) -> ToolConfig {
 }
 
 /// What the `cron_*` tools need from the process: a clock, and the default zone.
-fn cron_context(config: &Config) -> CronContext {
+pub(crate) fn cron_context(config: &Config) -> CronContext {
     CronContext {
         clock: Arc::new(SystemClock),
         timezone: config.cron.timezone.clone(),

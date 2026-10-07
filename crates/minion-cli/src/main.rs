@@ -6,6 +6,7 @@ mod cron;
 mod init;
 mod markdown;
 mod mcp;
+mod mcp_serve;
 mod render;
 mod repl;
 mod run;
@@ -60,7 +61,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
         Some(Command::Init(_)) => unreachable!("handled above"),
         Some(Command::Session(args)) => session::run(&cli, &config, args.clone()).await,
         Some(Command::Cron(args)) => cron::run(&cli, &config, args.clone()).await,
-        Some(Command::Mcp(args)) => mcp::run(&cli, &config, args.clone()).await,
+        Some(Command::Mcp(args)) => mcp::run(&cli, &config, &cwd, args.clone()).await,
         Some(Command::Run { prompt }) => {
             let prompt = resolve_prompt(prompt)?;
             let stop = run::one_shot(&cli, &config, &cwd, prompt).await?;

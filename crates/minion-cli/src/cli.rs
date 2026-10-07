@@ -103,9 +103,9 @@ pub struct McpArgs {
 
 /// MCP client actions.
 ///
-/// `mcp serve` — the other direction — belongs to M6 and is deliberately not
-/// listed here yet: a subcommand that exists but refuses to run is worse than
-/// one that is not there.
+/// `mcp serve` — the other direction — is M6: it publishes minion to an MCP
+/// host over stdio. The two are mutually exclusive by construction (R5): the
+/// server owns stdin/stdout, so it never starts the REPL.
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum McpAction {
     /// List configured servers, whether they came up, and the tools they offer.
@@ -115,6 +115,14 @@ pub enum McpAction {
     Tools {
         /// The server's name, as it appears under `[mcp.client.servers]`.
         server: String,
+    },
+
+    /// Run as an MCP server over stdio, exposing the agent to another model.
+    Serve {
+        /// Use stdio. The only transport there is; `[mcp.server].transport`
+        /// must also say `stdio`.
+        #[arg(long)]
+        stdio: bool,
     },
 }
 

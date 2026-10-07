@@ -1,11 +1,16 @@
-//! `minion mcp list` and `minion mcp tools <server>` (§5.12).
+//! `minion mcp list`, `minion mcp tools <server>` and `minion mcp serve` (§5.12).
 //!
-//! Both commands are read-only views of `[mcp.client.servers.*]`, and both
+//! The first two are read-only views of `[mcp.client.servers.*]`, and both
 //! contact the servers to answer: a tool list is not something a config can
 //! state, so "configured servers + discovered tools" means spawning them. A
 //! server that will not start is reported, not fatal — the same degradation a
 //! turn gets.
+//!
+//! `mcp serve` is the other direction: it publishes minion to an MCP host over
+//! stdio and lives in [`crate::mcp_serve`]. It never returns to the REPL, which
+//! is the whole of R5 — the two would otherwise fight over stdin/stdout.
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use minion_core::config::{Config, Decision, McpServerConfig};
@@ -15,12 +20,17 @@ use minion_mcp::{McpServers, OnStart};
 use crate::cli::{Cli, McpAction, McpArgs};
 
 /// Run a `minion mcp` subcommand.
-pub async fn run(cli: &Cli, config: &Config, args: McpArgs) -> Result<ExitCode> {
-    let servers = McpServers::new(&config.mcp.client, config.exec.output_cap_bytes);
-
+pub async fn run(cli: &Cli, config: &Config, cwd: &Path, args: McpArgs) -> Result<ExitCode> {
     match args.action {
-        McpAction::List => list(cli, &servers).await,
-        McpAction::Tools { server } => tools(cli, &servers, &server).await,
+        McpAction::Serve { stdio } => crate::mcp_serve::run(cli, config, cwd, stdio).await,
+        action => {
+            let servers = McpServers::new(&config.mcp.client, config.exec.output_cap_bytes);
+            match action {
+                McpAction::List => list(cli, &servers).await,
+                McpAction::Tools { server } => tools(cli, &servers, &server).await,
+                McpAction::Serve { .. } => unreachable!("handled above"),
+            }
+        }
     }
 }
 

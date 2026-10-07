@@ -1,0 +1,220 @@
+---
+source: crates/minion-cli/src/mcp_serve.rs
+expression: surface_json(&runtime)
+---
+[
+  {
+    "description": "Run one turn of minion's agent with its own model backend and return the answer. Params: prompt (required), session_id? (continue a conversation), model?, max_iterations?, allow_tools? (a subset of the read-only tools).",
+    "name": "agent_ask",
+    "parameters": {
+      "properties": {
+        "allow_tools": {
+          "description": "Restrict the inner agent to these read-only tools.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_iterations": {
+          "description": "Cap the provider round-trips for this turn.",
+          "type": "integer"
+        },
+        "model": {
+          "description": "Override the model for this turn.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "What to ask the agent.",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Continue this conversation. Omit to start a new one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List minion's stored conversations, newest first.",
+    "name": "agent_list_sessions",
+    "parameters": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "description": "Fetch one conversation's transcript. Params: session_id (required).",
+    "name": "agent_get_session",
+    "parameters": {
+      "properties": {
+        "session_id": {
+          "description": "The conversation to fetch.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "Introspect the read-only tools minion's agent may call, with their risk classes.",
+    "name": "agent_list_tools",
+    "parameters": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "description": "Schedule a prompt to run on a 5-field cron expression. Params: schedule, prompt, name?, cwd?, timezone?, session_mode? (`new`|`reuse`), max_runs?, allow_overlap?.",
+    "name": "cron_add",
+    "parameters": {
+      "properties": {
+        "allow_overlap": {
+          "description": "Allow a run to start while the previous one is still active.",
+          "type": "boolean"
+        },
+        "cwd": {
+          "description": "Workspace for the run. Defaults to the current workspace.",
+          "type": "string"
+        },
+        "max_runs": {
+          "description": "Stop after this many runs.",
+          "type": "integer"
+        },
+        "name": {
+          "description": "Optional unique label.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "The prompt to run.",
+          "type": "string"
+        },
+        "schedule": {
+          "description": "5-field cron: minute hour day-of-month month day-of-week. Day of week is 0-7 with 0 and 7 meaning Sunday.",
+          "type": "string"
+        },
+        "session_mode": {
+          "enum": [
+            "new",
+            "reuse"
+          ],
+          "type": "string"
+        },
+        "timezone": {
+          "description": "IANA timezone. Defaults to the configured one.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schedule",
+        "prompt"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "description": "List scheduled jobs with their next run, last status, and session mode.",
+    "name": "cron_list",
+    "parameters": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
+    "description": "Delete a scheduled job by `id` or `name`.",
+    "name": "cron_remove",
+    "parameters": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "description": "Run a shell command in minion's workspace. Refused by policy unless [mcp.server].expose_exec is true.",
+    "name": "agent_run_command",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for `run_command`.",
+      "properties": {
+        "command": {
+          "description": "The command line to run, interpreted by the shell.",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Working directory, relative to the workspace root. Defaults to the root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stdin": {
+          "description": "Text piped to the command's stdin.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "description": "How long to allow, in milliseconds. Clamped to the configured maximum.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "title": "RunCommandArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Write a file in minion's workspace. Refused by policy unless [mcp.server].expose_write is true.",
+    "name": "agent_write_file",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for `write_file`.",
+      "properties": {
+        "content": {
+          "description": "The complete new contents of the file.",
+          "type": "string"
+        },
+        "create_dirs": {
+          "default": false,
+          "description": "Create missing parent directories.",
+          "type": "boolean"
+        },
+        "overwrite": {
+          "default": false,
+          "description": "Replace the file if it already exists. Without this, an existing file is\nan error rather than something to clobber.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Path to the file. Relative paths resolve against the workspace root.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "title": "WriteFileArgs",
+      "type": "object"
+    }
+  }
+]
