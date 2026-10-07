@@ -49,10 +49,12 @@ fn main() {
 
 /// Capability families the binary is always built with, plus any cargo features.
 ///
-/// §9's example is `(mcp, cron)`: these name what the binary can do, not cargo
+/// §9's example is `(mcp, cron)`: these name what the binary *can do*, not cargo
 /// features, because the families are compiled in unconditionally. A cargo
 /// feature is appended when one exists, so the string stays truthful if a
-/// capability ever becomes optional.
+/// capability ever becomes optional. `default` is skipped: it is the feature
+/// *group* `minion-cli` declares, set on every ordinary build, so listing it
+/// would claim a capability nobody opted into.
 fn features() -> String {
     let mut names = vec![
         "cron".to_string(),
@@ -63,6 +65,7 @@ fn features() -> String {
     for (key, _) in std::env::vars() {
         if let Some(feature) = key.strip_prefix("CARGO_FEATURE_")
             && !feature.is_empty()
+            && !feature.eq_ignore_ascii_case("default")
         {
             names.push(feature.to_ascii_lowercase().replace('_', "-"));
         }
