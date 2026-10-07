@@ -40,6 +40,12 @@ pub struct Config {
     pub cron: CronConfig,
     /// Consuming external MCP servers (SDD §5.10).
     pub mcp: McpConfig,
+    /// Remote peers a small model delegates a brief to (SDD §5.13, M10.2).
+    ///
+    /// Each entry is *one* tool — `peer__<name>_ask` — a flattened, gate-visible
+    /// delegation to another minion's `agent_ask` (D29). Keyed by the name that
+    /// tool carries.
+    pub peers: BTreeMap<String, Peer>,
     /// Self-update channel (SDD §9).
     pub update: UpdateConfig,
     /// Logging settings.
@@ -674,6 +680,93 @@ impl McpServerConfig {
     }
 }
 
+/// One remote peer, `[peers.<name>]` (SDD §5.13, M10.2).
+///
+/// A peer is *another minion's* `mcp serve` endpoint, reached over MCP like any
+/// other server (D25) — no new protocol. What differs is how it reaches the
+/// model: instead of every tool the peer publishes, a peer contributes exactly
+/// one, `peer__<name>_ask`, which carries a *brief* to the peer's `agent_ask`
+/// and brings back its answer. The name is per peer so the approval engine keys
+/// on it directly; a generic `delegate(target = "…")` would move the decision
+/// off the tool name and into an argument, which is the trap `mcp_call` is
+/// deferred for (D20, D29).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Peer {
+    /// Program to spawn for a peer on the same machine. Executed directly,
+    /// never through a shell. Mutually exclusive with [`Self::url`].
+    pub command: String,
+    /// Arguments passed to `command`, verbatim.
+    pub args: Vec<String>,
+    /// The peer's Streamable-HTTP endpoint, e.g. `http://big.tailnet.ts.net:8788/mcp`.
+    /// This is the shape the milestone is about: the brief leaves the machine.
+    pub url: String,
+    /// Name of the environment variable holding the bearer token. Only the name.
+    pub token_env: String,
+    /// Path to the credentials file (`api_key = "…"`, mode 0600) holding the
+    /// token. Only the path.
+    pub token_file: String,
+    /// Completion budget forwarded to the peer's `agent_ask` when a call does
+    /// not name one. `None` leaves the peer's own default.
+    pub max_tokens: Option<u32>,
+    /// Largest answer kept from the peer, in bytes. A longer answer is cut and
+    /// marked. Around 8 KB by default: the local model has a small context, so
+    /// a long answer to a short brief is the failure mode to avoid (§5.13).
+    pub result_cap_bytes: u64,
+    /// Approval decision for `peer__<name>_ask`, substituting the global
+    /// `policy.default` (and `policy.noninteractive`) for that one tool.
+    ///
+    /// `None` leaves it under the global policy — which is `deny` in a
+    /// non-interactive run, so a cron job cannot escalate a brief off the
+    /// machine unless the operator says so. Deny and allow rules still run
+    /// first. See D21.
+    pub approval: Option<Decision>,
+}
+
+impl Default for Peer {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            url: String::new(),
+            token_env: String::new(),
+            token_file: String::new(),
+            max_tokens: None,
+            result_cap_bytes: 8192,
+            approval: None,
+        }
+    }
+}
+
+impl Peer {
+    /// Whether this peer is reached over HTTP rather than spawned over stdio.
+    pub fn is_http(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+
+    /// The bearer token to send, resolved from `token_env` then `token_file`.
+    ///
+    /// `Ok(None)` means "no auth configured". A source that is named but yields
+    /// nothing is an error rather than a silent anonymous call, the same
+    /// fail-closed rule the MCP client applies.
+    pub fn bearer_token(&self) -> Result<Option<String>> {
+        resolve_secret(
+            &self.token_env,
+            &self.token_file,
+            "peer bearer token",
+            " (set `token_env` or `token_file` on the peer, or unset both to send no token)",
+        )
+    }
+
+    /// The one tool this peer is exposed as: `peer__<name>_ask`.
+    ///
+    /// It is also the family key the approval policy is keyed on, so the name a
+    /// call resolves to and the name a policy matches are the same string.
+    pub fn tool_name(name: &str) -> String {
+        format!("peer__{name}_ask")
+    }
+}
+
 /// `[update]`: where `minion update` looks for a newer release (SDD §9).
 ///
 /// The channel is a GitHub-compatible releases API serving prebuilt binaries.
@@ -917,6 +1010,52 @@ impl Config {
                          not to a `url`"
                     )));
                 }
+            }
+        }
+        // Peers: a name is half of `peer__<name>_ask`, and a peer is reached by
+        // its `command` or its `url`. Both are checked at load time so a typo is
+        // a startup error rather than a delegation tool that never works (M10.2).
+        for (name, peer) in &self.peers {
+            if name.trim().is_empty() {
+                return Err(Error::Config("a peers key must not be empty".to_string()));
+            }
+            if name.contains("__") {
+                return Err(Error::Config(format!(
+                    "peers.{name}: a peer name must not contain `__`, which separates \
+                     the namespace in `peer__<name>_ask`"
+                )));
+            }
+            let has_command = !peer.command.trim().is_empty();
+            let has_url = !peer.url.trim().is_empty();
+            if has_command && has_url {
+                return Err(Error::Config(format!(
+                    "peers.{name}: `command` (stdio) and `url` (HTTP) are mutually \
+                     exclusive; set exactly one"
+                )));
+            }
+            if !has_command && !has_url {
+                return Err(Error::Config(format!(
+                    "peers.{name}: one of `command` (stdio) or `url` (HTTP) is required"
+                )));
+            }
+            if has_url {
+                let url = peer.url.trim();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(Error::Config(format!(
+                        "peers.{name}.url must be an `http://` or `https://` endpoint, \
+                         was `{url}`"
+                    )));
+                }
+                if !peer.args.is_empty() {
+                    return Err(Error::Config(format!(
+                        "peers.{name}: `args` belongs to a stdio `command`, not to a `url`"
+                    )));
+                }
+            }
+            if peer.result_cap_bytes == 0 {
+                return Err(Error::Config(format!(
+                    "peers.{name}.result_cap_bytes must be at least 1"
+                )));
             }
         }
         // The server half: `stdio` (the default) or `http`. A second transport is
@@ -1406,6 +1545,74 @@ mod tests {
     fn no_mcp_servers_is_the_default() {
         let config = Config::default();
         assert!(config.mcp.client.servers.is_empty());
+    }
+
+    // -------------------------------------------------------------- peers (M10.2)
+
+    #[test]
+    fn no_peers_is_the_default() {
+        let config = Config::default();
+        assert!(config.peers.is_empty());
+    }
+
+    /// A peer names *one* tool, `peer__<name>_ask`, and is reached like any
+    /// other MCP server. Both are config facts, so both are tested here.
+    #[test]
+    fn a_peer_is_read_from_a_project_file_and_names_one_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[peers.big]\nurl = \"http://big.tailnet.ts.net:8788/mcp\"\n\
+             token_file = \"/home/me/.config/minion/big.credentials\"\n\
+             max_tokens = 512\nresult_cap_bytes = 4096\napproval = \"ask\"\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+        let big = &config.peers["big"];
+        assert!(big.is_http());
+        assert_eq!(big.url, "http://big.tailnet.ts.net:8788/mcp");
+        assert_eq!(big.max_tokens, Some(512));
+        assert_eq!(big.result_cap_bytes, 4096);
+        assert_eq!(big.approval, Some(Decision::Ask));
+        assert_eq!(Peer::tool_name("big"), "peer__big_ask");
+    }
+
+    /// Each check is a startup error rather than a delegation tool that never
+    /// works: a peer with no reach, two reaches, a bad scheme, or no room for a
+    /// result is refused before anything is called.
+    #[test]
+    fn a_peer_needs_exactly_one_reach_and_a_usable_cap() {
+        let cases = [
+            ("neither", "[peers.a]\n"),
+            (
+                "both",
+                "[peers.a]\ncommand = \"x\"\nurl = \"http://h/mcp\"\n",
+            ),
+            ("scheme", "[peers.a]\nurl = \"127.0.0.1:8788/mcp\"\n"),
+            (
+                "args",
+                "[peers.a]\nurl = \"http://h/mcp\"\nargs = [\"-x\"]\n",
+            ),
+            ("cap", "[peers.a]\ncommand = \"x\"\nresult_cap_bytes = 0\n"),
+            ("name", "[peers.a__b]\ncommand = \"x\"\n"),
+        ];
+        for (label, body) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("minion.toml"), body);
+            let err = Config::load_with(None, None, dir.path()).unwrap_err();
+            assert!(
+                matches!(err, Error::Config(_)),
+                "{label}: expected a config error, got: {err}"
+            );
+        }
+    }
+
+    /// §5.13: the result cap defaults to "around 8 KB", because the model that
+    /// receives it has a small context.
+    #[test]
+    fn a_peer_result_cap_defaults_to_around_eight_kilobytes() {
+        assert_eq!(Peer::default().result_cap_bytes, 8192);
+        assert_eq!(Peer::default().max_tokens, None);
     }
 
     /// §5.1: the server half defaults to the read-only surface (D8, T5). Shell
