@@ -1,8 +1,9 @@
-//! One live connection to one external MCP server, over stdio (SDD §5.10).
+//! One live connection to one external MCP server, over stdio or Streamable
+//! HTTP (SDD §5.10, D25).
 //!
 //! Everything protocol-shaped stops here: the rest of the crate works in terms
 //! of a tool list and a text result, so nothing above this file has to know that
-//! `rmcp` exists.
+//! `rmcp` exists — or which transport carried the call.
 
 use std::sync::Arc;
 
@@ -10,6 +11,9 @@ use rmcp::RoleClient;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::service::RunningService;
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -74,6 +78,35 @@ impl McpClient {
         let service = ().serve(transport).await.map_err(|err| {
             Error::Config(format!(
                 "MCP server `{server}`: the handshake failed: {err}"
+            ))
+        })?;
+
+        Ok(Arc::new(Self {
+            server: server.to_string(),
+            service: Mutex::new(service),
+        }))
+    }
+
+    /// Reach a server over Streamable HTTP and complete the MCP handshake.
+    ///
+    /// `url` is the endpoint — `http://host:port/mcp` — and `token`, when
+    /// present, is sent as `Authorization: Bearer <token>` on every request.
+    ///
+    /// No TLS is configured, deliberately: inside a tailnet the traffic is
+    /// already encrypted by WireGuard, and the token — not the source address —
+    /// is what authenticates the caller, because any process on a tailnet node
+    /// can reach that port (D26). An `https://` URL would still work if a future
+    /// decision added certificates; nothing here forbids one.
+    pub async fn connect_http(server: &str, url: &str, token: Option<&str>) -> Result<Arc<Self>> {
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+        if let Some(token) = token {
+            config = config.auth_header(token);
+        }
+        let transport = StreamableHttpClientTransport::with_client(reqwest::Client::new(), config);
+
+        let service = ().serve(transport).await.map_err(|err| {
+            Error::Config(format!(
+                "MCP server `{server}`: the HTTP handshake failed: {err}"
             ))
         })?;
 
@@ -184,18 +217,25 @@ fn render(content: &[ContentBlock], cap: usize) -> (String, bool) {
         text.push_str(&piece);
     }
 
+    cap_text(text, cap)
+}
+
+/// Cut `text` to `cap` bytes on a character boundary, marking the cut.
+///
+/// A cap that splits a code point would produce a string the provider rejects
+/// outright, so the boundary is searched for rather than assumed. `truncated`
+/// is `true` only when something was actually removed.
+pub fn cap_text(mut text: String, cap: usize) -> (String, bool) {
     if text.len() <= cap {
         return (text, false);
     }
-    // Cut on a character boundary: a cap that splits a code point would produce
-    // a string the provider rejects outright.
     let mut end = cap;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    let mut cut = text[..end].to_string();
-    cut.push_str("\n… [truncated to the output cap]");
-    (cut, true)
+    text.truncate(end);
+    text.push_str("\n… [truncated to the output cap]");
+    (text, true)
 }
 
 #[cfg(test)]

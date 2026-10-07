@@ -308,9 +308,9 @@ Rationale: `minion-core` has zero terminal and zero network dependencies, so the
 
 ### 5.1 Configuration
 
-**Precedence** (highest first): CLI flags → env vars (`MINION_*`) → project `minion.toml` → user config → built-in defaults.
+**Precedence** (highest first): CLI flags → env vars (`MINION_*`) → project `minion.toml` → synced master layer (`config sync`, §5.14) → user config → built-in defaults.
 
-Locations: `$XDG_CONFIG_HOME/minion/config.toml` (or `~/Library/Application Support/minion/` on macOS), plus `./minion.toml` in the workspace.
+Locations: `$XDG_CONFIG_HOME/minion/config.toml` (or `~/Library/Application Support/minion/` on macOS), plus `./minion.toml` in the workspace, plus the machine-local `synced.toml` written by `config sync` (§5.14).
 
 ```toml
 [provider]
@@ -389,22 +389,42 @@ missed_run_cap = 20              # ceiling on the runs one run_all catch-up may 
 
 [mcp.server]
 enabled = true
-transport = "stdio"
+transport = "stdio"              # stdio | http
+bind = "127.0.0.1:8788"          # only for transport = "http"; loopback by default
+token_env = ""                   # for "http": the NAME of the var holding the bearer token
+token_file = ""                  # ...or the PATH to the 0600 credentials file holding it
 expose_exec = false              # run_command over MCP defaults OFF
 expose_write = false
 expose_cron_write = true
 
+# A server is reached one of two ways, and they are mutually exclusive: a
+# `command` minion spawns over stdio, or a `url` it speaks Streamable HTTP to.
 [mcp.client.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
 approval = "ask"
 tool_allow = ["read_file", "list_directory"]
 
+[mcp.client.servers.peer]
+url = "http://peer.tailnet.ts.net:8788/mcp"
+token_file = "~/.config/minion/peer.credentials"
+approval = "ask"
+tool_allow = ["*"]
+
 [logging]
 level = "info"
 format = "text"                  # text | json
 file = "~/.local/state/minion/minion.log"
 redact_env = true
+
+# The master config channel (M11, §5.14). This section is read from the *local*
+# layers only — it is the bootstrap that tells a node where the master repo is,
+# so the synced layer itself may never define it. `remote`/`ref` name the git
+# channel; `node` names *this* machine and is resolved when it is empty.
+[configsync]
+remote = "https://git.albruiz.dev/albruiz/minion-config.git"
+ref = "main"                     # branch or tag; a pinned commit is also accepted
+node = ""                        # empty → `hostname -s` → the self entry of `tailscale status`
 ```
 
 **Secrets.** The config records only the *names* of where a secret comes from. The value is read at
@@ -975,13 +995,14 @@ results were dropped is rejected by the provider, so a turn must never be split.
 
 ### 5.9 MCP server
 
-The server task is started with `minion mcp serve` (stdio). It uses `rmcp`'s server trait and shares the same core loop, store, and policy engine.
+The server task is started with `minion mcp serve`, over **stdio** or **Streamable HTTP**
+(`[mcp.server].transport = "http"`). It uses `rmcp`'s server trait and shares the same core loop, store, and policy engine.
 
 **Exposed tools** (default surface):
 
 | Tool | Purpose | Default gate |
 |---|---|---|
-| `agent_ask` | Run one agent turn; params `prompt`, `session_id?`, `model?`, `max_iterations?`, `allow_tools?` | `auto` (read-only tool subset) |
+| `agent_ask` | Run one agent turn; params `prompt`, `session_id?`, `model?`, `max_tokens?`, `max_iterations?`, `allow_tools?` | `auto` (read-only tool subset) |
 | `agent_list_sessions` | Enumerate sessions | `auto` |
 | `agent_get_session` | Fetch transcript | `auto` |
 | `agent_list_tools` | Introspect enabled tools + risk classes | `auto` |
@@ -1032,19 +1053,40 @@ but the protocol, so diagnostics stay on stderr.
   `mcp serve` is a protocol server, not a daemon; starting a scheduler inside it
   is a separate decision and is not part of this milestone.
 
+**Transport (as implemented, M10).** With `transport = "http"` the same surface
+is served over `rmcp`'s Streamable HTTP transport on `bind`, instead of owning
+stdin/stdout. The gate, the read-only default and the `agent_*` naming are
+unchanged — the transport is a socket where stdio was a pipe, nothing above it
+moves. The bind policy (D27) runs at config load, before `TcpListener::bind`, so
+a wildcard, a globally routable address, or a non-loopback bind with no token is
+refused as a startup error rather than served unauthenticated; the default is
+`127.0.0.1:8788`. When a token source is configured the bearer token is required
+on every request, loopback included (D26); the config carries only the *name* of
+the environment variable or the *path* to the `0600` credentials file, resolved
+through the same `resolve_secret` the provider key uses. Off a loopback bind the
+`Host` allowlist is switched off deliberately: a MagicDNS name cannot be derived
+from an `IP:port` bind, and the token — not the request's `Host` or its source
+address — is the authentication boundary. There is no TLS, also deliberately
+(D26): inside the tailnet WireGuard already encrypts the traffic.
+
 ### 5.10 MCP client
 
-- Servers from `[mcp.client.servers.*]` are spawned at startup (lazily on first use if `lazy = true`).
+- Servers from `[mcp.client.servers.*]` are reached at startup — spawned over stdio when they have a `command`, or contacted over Streamable HTTP when they have a `url` (lazily on first use if `lazy = true`).
 - `tools/list` results are flattened into the registry as `mcp__<server>__<tool>`, with `inputSchema` passed through verbatim (minion does not rewrite third-party schemas).
 - `tool_allow` per server filters what reaches the model; anything not listed is invisible and uncallable.
 - Per-server approval policy overrides the global default, so a trusted local server can be `auto` while a network server is `ask`.
 - Server failures degrade gracefully: the tools are removed from the catalog and a `system` notice explains why. They are retried on the next turn.
 - Tool name collisions with built-ins are resolved by prefixing, never shadowing: built-ins always win.
 
-**Configuration.** Each `[mcp.client.servers.<name>]` entry is `command`, `args`, `lazy`, `tool_allow`
-and `approval`. The table key is the namespace: it names every tool of that server, and a key containing
-`__` is rejected at load time rather than left to collide with another server's. `command` is spawned
-directly, never through a shell, so an argument cannot become a second command.
+**Configuration.** Each `[mcp.client.servers.<name>]` entry is reached one of two ways, and they are
+mutually exclusive: a `command` (with `args`) minion spawns over stdio, or a `url` it speaks
+Streamable HTTP to. `Config::validate` accepts exactly one of the two — both, or neither, is a startup
+error, as is an `args` list beside a `url` or a scheme that is not `http(s)`. A `url` server may name a
+bearer token source — `token_env` (a variable *name*) or `token_file` (a credentials-file *path*),
+sent as `Authorization: Bearer` — and the value is never in the config. The table key is the namespace:
+it names every tool of that server, and a key containing `__` is rejected at load time rather than left
+to collide with another server's. `command` is spawned directly, never through a shell, so an argument
+cannot become a second command.
 
 ```toml
 [mcp.client.servers.files]
@@ -1053,6 +1095,12 @@ args = ["--root", "/srv"]
 lazy = true                       # contact it on the first turn, not at startup
 tool_allow = ["read_*", "list"]   # empty allows nothing; ["*"] allows everything
 approval = "auto"                 # this server's tools substitute the global default
+
+[mcp.client.servers.peer]         # a second minion, on the same tailnet
+url = "http://peer.tailnet.ts.net:8788/mcp"
+token_file = "~/.config/minion/peer.credentials"   # api_key = "…", mode 0600
+approval = "ask"
+tool_allow = ["*"]
 ```
 
 **What is published, and what is gated (as implemented, M5).** An external tool is an ordinary `Tool`:
@@ -1078,6 +1126,17 @@ built-in, whatever a server calls itself.
 a tool list cannot be discovered without a connection — `lazy` buys a cheaper session start, not a
 hidden tool set. `minion mcp list` and `minion mcp tools <server>` are explicit uses and start a lazy
 server immediately, which is also how an operator inspects one.
+
+**HTTP transport (as implemented, M10).** A `url` server goes through the same
+`McpClient`, so the catalogue, `tool_allow`, the per-server policy, the transition
+notices and the retry are the stdio behaviour unchanged — a peer that is down is a
+notice and a retry on the next turn, exactly as a child process that failed to
+spawn is. The difference is the handshake: `connect_http` opens `rmcp`'s Streamable
+HTTP client against the endpoint and, when a token is configured, sends it as
+`Authorization: Bearer` on every request. The token is resolved from `token_env`
+then `token_file` with the provider's resolution; a source that is *named* but
+yields nothing is an error rather than a silent anonymous call. `minion mcp list`
+prints the `url` in place of the `command` line for such a server.
 
 **Failure.** A server that cannot be started costs its tools and nothing else: the turn completes, the
 tools are gone from the catalogue, and the reason arrives as a `system` message. Notices are emitted on
@@ -1169,7 +1228,11 @@ minion mcp tools <server>              # inspect one server
 minion init [--check] [--project] [--force] [--non-interactive]
             [--header 'Name: value']… [--credentials-file <PATH>] [--no-store-token]
                                        # first-run setup for the model backend (§5.1.1)
-minion config show|path                # read-only; `config init` aliases `minion init`
+minion config show|path [--origin] [--json]
+                                       # read-only; `--origin` names the layer each value
+                                       # came from (§5.14); `config init` aliases `minion init`
+minion config sync [--dry-run] [--check] [--node <NAME>] [--remote <URL>] [--ref <REF>]
+                                       # converge the machine layer from the master repo (§5.14)
 minion doctor                          # env, config, db, provider reachability
 minion update [--check] [--yes] [--force] [--rollback]
                                        # check a release channel and replace the installed
@@ -1187,6 +1250,229 @@ Global options:
 ```
 
 **Exit codes:** `0` success · `1` turn failed, or `minion update --check` found an update available · `2` usage error · `3` provider/auth error, or an update could not reach its release channel · `4` refused (policy denied in non-interactive mode, or an operation declined to proceed — e.g. `init` against an existing config without `--force`, an update whose checksum or commit did not verify, or one cancelled at the prompt) · `5` internal error.
+
+---
+
+### 5.13 Peers — asking a larger model
+
+A **peer** is another minion's `mcp serve` endpoint. Nothing new is spoken: a peer is
+an MCP server like any other (M10.1, D25). What this section adds is the *shape of the
+delegation* — how a small local model hands a hard question to a big remote one.
+
+```toml
+[peers.big]                                  # one delegation tool, `peer__big_ask`
+url = "http://big.tailnet.ts.net:8788/mcp"   # a remote minion; `command` is the local form
+token_file = "~/.config/minion/big.credentials"   # api_key = "…", mode 0600
+max_tokens = 512          # forwarded to the peer's `agent_ask` when a call does not name one
+result_cap_bytes = 8192   # what the local model sees; around 8 KB by default
+approval = "ask"          # this peer's fallback, substituting policy.default (D21)
+```
+
+- **One tool per peer, flattened `peer__<name>_ask`.** This is deliberate, and the
+  alternative is refused on principle: a generic `delegate(target = "…")` would move the
+  approval decision off the tool *name* and into an argument, which is precisely the trap
+  `mcp_call` is deferred over (D20) — the engine keys its rules on names, and a parameter
+  recreates the ambiguity the flattened tools exist to remove. The name is also the family
+  key: `peer__big_ask` is the string a `[policy.allow]`/`[policy.deny]` rule and a per-peer
+  `approval` key on, and an operator's `mcp__…` rules are untouched by it.
+- **Params `{ brief, context?, max_tokens? }`.** `brief` is required and non-empty.
+  A `tools` argument is *refused*, not ignored: `agent_ask` already runs the read-only
+  subset of the peer's own registry (D22), and the caller does not get to widen it.
+- **A brief, not a trajectory.** Only the brief — with `context`, if given, prefixed — is
+  sent; nothing from the local transcript rides along. This is the evidence-backed choice:
+  the handoff-tax study (arXiv 2608.24358) measures that escalating with the full
+  trajectory recovers *less than half* of the quality gap and that the escalation works
+  better the less of the weak model's history it carries. It is also mechanical: the local
+  model that receives the answer has a 4–8K context, so a long answer back is what kills
+  it. Hence the result cap.
+- **Risk is `Network`** — the MCP floor (D21). The brief leaves the machine, so the gate
+  is consulted *before* anything is sent, and with `policy.noninteractive = "deny"` (the
+  default) a cron job cannot escalate: `build_cron_gate` is non-interactive, so
+  `peer__<name>_ask` is refused there exactly as `http_fetch` is. This is the same
+  reasoning the System One guard carries — the payload leaves the machine (D16).
+- **The peer's answer is data.** It is placed in the tool result and nowhere else; it
+  never becomes a system prompt and is never executed. A peer is a remote endpoint, and
+  its text is untrusted input, exactly like any other tool output (T14). A delegated turn
+  is told so in the tool's own description.
+- **Depth cap 1.** A peer answers through its own `agent_ask`, whose inner agent holds
+  only the read-only subset of the built-in registry (D22). A delegation tool is
+  `Network`, so it is never in that subset: a peer cannot pass the brief on to a third
+  model. The cap is the read/write line itself (D15), not a counter a caller could reset,
+  and `mcp serve` never assembles `[peers.*]` — so two small models passing the ball is
+  not reachable by construction. `crates/minion-cli/src/mcp_serve.rs` pins the property
+  with a test on the inner surface.
+- **Cost is visible.** The peer's `agent_ask` reports the tokens it spent; the delegation
+  tool puts them in the tool result's metadata (`usage`), and the loop folds them into the
+  turn's usage (`ToolOutput::reported_usage`). `/cost` therefore includes what the peer
+  spent. Advisory, as always (R8): a peer that reports nothing simply does not count, and
+  no turn is blocked on it.
+- **Failure is a tool error.** A peer that cannot be reached, refuses the brief, or dies
+  mid-call becomes a tool result the model can read; the turn carries on, and the
+  connection is retried on the next call. Nothing panics, and nothing hangs the loop.
+  A `result_cap_bytes` that the answer exceeds cuts the answer and marks it `truncated`.
+
+`mcp serve` ignores `[peers.*]`, for the same reason it ignores `[mcp.client.servers.*]`:
+the delegated turn's surface is the built-ins' read-only subset, and a peer there would be
+the second hop the depth cap exists to forbid.
+
+---
+
+### 5.14 Master config layer — `minion config sync`
+
+A **master** lets one place describe how all the other nodes are configured, without depending on
+the network between them. It is deliberately *not* a process: the master is a **git repository plus
+a convention**, and each node converges by pulling it. This section fixes the shape of that pull;
+it is a design proposal (M11), not a built feature (D35–D39).
+
+**Pull, never push.** Every node runs `minion config sync`. The master never reaches into a node,
+so convergence works for a node behind NAT, on a different network, or on one that is not on the
+tailnet at all — which is the case of the 1050 Ti today. The evaluated alternative is an HTTP
+endpoint served by the master (either a live `GET /config` or a push channel): it is **refused**
+because it needs a service that is always on (against the no-daemon principle and the non-goals
+below), it needs every node to be able to *reach* the master (exactly the connectivity problem the
+pull solves), and it re-implements — worse — what git already is: versioning, transport auth,
+history, and an offline cache. Recorded as **D35**.
+
+**Channel: the git repo.** `[configsync].remote` and `.ref` name the channel; both are read from
+the **local layers only** (flags or the user config), because this is the bootstrap that tells a
+node where the master is — the synced layer itself may never define it.
+
+```
+minion-config/                 # a repo of its own (Forgejo), not the minion source tree
+├── base.toml                  # shared by every node
+├── nodes/<name>.toml          # the overlay for one node
+└── checksums.txt              # the commit and a sha256 per file (generated, committed)
+```
+
+`sync` shells out to the system `git` (a bare mirror under `$XDG_CACHE_HOME/minion/config-sync/`),
+rather than growing a second protocol: git is already where the nodes are, it already carries the
+host's auth (SSH key or HTTPS token), and it is the versioned, auditable store this milestone is
+about. If `git` is absent the command fails loudly — it never degrades to a silent no-op.
+
+**Base + overlay.** The synced layer is `base.toml` deep-merged with `nodes/<name>.toml` on
+`toml::Value`, the existing merge, so an overlay only restates the keys it changes. A directory of
+per-node files is chosen over one `[node."<name>"]` table in a shared file: adding a node is a file
+add, two nodes never collide on one table (a merge hotspot), and one node's policy is one file to
+read. **D37**.
+
+**How a node knows its own name.** In order: the `--node` flag → `[configsync].node` → `hostname
+-s` → the self entry of `tailscale status --json` (`DNSName`, domain stripped). The resolved name
+and the rule that produced it are logged and printed by `config show --origin`. A name that does
+not appear in `nodes/` is **not** an error: the node applies the base alone and warns, so a freshly
+provisioned machine converges before its entry exists. A node that *is* listed but whose overlay
+fails to parse is a hard error — a policy that cannot be honoured must not be silently dropped.
+
+**Precedence.** The synced layer fits the existing order without replacing it (highest first):
+
+```
+CLI flags → env (MINION_*) → project minion.toml → synced layer → user config → defaults
+```
+
+The argument is the one the existing order already uses — *more specific wins*. The synced layer is
+a **machine** layer; a project `minion.toml` is a **workspace** layer, therefore more specific, and
+stays above it; the user config is also machine-level but expresses a personal preference, and an
+admin policy outranks it, so the synced layer sits above the user file. `sync` writes the merged
+base+overlay to a machine-local `synced.toml` beside the user config (never committed, never part
+of a `--project` write) with a sibling state file recording `{remote, ref, commit, files:sha256,
+applied_at}`; `Config::load` then merges it like any other layer, so a machine that has never synced
+has no file and behaves exactly as today. No database is involved. **D36**.
+
+Two consequences are written down rather than hidden. Because the project file is above the synced
+layer, **a cloned repository's committed `minion.toml` can override master policy** (for example
+widen `[policy.allow]`); and because the synced layer is above the user file, **an operator cannot
+override master policy in their own config**. If master policy should instead be a floor that
+neither can loosen, that is a different mechanism — a "locked keys" list, not an order — and it is
+flagged for the spec owner (§11, R10) rather than decided here.
+
+**Observability is mandatory, not a nicety.** A sync nobody can inspect is magic, and magic is not
+debuggable.
+
+- `minion config sync --dry-run` fetches and verifies, prints the *effective* diff, and writes
+  nothing:
+
+  ```
+  config sync: node "1050ti" (from hostname)
+    channel  https://git.albruiz.dev/albruiz/minion-config.git @ 4f2a1c9 (ref main)
+    verified 3 files, sha256 ok, commit ok
+    synced layer (base.toml + nodes/1050ti.toml):
+      + peers.big.url          nodes/1050ti.toml
+      + peers.big.token_file   base.toml
+      ~ policy.noninteractive  base.toml   "ask" -> "deny"   (shadowed by project ./minion.toml)
+    dry-run: nothing written
+  ```
+
+- `minion config sync --check` resolves the remote commit and exits `1` when it differs from the
+  applied one, writing nothing — the same shape as `minion update --check`.
+
+- `minion config show --origin` names, for every effective key, the layer it came from:
+  `default` / `user:<path>` / `synced:<commit> <file>` / `project:<path>` / `env:<VAR>` / `flag`.
+  It is implemented by keeping each layer's `toml::Value` and walking them highest-first: a leaf's
+  origin is the topmost layer that defines it. `--json` is the script form.
+
+  ```
+  provider.model         = "qwen2.5:14b"   [user:~/.config/minion/config.toml]
+  peers.big.url          = "http://big…"   [synced:4f2a1c9 nodes/1050ti.toml]
+  policy.noninteractive  = "deny"          [project:./minion.toml]
+  workspace.roots        = ["."]           [default]
+  ```
+
+**Integrity, the same contract as `minion update` (D23).** The bundle carries `checksums.txt` with
+the commit and a sha256 per config file. Before anything is applied, in order: **(1)** every file
+hashes (computed in-tree, `minion_core::sha256`) to its entry, and **(2)** the commit the ref
+resolves to equals the `commit` line. Any mismatch refuses the whole bundle — exit `4`, nothing
+written (fail-closed). Two checks, not one, for update's reason: the **checksum** binds the bytes to
+the manifest and the **commit** binds the manifest to a revision, so a bundle that swapped both
+files and manifest still fails the commit check. Both are needed even though git hashes objects,
+because git proves the objects it fetched and says nothing about a hand-edited cache, and it does
+not bind a bundle read any other way to a revision. Applying is atomic: `synced.toml` and its state
+file are written to a temp file and `rename()`d, so an interrupted sync never leaves a half-applied
+layer. **D38**.
+
+The honest limit, stated as the risk it is: **whoever controls the channel controls the effective
+policy of every node.** The manifest lives in the repo, so a malicious publisher rewrites the files
+*and* the manifest together and passes both checks — the residual is publisher trust, exactly the
+limit D23 already carries, not a claim of supply-chain security. It is written up as **T15** and
+**R10**. What keeps the blast radius bounded is §5.1: the channel can only ever distribute *names*,
+never a secret value, so a compromised master distributes policy — it cannot exfiltrate keys.
+
+**Relation to peers (M10).** The peer cohort is the clearest use case. Today `[peers.big]` is
+repeated in every node's config, so adding a node means editing N files. With the master, the peer
+lives once in `base.toml`:
+
+```toml
+# base.toml
+[peers.big]
+url = "http://big.tailnet.ts.net:8788/mcp"
+token_file = "~/.config/minion/big.credentials"   # a path, never the token
+approval = "ask"
+```
+
+Every node gains `peer__big_ask` after its next `config sync`; adding a node is one
+`nodes/<name>.toml`; rotating the peer's endpoint is one line in the base. Only **names** travel —
+`url` plus a `token_file` *path* or a `token_env` *variable name* — so §5.1 holds and the master is
+never where the tokens live. Each node's own `0600` credentials file (or environment) supplies the
+value; provisioning those values is out of scope, below.
+
+**What does not enter.** **D39.**
+
+- **Centralizing secret *values*.** That is the token-manager's job, a separate system. The master
+  records names and paths, never values (§5.1, D9/D11). A master that held every node's key would
+  be the single point of compromise this whole section exists to avoid.
+- **Automatic node discovery or enrolment.** A node is in the repo because a human put it there.
+  No tailnet scan, no self-registration, no "join" protocol.
+- **Any permanently-running master service.** No daemon, no endpoint, no listener (D35).
+- **A sync timer inside minion.** `sync` runs when it is invoked. A node that wants it periodic
+  wires its own cron/launchd to call `minion config sync`; minion starts no background loop for it.
+
+**Exit codes:** `0` up to date · `2` usage · `3` channel unreachable (remote, auth, or ref missing)
+· `4` refused (integrity mismatch, or a listed overlay that will not parse) · `5` internal.
+`--check` exits `1` when drift exists.
+
+**Placement.** The rules — bundle shape, the manifest parse, verification, the overlay merge and the
+origin walk — are pure and live in `minion-core` (they take bytes and return values, no I/O). The
+one part that shells out to `git` lives in a new small crate **`minion-master`**, mirroring the split
+`minion-update` and `minion-guard` already use to keep `minion-core` free of I/O; the subcommand is
+`minion-cli/src/config.rs`. `[configsync]` is `ConfigSyncConfig` in `minion-core/src/config.rs`.
 
 ---
 
@@ -1214,6 +1500,7 @@ API keys; filesystem contents; shell access; the SQLite store (may contain sensi
 | T11 | `init` writes a config that leaks a credential | The value goes only to the separate `0600` credentials file; the config records env var *names* and paths, so `--project` output stays committable; the token is never printed, never logged, and never appears in `--json` |
 | T12 | `init` silently overwrites a hand-tuned config | Existing target is diffed and requires `--force`; writes go through a temp file and rename, so no partial config is left behind |
 | T13 | The API key leaks into terminal scrollback or a screen share | Echo is disabled *before* the prompt is printed, not after, closing the window in which a fast paste would be echoed; the guard restores the previous termios on drop, including on panic |
+| T15 | The master config channel is the softest target in the fleet: whoever controls it controls the effective policy of *every* node | The bundle is verified before it is applied (per-file SHA-256 against a committed manifest, plus the commit the ref resolves to), fail-closed (D38, §5.14); the channel can only *name* secrets, never carry a value (§5.1), so a compromised channel cannot exfiltrate keys — it can only distribute policy; sync is an explicit pull, never a daemon, so nothing applies without a decision. The residual — a manifest that agrees with a malicious commit — is publisher trust, the same acknowledged limit `minion update` carries (D23) |
 
 ### 6.3 Principle of least exposure
 
@@ -1315,6 +1602,9 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | M8 — Self-update | done | `minion update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
 | M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `minion update` installs; a mismatched version or a failing test publishes nothing |
 | M9.1 — Six targets | done | The release pipeline covers `{linux, macOS, Windows} × {amd64, arm64}`: macOS and Windows on their own runners, Windows/arm64 native, every built binary run to assert both stamps, and one `checksums.txt` over the six named assets (D24, D28) | A push to `main` publishes all six assets under the names `minion update` looks up, each carrying the version and commit it was built from, and the uploaded `checksums.txt` covers the six |
+| M10 — Peer transport | done | Streamable HTTP for both halves: `url` on `[mcp.client.servers.*]` with bearer-token auth (`token_env`/`token_file`), `transport = "http"` + `bind` on `[mcp.server]`, a fail-closed bind policy, no TLS by design | Two minion instances on a tailnet discover and call each other's gated tools over HTTP; a non-loopback bind with no token refuses to start; a wrong token lists nothing |
+| M10.2 — Peer delegation | done | One `peer__<name>_ask` tool per `[peers.*]` entry, carrying a *brief* to the peer's `agent_ask`; a configurable result cap (~8 KB), the read-only depth cap, remote usage folded into the turn, and the whole thing behind the `Network` gate | A small model escalates a self-contained brief to a bigger peer through the gate and gets its answer as tool-result data; a cron job cannot escalate; the gate decides before the network is touched; a peer that fails or goes missing is a tool error, never a panic or a hang |
+| M11 — Master config node | proposed | A master as a **git repo, not a service**: `minion config sync` converges a machine-local synced layer (`base.toml` + `nodes/<name>.toml`) from a Forgejo repo, under the D23 integrity contract, slotted into the existing precedence, with `--dry-run` and `config show --origin`. Design only (§5.14, D35–D39); no code in this milestone card | A node behind NAT — or one not yet on the tailnet — converges its config by *pulling*; a manipulated bundle is refused and nothing changes; adding a peer cohort member is one edit to the repo, not N node configs |
 
 ---
 
@@ -1331,6 +1621,7 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 | R6 | Cron in-process means jobs don't run when minion is closed | Documented; optional `--system` crontab/launchd integration deferred to v2 |
 | R7 | `always` allowlist could persist an over-broad pattern | Show the exact pattern before persisting; require explicit confirmation; cap pattern length and forbid wildcards alone |
 | R8 | Token/cost accounting differs per provider | Treat usage as advisory; never block a turn solely on a missing usage field |
+| R10 | The master channel is the fleet's single point of policy injection, and the chosen precedence lets a cloned project — and blocks a local user — override master policy | The bundle is verified before it is applied, fail-closed (D38), and the channel carries names, never secret values (§5.1), so a compromised master distributes policy but cannot exfiltrate keys; recorded as T15. The residual (a manifest that agrees with a malicious commit) is publisher trust, the same limit D23 carries. Whether master policy should instead be a *floor* a project or user cannot loosen — a "locked keys" mechanism with its own decision — is left open for the spec owner |
 
 **Open questions for review:**
 1. ~~Should `http_fetch` support an explicit `http://` for local dev servers via a named allowlist
@@ -1433,4 +1724,15 @@ than editing individual tools.
 | D22 | The MCP server's disabled capabilities are *listed and refused*, not absent, and the exposed shell tool is decided under the name `run_command` | §5.9's table says `agent_run_command` and `agent_write_file` are "denied unless" the flag is set, and T5's mitigation is a startup banner — both describe a capability that exists and is refused, not one that is missing. A hidden tool would leave the host unable to tell "minion cannot do this" from "I mistyped the name", and it would make the denial invisible in the audit trail. So the two tools are always in the list, and without their flag the engine carries a deny rule that refuses every call and records the refusal. The name the *gate* sees is the real tool's — `run_command`, `write_file` — because the policy engine is not a second, weaker world: an operator's existing `run_command` deny rules keep protecting the MCP surface, the classifier still sees the command it is judging, and `subject_for`/`pattern_for` still extract the right subject. The `agent_` prefix is a naming convention of this surface, not a second identity, and the audit row therefore names the tool that actually ran. The gate is non-interactive (`stdin` is the protocol pipe, so no prompt can be shown), and an enabled family substitutes the non-interactive fallback through `ToolPolicy` (D21) — deny and allow rules still run first, so turning a flag on grants nothing that was refused. `agent_ask`'s inner agent is restricted to the read-only subset of the built-in registry, filtered by `Risk::is_observation` rather than by a list of names, so the default surface cannot drift wider than the read/write line itself. The scheduler is deliberately not started here: a job created over MCP is stored and runs under the non-interactive cron gate the next time a process with a scheduler opens the database, which keeps `mcp serve` a protocol server rather than a daemon |
 | D23 | `minion update` installs a **prebuilt binary from a release channel**, never compiles on the target, and verifies it with two independent checks before replacing anything | The alternative — `git pull` and `cargo build` in place — was rejected because it turns an update into a build environment problem: it needs a toolchain on every machine, it needs a writable checkout, and a failure halfway leaves a half-built tree rather than a known-good binary. A prebuilt asset is one file that either matches or does not. The channel is a GitHub-compatible releases API with prebuilt per-platform assets and a `checksums.txt`, which is the shape `Az107/space-elevator` already publishes, so there is a working precedent to mirror. Two checks, not one, because each closes a different hole: the **checksum** binds the bytes to the release, and the **commit** binds the release to a revision, so a swapped asset that comes with a swapped manifest still fails the commit check. The commit is read from `target_commitish` when it is a hex SHA, or from a `build-commit:` line in the notes otherwise; a release that declares neither is refused rather than installed on a guess, which is the fail-closed reading of §5.12's "refused" exit. The hash is SHA-256 implemented in-tree (`minion-core::sha256`) rather than taken from `sha2`: the algorithm is 60 lines, the tests pin the NIST vectors, and it keeps `Cargo.lock` free of a new external crate, which matters for a binary whose whole selling point is a small dependency surface. The replacement is a staging file plus `rename()` so the path is never a half-written file, and the previous binary is kept as `minion.old-<version>` — which is also what `--rollback` restores, so undo does not need the network. Nothing else is touched: not the config, not the database, not the credentials file, because an update replaces exactly one file and anything more would make it an installer with opinions. When the directory is not writable, minion does not elevate and does not silently skip: it stages the verified bytes where it can write and prints the two literal `sudo` commands, matching the rule that Hermes never runs `sudo`. Two smaller decisions are recorded here too. `https` is required, with plain `http` permitted only to a literal loopback host — the exception exists for a local mirror and a test fixture, and it mirrors the rule `http_fetch` already uses (D17). And the target defaults to `current_exe()` canonicalized, overridable with `$MINION_UPDATE_BINARY`, so an update can replace an installation other than the one currently running without becoming a privileged operation: whoever can set the environment already runs the code. `--check` stays read-only, which is why it exits `1` on "update available" rather than `0`: a script asking "should I update?" needs the answer in the status, not in the prose |
 | D24 | The release pipeline publishes **gnu Linux binaries for amd64 and arm64** (amd64 native, arm64 cross-compiled with `gcc-aarch64-linux-gnu` on the runner) alongside the four macOS and Windows assets, derives the tag from the newest `vX.Y.Z` tag, and refuses to publish unless that tag equals `[workspace.package].version` | §9 asks for musl static on Linux, and this deviates: the binaries are gnu and dynamically linked. The reason is the dependency tree. `minion-store` bundles SQLite and rustls pulls `aws-lc-sys`, both of which compile C through `cc` and cmake, so a static musl build is a cross-toolchain problem — a musl C compiler for each architecture — rather than the one-file build musl is for a pure-Rust crate. The gnu path builds with the runner's own toolchain and only adds `gcc-aarch64-linux-gnu` for the arm64 link, which is the option the milestone named; musl is deferred until it can be exercised end to end rather than guessed at. The cost is a glibc floor: the job is pinned to the `ubuntu-22.04` runner (glibc 2.35) instead of `ubuntu-latest`, so the floor is stable rather than moving when GitHub rotates the image, and the failure mode is bounded — a binary that cannot start fails the `--version` commit check inside `minion update` and the install is refused, not half-applied. The Linux pair is published gnu; the four macOS and Windows assets are built by the same pipeline on the runners D28 describes, and the six names together — `minion-{linux,darwin,windows}-{amd64,arm64}` — are what `minion update` can consume. The tag is derived from the newest tag rather than from the manifest because that is the rule the `Az107/space-elevator` precedent publishes with, but the manifest is what the binary reports and `minion update` compares that to the tag, so the two must agree or the workflow fails: a release whose tag and embedded version disagree would make `minion update` offer the same release forever. |
+| D25 | MCP gains a **Streamable HTTP** transport for both halves, and a client server is `command` (stdio) *xor* `url` (HTTP) | Two minion instances on the same tailnet need to talk to each other, and today both halves are stdio-only: `transport-child-process` for the client, `mcp serve` owning stdin/stdout for the server. `rmcp` 3.5.0 already ships both the Streamable HTTP client (`transport-streamable-http-client-reqwest`) and server (`transport-streamable-http-server`), so the transport is adopted, not invented — no second protocol, no hand-rolled framing. The two client paths are mutually exclusive on purpose and checked at config load: a `command` is spawned over stdio, a `url` is spoken to over HTTP, and "both" or "neither" is a startup error rather than a server that quietly picks one; `args` beside a `url`, or a scheme that is not `http(s)`, is refused for the same reason. The server half is a config value (`transport = "http"`) rather than a flag because it changes what resource the process owns — a socket where stdio was a pipe — but R5's exclusion still holds: neither path can reach the REPL. Everything above `McpClient` is untouched, so listing, `tool_allow`, the per-server policy, the transition notices and the next-turn retry are the stdio behaviour verbatim; a test proves a down HTTP peer degrades exactly as a child that failed to spawn does |
+| D26 | HTTP auth is a **bearer token**, never the source address, and there is **no TLS** — deliberately | Inside a tailnet the traffic is already encrypted by WireGuard, so TLS would add a dependency on the Tailscale daemon and on certificates to a binary whose whole selling point is a minimal dependency surface, and it would buy nothing against the threat that matters here. The real authentication is the token: any process on a tailnet node can open that port, so the source IP proves nothing about who is calling, and the `Host` header is no better — off a loopback bind the `Host` allowlist is switched off precisely because a MagicDNS name cannot be derived from an `IP:port` bind, leaving the token as the boundary. The client sends `Authorization: Bearer` on every request, and the server, when a token is configured, requires it even on loopback — a token that is only checked on a tailnet is a token that can be forgotten locally. The comparison is constant-time so a token cannot be recovered a byte at a time, and the check runs *before* the MCP service, so a wrong token lists no tool and reaches no handler (the test asserts the raw `401`). The config carries only names — `token_env` (a variable name) or `token_file` (a `0600` credentials-file path) — resolved through the same `resolve_secret` the provider key uses; a source that is named but yields nothing is an error, not a silent anonymous request, so a typo cannot masquerade as a server that rejects you. An `https://` URL is still accepted by the client, so a future decision can add certificates without a config change |
+| D27 | The HTTP bind is **fail-closed**: default `127.0.0.1:8788`; wildcard and globally routable addresses are always refused, and any other non-loopback bind needs a token or the server refuses to start | The policy runs at config load, before `TcpListener::bind`, so a bad bind is a startup error rather than a socket that is already listening when the mistake is noticed. `0.0.0.0` and `::` are refused unconditionally because they are not an address — they are every interface, the public one included, and no tailnet bind wants them. A globally routable address is refused because minion's wide-area transport is the tailnet, not the public internet, and that is a different decision than this milestone makes. Everything else that is not loopback — a tailnet `100.64.0.0/10` or `fd7a:115c:a1e0::/48` address, a LAN, a link-local one — is refused *unless* a token source is configured, because off loopback the token is the only thing minion has (D26). Loopback needs nothing: it is a local process. The default is loopback so the zero-config case is the safe one, and the private-address list is the one `http_fetch`'s `block_private_ips` already uses, so the two agree on where the public boundary is |
 | D28 | The six-target release matrix builds each target on a runner that can also **execute** it — macOS on macOS runners (`macos-15-intel` for x86_64, `macos-15` for arm64), Windows/arm64 on the native `windows-11-arm` runner rather than cross-compiled with `cargo-xwin`, Linux/arm64 cross-linked and run under `qemu-user-static` — so every binary's two stamps are checked before it is published | Three constraints decide it. macOS cannot be cross-linked from Linux: the linker and SDK are Apple's and not redistributable, so the two `*-apple-darwin` targets are built on macOS runners, which is also where they can be run. Windows/arm64 is a real choice — cross-compile an arm64 PE on an x64 runner with `cargo-xwin`, or build natively on the GA `windows-11-arm` image — and the milestone's own requirement picks for it: the asset must be executed to verify its stamps, and a Windows x64 host cannot run an arm64 PE (Windows on ARM emulates x64, not the reverse), so the cross path would ship an arm64 binary that no runner in the matrix can check. `cargo-xwin` would also pull a third-party tool and a downloaded MSVC CRT/SDK into a pipeline whose point is a small, legible surface, and the C in the tree (`aws-lc-sys` through rustls, and the SQLite bundled by `minion-store`) compiles against the native runner's own arm64 MSVC toolchain with no extra setup. Linux/arm64 stays the one cross link — the distro aarch64 gcc is also the C compiler those crates need — and `qemu-user-static` is installed so it too is run rather than trusted. The other cost is a C toolchain per runner, which the GitHub images already carry: NASM and Perl for `aws-lc-sys` on Windows, Xcode CLT for the bundled SQLite on macOS, so the job adds an install step only for the Linux cross. The Windows assets are the bytes of the built `.exe` under the suffix-free published name, because the updater replaces `current_exe()` and the installed file keeps its real name; the stamp check runs the `.exe` itself, whose bytes are the asset. Runner labels are pinned rather than `-latest`, for the same reason the Ubuntu one is (D24): the image must not move under a published binary; the six asset names are the client contract a unit test pins (`minion-core::update::asset_for`). |
+| D29 | A peer reaches the model as **one flattened tool per peer**, `peer__<name>_ask`, never as a generic `delegate(target = "…")` | The approval engine decides on a tool *name*: deny rules, allow rules and the per-server/per-peer `ToolPolicy` all key on it. A single generic tool with a `target` parameter would move that decision off the name and into an argument, which is exactly the ambiguity that `mcp_call` was deferred over (D20) and that the flattened `mcp__<server>__<tool>` tools exist to remove. Flattening per peer keeps three things true at once: an operator writes a rule that names one peer (or `peer__*` names them all), the audit row names the tool that actually ran, and the naming style is the MCP client's own — a namespace plus a fixed leaf, here `peer__<name>_ask` rather than `mcp__<name>__agent_ask`, because a peer contributes *one* capability (a brief) rather than a server's catalogue. A peer is still an MCP server underneath (D25): same transport, same handshake, same client, same bearer-token resolution. The alternative — modelling a peer as an ordinary `[mcp.client.servers.*]` entry and letting `agent_ask` reach the model as `mcp__peer__agent_ask` — was rejected because it would offer the peer's whole catalogue (listing sessions, reading transcripts, the cron tools) instead of the one bounded delegation the milestone is about, and because it would lose the per-peer result cap and the two-argument brief that keep the handoff small |
+| D30 | A delegation sends a **brief, not a trajectory**, and the answer is capped (~8 KB) and treated as **data** | The handoff-tax measurement (arXiv 2608.24358) is the evidence: escalating with the full trajectory recovers less than half of the quality gap, and the escalation does *better* the less of the weak model's history it carries — so the tool takes `{ brief, context? }` and sends exactly that, with `context` a short optional prefix and no part of the local transcript. The other half of the argument is mechanical: the model that receives the answer is local and small (a 2B model has a 4–8K context), so a long answer back is what breaks it; hence `result_cap_bytes` with an ~8 KB default, cutting on a character boundary and marking the cut. The peer's text enters the transcript as a *tool result* and nowhere else — never as a system prompt, never executed — because a peer is a remote endpoint whose output is untrusted input (T14), and the tool's own description says so. `max_tokens` is forwarded to the peer's `agent_ask` (which now accepts it) so a caller can bound the answer at the source, and a caller that tries to pass a `tools` argument is refused rather than ignored: the peer's surface is the peer's read-only subset (D22), and the caller does not get to widen it |
+| D31 | The **depth cap is 1** and it is the read/write line, not a counter; a peer's tokens are folded into the turn's usage | Two small models passing a brief back and forth is the failure mode — an unbounded escalation with no answer at the end. The cap is not a hop counter a caller could reset or forget to thread through: a delegated turn runs under the peer's `agent_ask`, whose inner registry is the read-only subset of the built-ins (D22), and a delegation tool is `Risk::Network`, so it is never in that subset. `mcp serve` also deliberately does not assemble `[peers.*]` (it already ignores `[mcp.client.servers.*]`), so the reachability hole is closed at the source as well as by the risk filter; `mcp_serve`'s tests pin the property so a future widening of the inner surface fails loudly. Cost rides the same decision: the peer's `agent_ask` already reports `usage`, so the delegation tool puts it in the tool result's metadata and the agent loop folds it into the turn's usage — which is what `/cost` reads — through `ToolOutput::reported_usage`, advisory and fail-open exactly as R8 requires (a peer that reports nothing simply does not count, and no turn is blocked on a missing value) |
+| D35 | The master is a **git repository plus a pull-side `minion config sync`**, never a service the master runs | The requirement is to configure many nodes without depending on the network *between* them, and a pull is the only shape that satisfies it: the master never has to reach a node, so a machine behind NAT, on another network, or not yet on the tailnet (the 1050 Ti today) converges the moment it can reach the channel — and the channel, a Forgejo repo, already exists. The alternative, an HTTP endpoint served by the master (a live `GET /config` or a push channel), was evaluated and refused on three counts: it needs a process that is always on, against the no-daemon principle and this milestone's own non-goals; it needs every node to be reachable *from* the master, which is exactly the connectivity problem the pull exists to avoid; and it would re-implement, worse, what git already provides — history, transport auth, audit, and an offline cache. So "master" is a convention plus a repo, not a running thing, and `sync` is an explicit act a node performs rather than something done to it |
+| D36 | The synced layer is a **machine-level layer between the project file and the user config**, materialized as a machine-local `synced.toml` beside the user config | The new layer has to slot into the existing precedence, not replace it, and the existing rule is *more specific wins*. A project `minion.toml` describes one workspace, so it is more specific than any machine-wide policy and stays above the synced layer; the user config is also machine-level but is a personal preference, and an admin policy outranks a preference, so the synced layer sits above it. The result — flags → env → project → synced → user → defaults — reuses the existing specificity rule instead of inventing a second one, and a machine that has never synced has no `synced.toml` and behaves exactly as today. `sync` writes only that file plus a sibling state file (commit, ref, per-file hashes); it is never committed and never part of `--project`, and `Config::load` merges it like any other layer, so no database is involved and `minion run` stays offline. Two consequences are recorded rather than hidden: a cloned repo's committed `minion.toml` can override master policy, and a local user cannot — if master policy should be a floor instead of a layer, that is a distinct "locked keys" mechanism and is left open (§11 R10), not smuggled in here |
+| D37 | Overlays are **one file per node** (`nodes/<name>.toml`), the node's name is resolved from `--node` → `[configsync].node` → `hostname -s` → `tailscale status`, and `--dry-run`/`config show --origin` are part of the design, not extras | A single `[node."<name>"]` table in one file makes every node's edit a conflict in that file and makes "add a node" a change to shared content; a directory keeps one node's policy to one file, makes adding a node a file add, and lets a reviewer read exactly one node. The name has to resolve deterministically and be *visible*: an explicit `--node`/config wins, `hostname -s` is the Unix-native default, and `tailscale status --json` is the fallback so a node matches its MagicDNS name without config — and whichever rule fired is printed. An unknown name applies the base alone with a warning rather than failing, so a freshly provisioned machine converges before its entry exists; a *listed* node whose overlay will not parse is a hard error, because a policy that cannot be honoured must not be silently dropped. `--dry-run` and `--origin` are mandatory because a sync that cannot show its diff and its provenance is undebuggable magic — the point of a config layer is that an operator can answer "why is this value what it is" from the tool itself |
+| D38 | The bundle is verified **before** it is applied with the same two checks as `minion update` — a per-file sha256 against a committed manifest, and the commit the ref resolves to — and any mismatch refuses the bundle, fail-closed | Whoever controls the channel controls the effective policy of every node, so applying an unverified bundle is remote policy injection, and the contract `minion update` already uses (D23) is the right one to borrow verbatim. The checksum binds the bytes to the manifest and the commit binds the manifest to a revision, so swapping the files *and* the manifest still fails the commit check; the pair is needed even though git hashes its own objects, because git proves what it fetched and says nothing about a hand-edited cache or a bundle read another way. A refusal exits `4` and writes nothing, and the write is temp-file-plus-rename, so an interrupted sync cannot leave a half-applied layer. The honest limit is stated, not papered over: the manifest is committed in the repo, so a malicious publisher rewrites it alongside the files and passes both checks — the residual is publisher trust, the same acknowledged limit D23 carries, recorded as T15 and R10. What bounds the blast radius is that the channel carries only *names*, never a secret value (§5.1): a compromised master distributes policy but cannot exfiltrate keys |
+| D39 | The master carries **names, never secret values**, and the non-goals are explicit: no secret centralization, no node discovery, no always-on service, no sync timer | The invariant that makes the design safe is §5.1's: a config records *where* a secret comes from, never the secret. If the master could carry values it would become the single place where every node's keys live — the exact centralization this milestone is told not to build, and a single point of compromise for the fleet. So the channel distributes `token_file` paths and `token_env` names; values are provisioned per node by whatever the operator already uses (environment, a credentials file, or the separate token-manager system), which keeps this milestone out of the secrets business. Node discovery and self-enrolment are refused because a node appears in the repo because a human put it there — scanning a tailnet and trusting whatever answers is a different threat model. And because the whole value of the design is that the master is *not* a process, anything that would require one — an endpoint, a listener, a background sync loop — is out of scope by construction; a node that wants periodic sync wires its own cron to call `minion config sync`, so minion still starts no daemon (the spirit of D5) |

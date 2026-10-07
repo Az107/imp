@@ -20,7 +20,7 @@ use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
 use minion_cron::RunReport;
 use minion_guard::HttpSystemOneGuard;
-use minion_mcp::{McpServers, OnStart};
+use minion_mcp::{McpServers, OnStart, PeerAsk, peer_policies, peer_tools};
 use minion_provider::OpenAiProvider;
 use minion_store::{NewSession, SessionRow, Store};
 use minion_tools::{CronContext, ToolConfig, default_registry};
@@ -59,6 +59,9 @@ pub struct Session {
     /// The external servers this session consumes, shared so a turn can retry
     /// one that was down and the catalogue follows.
     mcp: Arc<McpServers>,
+    /// The peer delegation tools, kept so their connections close on the way
+    /// out. A stdio peer is a child process; an HTTP one is a socket.
+    peers: Vec<Arc<PeerAsk>>,
 }
 
 /// The parameters a provider was built from, kept to rebuild it later.
@@ -157,9 +160,12 @@ impl Session {
         self.mcp.refresh(OnStart::All).await
     }
 
-    /// Close the external servers on the way out.
+    /// Close the external servers and any peer connection on the way out.
     pub async fn shutdown(&self) {
         self.mcp.shutdown().await;
+        for peer in &self.peers {
+            peer.close().await;
+        }
     }
 
     /// The text of the first user message, used to derive a title.
@@ -204,6 +210,17 @@ pub async fn build(
 
     let mut registry = default_registry(&tool_config(config), store.clone(), cron_context(config));
     registry.attach_catalog(mcp.clone());
+    // One delegation tool per peer, `peer__<name>_ask` (M10.2). Registered
+    // rather than catalogued: its name and schema come from config, so it is on
+    // offer from the moment the session exists. The handles are kept so their
+    // connections close with the session.
+    let peers: Vec<Arc<PeerAsk>> = peer_tools(&config.peers)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    for peer in &peers {
+        registry.register_arc(peer.clone());
+    }
     let tools = Arc::new(registry);
 
     let mcp_notices = mcp.refresh(OnStart::Eager).await;
@@ -262,6 +279,11 @@ pub async fn build(
         workspace_root: workspace_root.clone(),
     };
 
+    // The families a per-server (or per-peer) policy names. Both go into the same
+    // list, so the longest matching prefix still decides (D21).
+    let mut families = mcp.policy_families();
+    families.extend(peer_policies(&config.peers));
+
     // Whether anyone can answer a prompt. `--yes` forces the permissive path;
     // a non-TTY still cannot be prompted, so it falls back to `noninteractive`.
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -273,7 +295,7 @@ pub async fn build(
             tty,
             cli.yes,
             cli.deny,
-            mcp.policy_families(),
+            families.clone(),
         ),
         &store,
     );
@@ -289,7 +311,7 @@ pub async fn build(
                 config,
                 &store,
                 &workspace_root.display().to_string(),
-                mcp.policy_families(),
+                families,
             ),
             &store,
         ),
@@ -312,6 +334,7 @@ pub async fn build(
         spec,
         gate,
         mcp,
+        peers,
     };
     if resume.is_none() {
         session.persist_all().await?;

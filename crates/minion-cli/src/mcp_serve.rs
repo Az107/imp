@@ -32,6 +32,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, GetPromptResult, Implementation, JsonObject, ListPromptsResult,
@@ -41,6 +45,8 @@ use rmcp::model::{
     ServerCapabilities, ServerConfig, Tool as RmcpTool,
 };
 use rmcp::service::{RequestContext, serve_server};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -99,9 +105,9 @@ impl Exposure {
     /// It is printed to **stderr**, because stdout is the protocol. An enabled
     /// capability is shouted rather than listed: the whole mitigation for T5 is
     /// that nobody turns on shell-over-MCP without noticing.
-    pub fn banner(&self) -> Vec<String> {
+    pub fn banner(&self, transport: &str) -> Vec<String> {
         let mut lines = vec![
-            "minion mcp serve · stdio".to_string(),
+            format!("minion mcp serve · {transport}"),
             format!(
                 "  expose_exec       = {}  {}",
                 self.exec,
@@ -218,6 +224,10 @@ impl Runtime {
             .get("max_iterations")
             .and_then(Value::as_u64)
             .map(|value| value.max(1) as u32);
+        let max_tokens = args
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(1, u32::MAX as u64) as u32);
         let allow_tools: Option<Vec<String>> = match args.get("allow_tools") {
             Some(Value::Array(items)) => Some(
                 items
@@ -266,7 +276,7 @@ impl Runtime {
             model: model.unwrap_or_else(|| self.config.provider.model.clone()),
             max_iterations: max_iterations.unwrap_or(self.config.agent.max_iterations),
             temperature: self.config.provider.temperature,
-            max_tokens: None,
+            max_tokens,
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
             workspace_root: self.workspace_root.clone(),
@@ -643,7 +653,7 @@ impl MinionTool for AgentAsk {
     fn description(&self) -> &'static str {
         "Run one turn of minion's agent with its own model backend and return the answer. \
          Params: prompt (required), session_id? (continue a conversation), model?, \
-         max_iterations?, allow_tools? (a subset of the read-only tools)."
+         max_tokens?, max_iterations?, allow_tools? (a subset of the read-only tools)."
     }
 
     fn schema(&self) -> Value {
@@ -656,6 +666,10 @@ impl MinionTool for AgentAsk {
                     "description": "Continue this conversation. Omit to start a new one."
                 },
                 "model": { "type": "string", "description": "Override the model for this turn." },
+                "max_tokens": {
+                    "type": "integer",
+                    "description": "Cap the tokens this turn may generate."
+                },
                 "max_iterations": {
                     "type": "integer",
                     "description": "Cap the provider round-trips for this turn."
@@ -1007,10 +1021,11 @@ impl ServerHandler for MinionServer {
 
 /// `minion mcp serve` (§5.12).
 ///
-/// It never returns to the REPL: the server owns stdin/stdout for the protocol,
-/// which is the whole of R5. It also never starts the scheduler — a job added
-/// here is stored, and runs the next time a process with a scheduler opens the
-/// database.
+/// It never returns to the REPL: over stdio the server owns stdin/stdout, and
+/// over HTTP it owns its socket until the process is stopped. Neither path can
+/// reach `repl::interactive` (R5). It also never starts the scheduler — a job
+/// added here is stored, and runs the next time a process with a scheduler opens
+/// the database.
 pub async fn run(
     cli: &Cli,
     config: &Config,
@@ -1022,19 +1037,34 @@ pub async fn run(
             "mcp.server.enabled is false; refusing to serve".to_string(),
         ));
     }
+    // `--stdio` forces the stdio transport whatever the config says; otherwise
+    // the configured transport decides. Anything but the two known names is a
+    // startup error rather than a server that quietly does something else.
     let transport = if stdio {
         "stdio".to_string()
     } else {
-        config.mcp.server.transport.clone()
+        config.mcp.server.transport.trim().to_string()
     };
-    if transport != "stdio" {
-        return Err(Error::Config(format!(
-            "mcp.server.transport must be \"stdio\", was `{transport}`"
-        )));
-    }
 
-    let runtime = Runtime::build(config, cwd, cli.db.clone(), None).await?;
-    for line in runtime.exposure.banner() {
+    if transport == "stdio" {
+        serve_stdio(config, cwd, cli.db.clone()).await
+    } else if transport.eq_ignore_ascii_case("http") {
+        serve_http(config, cwd, cli.db.clone()).await
+    } else {
+        Err(Error::Config(format!(
+            "mcp.server.transport must be \"stdio\" or \"http\", was `{transport}`"
+        )))
+    }
+}
+
+/// The stdio server (M6): the protocol on stdin/stdout, until the peer closes.
+async fn serve_stdio(
+    config: &Config,
+    cwd: &Path,
+    db: Option<PathBuf>,
+) -> Result<std::process::ExitCode> {
+    let runtime = Runtime::build(config, cwd, db, None).await?;
+    for line in runtime.exposure.banner("stdio") {
         eprintln!("{line}");
     }
 
@@ -1047,6 +1077,124 @@ pub async fn run(
         .await
         .map_err(|err| Error::Config(format!("mcp serve: {err}")))?;
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The Streamable HTTP server (M10.1): the same surface on a socket.
+///
+/// The bind policy already ran at config load ([`McpServerSection::bind_socket`]),
+/// so a wildcard, a public address, or a non-loopback bind without a token never
+/// reaches this point. The token, when configured, is resolved here and required
+/// on every request — on loopback too, because a token that is only checked on a
+/// tailnet is a token that can be forgotten locally.
+async fn serve_http(
+    config: &Config,
+    cwd: &Path,
+    db: Option<PathBuf>,
+) -> Result<std::process::ExitCode> {
+    let runtime = Runtime::build(config, cwd, db, None).await?;
+    for line in runtime.exposure.banner("http") {
+        eprintln!("{line}");
+    }
+
+    let token = config.mcp.server.bearer_token()?;
+    if token.is_some() {
+        eprintln!("  auth              required (Authorization: Bearer …)");
+    } else {
+        eprintln!("  auth              none (loopback only)");
+    }
+
+    let addr = config.mcp.server.bind_socket()?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|err| Error::Config(format!("mcp serve: cannot bind {addr}: {err}")))?;
+    let local = listener.local_addr().unwrap_or(addr);
+    eprintln!("minion listening on http://{local}/mcp");
+
+    let router = http_router(runtime, token, local.ip().is_loopback());
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .map_err(|err| Error::Config(format!("mcp serve: the HTTP server stopped: {err}")))?;
+    Ok(std::process::ExitCode::SUCCESS)
+}
+
+/// The router `transport = "http"` serves: the MCP service at `/mcp`, optionally
+/// behind the bearer-token gate.
+///
+/// Split out from [`serve_http`] so a test can bind it to an ephemeral port and
+/// drive it with a real client, which is the only way to prove the surface and
+/// the gate together.
+fn http_router(runtime: Arc<Runtime>, token: Option<String>, loopback: bool) -> axum::Router {
+    let factory = {
+        let runtime = runtime.clone();
+        move || Ok::<_, std::io::Error>(MinionServer::new(runtime.clone()))
+    };
+
+    let mut server_config = StreamableHttpServerConfig::default();
+    if !loopback {
+        // The `Host` allowlist defaults to loopback names, and a MagicDNS name
+        // cannot be derived from an `IP:port` bind. Off a loopback bind the
+        // bearer token — not the request's `Host` or its source address — is the
+        // authentication boundary (D26), so host validation is switched off
+        // rather than guessed at.
+        server_config = server_config.disable_allowed_hosts();
+    }
+
+    let service = StreamableHttpService::new(
+        factory,
+        Arc::new(LocalSessionManager::default()),
+        server_config,
+    );
+
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    if let Some(expected) = token {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(expected),
+            require_bearer,
+        ));
+    }
+    router
+}
+
+/// Reject a request that does not carry the configured bearer token.
+///
+/// It runs **before** the MCP service, so a wrong token never reaches a handler:
+/// no tool is listed, no call is attempted, and an unauthenticated caller learns
+/// nothing about the surface beyond "not authorized". The comparison is
+/// constant-time so a token cannot be recovered a byte at a time.
+async fn require_bearer(
+    State(expected): State<Arc<String>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let ok = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| constant_time_eq(presented.trim(), expected.as_str()));
+
+    if ok {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+    }
+}
+
+/// Compare two secrets without letting the comparison's duration depend on where
+/// they first differ.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1426,7 +1574,7 @@ mod tests {
             write: false,
             cron_write: true,
         }
-        .banner()
+        .banner("stdio")
         .join("\n");
         assert!(quiet.contains("expose_exec       = false"));
         assert!(quiet.contains("read-only"));
@@ -1436,7 +1584,7 @@ mod tests {
             write: true,
             cron_write: false,
         }
-        .banner()
+        .banner("stdio")
         .join("\n");
         assert!(loud.contains("ENABLED"), "was: {loud}");
         assert!(loud.contains("shell commands"), "was: {loud}");
@@ -1537,6 +1685,35 @@ mod tests {
         assert!(stored.is_some(), "the conversation was persisted");
 
         client.cancel().await.ok();
+    }
+
+    /// The depth cap, pinned (M10.2, §5.13). The inner surface an `agent_ask`
+    /// turn runs — the one a peer runs *when it answers a brief* — is the
+    /// read-only subset of the built-ins: no `peer__*` tool is in it, so a peer
+    /// cannot pass the brief on to a third model. If someone ever widens this
+    /// surface, this test is the one that should fail.
+    #[tokio::test]
+    async fn the_inner_surface_a_peer_runs_has_no_delegation_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(
+            dir.path(),
+            Exposure::from(&McpServerSection::default()),
+            Scripted::once("x"),
+        )
+        .await;
+
+        let risks = runtime.tools.risks();
+        assert!(!risks.is_empty(), "the inner surface is not empty");
+        for (name, risk) in risks {
+            assert!(
+                risk.is_observation(),
+                "`{name}` is {risk:?}, so it must not be handed to a delegated turn"
+            );
+            assert!(
+                !name.starts_with("peer__"),
+                "`{name}` would let a peer delegate again, breaking the depth cap"
+            );
+        }
     }
 
     /// A denial crosses the protocol as a readable tool error, which is what the
@@ -1719,5 +1896,201 @@ mod tests {
         assert!(text.contains("expose_exec"), "was: {text}");
 
         client.cancel().await.ok();
+    }
+
+    // ------------------------------------------------- streamable http (M10.1)
+
+    /// Bind the HTTP router to an ephemeral loopback port and serve it in the
+    /// background. Returns the address, and the task the test aborts.
+    async fn spawn_http(
+        runtime: Arc<Runtime>,
+        token: Option<String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral loopback port");
+        let addr = listener.local_addr().expect("a bound address");
+        let router = http_router(runtime, token, true);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (addr, server)
+    }
+
+    /// The status line of a raw HTTP request, so a test can read what the
+    /// transport actually answered — the client library hides a `401` behind a
+    /// handshake error.
+    async fn raw_status(addr: std::net::SocketAddr, token: Option<&str>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let request = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await?;
+            let mut head = format!(
+                "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+                 Accept: application/json, text/event-stream\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n"
+            );
+            if let Some(token) = token {
+                head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+            }
+            head.push_str("\r\n{}");
+            stream.write_all(head.as_bytes()).await?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await?;
+            Ok::<_, std::io::Error>(response)
+        };
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("the request answered instead of hanging")
+            .expect("the request completed");
+        response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .expect("a status code")
+    }
+
+    /// (a) A real client reaches the HTTP surface on an ephemeral loopback
+    /// port, discovers the tools, and runs one — and the approval gate is still
+    /// what decides. "It listens" is not the assertion; a call that crossed the
+    /// gate is.
+    #[tokio::test]
+    async fn a_client_reaches_the_http_surface_and_the_gate_still_decides() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(
+            dir.path(),
+            Exposure::from(&McpServerSection::default()),
+            Scripted::once("the http model answered"),
+        )
+        .await;
+
+        let (addr, server) = spawn_http(runtime, None).await;
+        let url = format!("http://{addr}/mcp");
+
+        let client = minion_mcp::McpClient::connect_http("peer", &url, None)
+            .await
+            .expect("the client handshakes over HTTP");
+
+        let tools = client.list_tools().await.expect("tools/list");
+        let names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+        assert!(names.contains(&"agent_ask".to_string()), "was: {names:?}");
+        // The disabled capability is listed, because a hidden tool would leave
+        // the host guessing (D22).
+        assert!(
+            names.contains(&"agent_run_command".to_string()),
+            "was: {names:?}"
+        );
+
+        let answer = client
+            .call("agent_ask", json!({ "prompt": "say something" }), 64 * 1024)
+            .await
+            .expect("tools/call");
+        assert!(!answer.is_error, "{}", answer.content);
+        assert!(
+            answer.content.contains("the http model answered"),
+            "was: {}",
+            answer.content
+        );
+
+        // The gate did not move: `agent_run_command` is refused by policy, and
+        // the refusal crosses HTTP as a readable tool error.
+        let denied = client
+            .call(
+                "agent_run_command",
+                json!({ "command": "echo hi" }),
+                64 * 1024,
+            )
+            .await
+            .expect("tools/call");
+        assert!(denied.is_error, "was: {}", denied.content);
+        assert!(
+            denied.content.contains("deny rule"),
+            "was: {}",
+            denied.content
+        );
+
+        client.close().await;
+        server.abort();
+    }
+
+    /// (c) A wrong token is refused before the MCP service sees the request, so
+    /// no tool is ever published to that caller. Both halves are checked: the
+    /// raw status the layer answers, and the client-side failure.
+    #[tokio::test]
+    async fn a_wrong_http_token_is_rejected_before_any_tool_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(
+            dir.path(),
+            Exposure::from(&McpServerSection::default()),
+            Scripted::once("x"),
+        )
+        .await;
+
+        let (addr, server) = spawn_http(runtime, Some("right-token".to_string())).await;
+        let url = format!("http://{addr}/mcp");
+
+        // The right token works, so the 401s below are the token, not the URL.
+        let client = minion_mcp::McpClient::connect_http("peer", &url, Some("right-token"))
+            .await
+            .expect("the right token handshakes");
+        assert!(
+            client
+                .list_tools()
+                .await
+                .unwrap()
+                .iter()
+                .any(|tool| tool.name == "agent_ask"),
+            "the authorized client sees the surface"
+        );
+        client.close().await;
+
+        // A wrong token cannot even handshake, so it never lists a tool.
+        let wrong = minion_mcp::McpClient::connect_http("peer", &url, Some("wrong-token")).await;
+        assert!(wrong.is_err(), "a wrong token must not connect");
+        assert!(
+            minion_mcp::McpClient::connect_http("peer", &url, None)
+                .await
+                .is_err(),
+            "a missing token must not connect"
+        );
+
+        // The layer itself answers 401, before the service: the rejection is
+        // structural, not a handler's choice.
+        assert_eq!(raw_status(addr, Some("wrong-token")).await, 401);
+        assert_eq!(raw_status(addr, None).await, 401);
+
+        server.abort();
+    }
+
+    /// The other half of `serve_http`'s token handling: an absent token source
+    /// means no `Authorization` header is checked, which is what a loopback
+    /// server with no token configured relies on.
+    #[tokio::test]
+    async fn a_tokenless_loopback_server_answers_without_a_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime(
+            dir.path(),
+            Exposure::from(&McpServerSection::default()),
+            Scripted::once("x"),
+        )
+        .await;
+
+        let (addr, server) = spawn_http(runtime, None).await;
+
+        // An anonymous request reaches the service, which rejects the empty body
+        // as a protocol error rather than as an auth failure: not a 401.
+        assert_ne!(raw_status(addr, None).await, 401);
+
+        server.abort();
+    }
+
+    #[test]
+    fn a_token_comparison_does_not_short_circuit() {
+        assert!(constant_time_eq("s3cret", "s3cret"));
+        assert!(!constant_time_eq("s3cret", "s3cre7"));
+        assert!(!constant_time_eq("short", "longer"));
+        assert!(constant_time_eq("", ""));
     }
 }

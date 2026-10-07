@@ -4,7 +4,7 @@ expression: surface_json(&runtime)
 ---
 [
   {
-    "description": "Run one turn of minion's agent with its own model backend and return the answer. Params: prompt (required), session_id? (continue a conversation), model?, max_iterations?, allow_tools? (a subset of the read-only tools).",
+    "description": "Run one turn of minion's agent with its own model backend and return the answer. Params: prompt (required), session_id? (continue a conversation), model?, max_tokens?, max_iterations?, allow_tools? (a subset of the read-only tools).",
     "name": "agent_ask",
     "parameters": {
       "properties": {
@@ -17,6 +17,10 @@ expression: surface_json(&runtime)
         },
         "max_iterations": {
           "description": "Cap the provider round-trips for this turn.",
+          "type": "integer"
+        },
+        "max_tokens": {
+          "description": "Cap the tokens this turn may generate.",
           "type": "integer"
         },
         "model": {

@@ -32,6 +32,7 @@ fn server(tool_allow: &[&str], approval: Option<Decision>) -> McpServerConfig {
         lazy: false,
         tool_allow: tool_allow.iter().map(|s| s.to_string()).collect(),
         approval,
+        ..McpServerConfig::default()
     }
 }
 
@@ -181,7 +182,7 @@ async fn tool_allow_hides_and_blocks() {
     // Every tool the server listed is still known, which is what makes
     // `minion mcp tools` able to say what was hidden.
     let discovered = servers.discovered("stub");
-    assert_eq!(discovered.len(), 4, "was: {discovered:?}");
+    assert_eq!(discovered.len(), 5, "was: {discovered:?}");
 
     servers.shutdown().await;
 }
@@ -294,7 +295,7 @@ async fn a_lazy_server_starts_when_it_is_asked_about() {
         .expect("an explicit use starts it");
 
     assert!(servers.is_up("slow"));
-    assert_eq!(servers.discovered("slow").len(), 4);
+    assert_eq!(servers.discovered("slow").len(), 5);
     assert_eq!(servers.published("slow").len(), 1);
 
     servers.shutdown().await;
@@ -412,6 +413,34 @@ async fn a_server_policy_beats_the_global_default() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("non-interactive"), "was: {err}");
+}
+
+/// A client server configured over HTTP behaves like a stdio one when the peer
+/// is not there: it costs its tools, explains why once, and is retried next turn
+/// (D25, §5.10's "retried on the next turn").
+#[tokio::test]
+async fn an_http_peer_that_is_down_is_a_notice_and_a_retry() {
+    // A closed port on loopback: the connection is refused immediately.
+    let unreachable = McpServerConfig {
+        url: "http://127.0.0.1:1/mcp".to_string(),
+        tool_allow: vec!["*".to_string()],
+        ..McpServerConfig::default()
+    };
+    let servers = McpServers::new(&client_config(&[("far", unreachable)]), 64 * 1024);
+
+    let notices = servers.refresh(OnStart::All).await;
+    assert_eq!(notices.len(), 1, "was: {notices:?}");
+    assert!(notices[0].contains("unavailable"), "was: {}", notices[0]);
+    assert!(notices[0].contains("retried"), "was: {}", notices[0]);
+
+    // The retry is silent: nothing changed, so there is nothing new to say.
+    let retry = servers.refresh(OnStart::All).await;
+    assert!(retry.is_empty(), "was: {retry:?}");
+
+    let registry = registry(&servers);
+    assert!(registry.is_empty(), "a down peer offers no tool");
+
+    servers.shutdown().await;
 }
 
 /// The exit criterion: an external tool, invoked by the model, passing the gate,
