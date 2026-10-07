@@ -223,6 +223,19 @@ impl ToolRegistry {
         self
     }
 
+    /// Build a registry from an explicit set of tools, in the given order.
+    ///
+    /// This is how a *subset* of the registered tools is assembled — the MCP
+    /// server's read-only inner surface is one (§5.9) — without a filter pass
+    /// that would have to re-register by name. The caller owns the ordering, so
+    /// it is the same ordering rule as [`register`](Self::register).
+    pub fn from_tools(tools: Vec<Arc<dyn Tool>>) -> Self {
+        Self {
+            tools,
+            catalogs: Vec::new(),
+        }
+    }
+
     /// Attach a runtime source of tools, consulted after every registered one.
     pub fn attach_catalog(&mut self, catalog: Arc<dyn ToolCatalog>) -> &mut Self {
         self.catalogs.push(catalog);

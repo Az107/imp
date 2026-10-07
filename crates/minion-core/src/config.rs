@@ -383,6 +383,50 @@ pub enum MissedRunPolicy {
 pub struct McpConfig {
     /// The client half: external servers minion calls.
     pub client: McpClientConfig,
+    /// The server half: exposing minion over MCP (§5.9).
+    pub server: McpServerSection,
+}
+
+/// `[mcp.server]`: the surface `minion mcp serve` publishes (§5.9).
+///
+/// The default is the read-only surface (D8, T5): `agent_ask` and the
+/// introspection tools, plus the cron tools. Shell execution and file writes are
+/// opt-in, because both are a remote-code-execution surface once an MCP host is
+/// driving: `expose_exec`/`expose_write` stay `false` until an operator says
+/// otherwise, and the flags are printed at startup so nobody enables them by
+/// accident.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerSection {
+    /// Whether `minion mcp serve` is allowed to run at all.
+    pub enabled: bool,
+    /// Transport. Only `stdio` exists: R5 makes the server and the REPL
+    /// mutually exclusive because both own stdin/stdout.
+    pub transport: String,
+    /// Publish `agent_run_command` as a callable tool. `false` still lists it,
+    /// but every call is refused by the policy engine.
+    pub expose_exec: bool,
+    /// Publish `agent_write_file` as a callable tool. Same "listed but denied"
+    /// contract as [`expose_exec`](Self::expose_exec).
+    pub expose_write: bool,
+    /// Publish the `cron_*` tools. They are absent from the surface when this is
+    /// `false`, not merely denied.
+    pub expose_cron_write: bool,
+}
+
+impl Default for McpServerSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            transport: "stdio".to_string(),
+            expose_exec: false,
+            expose_write: false,
+            // §5.1's example has this on: scheduling is a `Write`, but the
+            // scheduler runs under the non-interactive cron gate, so a job it
+            // creates can still do very little on its own.
+            expose_cron_write: true,
+        }
+    }
 }
 
 /// `[mcp.client]`.
@@ -646,6 +690,15 @@ impl Config {
                     "mcp.client.servers.{name}.command must not be empty"
                 )));
             }
+        }
+        // Only stdio exists for the server half. R5 makes that a property and
+        // not a default: `mcp serve` and the REPL both own stdin/stdout, so a
+        // second transport is a second decision, not a config value.
+        if self.mcp.server.enabled && self.mcp.server.transport != "stdio" {
+            return Err(Error::Config(format!(
+                "mcp.server.transport must be \"stdio\", was `{}`",
+                self.mcp.server.transport
+            )));
         }
         Ok(())
     }
@@ -1061,6 +1114,52 @@ mod tests {
     fn no_mcp_servers_is_the_default() {
         let config = Config::default();
         assert!(config.mcp.client.servers.is_empty());
+    }
+
+    /// §5.1: the server half defaults to the read-only surface (D8, T5). Shell
+    /// execution and file writes are off until an operator says otherwise.
+    #[test]
+    fn the_mcp_server_defaults_to_a_read_only_surface() {
+        let config = Config::default();
+        assert!(config.mcp.server.enabled);
+        assert_eq!(config.mcp.server.transport, "stdio");
+        assert!(!config.mcp.server.expose_exec);
+        assert!(!config.mcp.server.expose_write);
+        assert!(config.mcp.server.expose_cron_write);
+    }
+
+    #[test]
+    fn the_mcp_server_section_is_read_from_a_project_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[mcp.server]\nexpose_exec = true\nexpose_cron_write = false\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert!(config.mcp.server.expose_exec);
+        assert!(
+            !config.mcp.server.expose_write,
+            "an unset flag keeps its default"
+        );
+        assert!(!config.mcp.server.expose_cron_write);
+    }
+
+    /// R5: stdio is the only transport, and a second one is a startup error
+    /// rather than a server that quietly does something else.
+    #[test]
+    fn a_non_stdio_mcp_transport_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[mcp.server]\ntransport = \"sse\"\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+        assert!(err.to_string().contains("stdio"), "was: {err}");
     }
 
     #[test]
