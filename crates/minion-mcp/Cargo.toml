@@ -9,14 +9,25 @@ repository.workspace = true
 [dependencies]
 async-trait = "0.1.92"
 minion-core = { version = "0.1.0", path = "../minion-core" }
-# The client half of MCP: `client` brings the request builders and
+# The client half of MCP: `client` brings the request builders,
 # `transport-child-process` the stdio child process a configured server is
-# spawned into. The default `server` feature stays on because `mcp serve` (M6)
-# and the stub server under `src/bin/` need it.
-rmcp = { version = "3.5.0", features = ["client", "transport-child-process"] }
+# spawned into, and `transport-streamable-http-client-reqwest` the Streamable
+# HTTP client a `url = "http://…/mcp"` server is reached over (M10.1). The reqwest
+# transport reuses the reqwest build the rest of the workspace already has. The
+# default `server` feature stays on because `mcp serve` (M6) and the stub server
+# under `src/bin/` need it.
+rmcp = { version = "3.5.0", features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
+# The Streamable HTTP client is reqwest-backed; this is the same reqwest build
+# (and so the same compiled crate) the rest of the workspace already uses, so it
+# adds an edge, not a second TLS stack. `rustls` is the workspace's TLS feature.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 tokio = { version = "1.53.1", features = [
     "sync",
     "rt",
