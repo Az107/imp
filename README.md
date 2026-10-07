@@ -334,11 +334,13 @@ cp target/aarch64-unknown-linux-gnu/release/minion   dist/minion-linux-arm64
 # ... plus, from macOS and Windows respectively:
 #   target/{x86_64,aarch64}-apple-darwin/release/minion     -> minion-darwin-{amd64,arm64}
 #   target/{x86_64,aarch64}-pc-windows-msvc/release/minion.exe -> minion-windows-{amd64,arm64}
-# All six must be present; `minion update` gets a 404 on a platform whose asset is missing.
+# All six must be present; `minion update` gets a 404 on a platform whose asset is missing,
+# and refuses the release outright if its manifest is missing (`checksums.txt` is not a
+# `minion-*` file, so the glob below does not pick it up — name it explicitly).
 ( cd dist && sha256sum minion-* >checksums.txt )
 gh release create v0.2.0 --title v0.2.0 \
   --notes "build-commit: $(git rev-parse --short=12 HEAD)" \
-  dist/minion-*
+  dist/minion-* dist/checksums.txt
 ```
 
 **Verifying a release:**
