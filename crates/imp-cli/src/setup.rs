@@ -185,6 +185,25 @@ impl Session {
         }
     }
 
+    /// The models the session's backend advertises, via `GET {base_url}/models`.
+    ///
+    /// `/model` uses this to show what the current provider offers. It rebuilds
+    /// the same client the session already talks through — from the retained
+    /// [`ProviderSpec`] — so it needs no second provider abstraction and cannot
+    /// drift from the request path's base URL, key or headers.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        OpenAiProvider::new(
+            &self.spec.base_url,
+            self.spec.api_key.clone().unwrap_or_default(),
+        )
+        .with_request_timeout(Some(self.spec.request_timeout))
+        .with_max_retries(1)
+        .with_headers(self.spec.headers.clone())
+        .with_session_id(self.session_id.clone())
+        .list_models()
+        .await
+    }
+
     /// The text of the first user message, used to derive a title.
     fn first_user_text(&self) -> Option<String> {
         self.history

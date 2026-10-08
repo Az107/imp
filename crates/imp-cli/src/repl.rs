@@ -60,12 +60,21 @@ pub async fn interactive(
     }
 
     let mut usage = Usage::default();
+    // Ctrl-C at the prompt asks once before it exits; the first press is easy to
+    // hit by accident. A successful read re-arms the first press.
+    let mut interrupts = InterruptGuard::default();
 
     loop {
         let line = match editor.readline("› ") {
-            Ok(line) => line,
+            Ok(line) => {
+                interrupts.on_line();
+                line
+            }
             Err(ReadlineError::Interrupted) => {
-                println!("^C");
+                if interrupts.on_interrupt() {
+                    break;
+                }
+                eprintln!("press again to exit");
                 continue;
             }
             Err(ReadlineError::Eof) => break,
@@ -262,7 +271,28 @@ async fn handle_slash(
                 state.options.model = model.to_string();
                 println!("model set to {}", state.options.model);
             }
-            None => println!("{}", state.options.model),
+            None => {
+                println!("current model: {}", state.options.model);
+                match state.list_models().await {
+                    Ok(models) if models.is_empty() => {
+                        println!("the provider advertised no models");
+                    }
+                    Ok(models) => {
+                        println!("available models ({}):", models.len());
+                        for model in &models {
+                            let marker = if *model == state.options.model {
+                                "›"
+                            } else {
+                                " "
+                            };
+                            println!("  {marker} {model}");
+                        }
+                    }
+                    Err(err) => {
+                        println!("could not list models from the provider: {err}");
+                    }
+                }
+            }
         },
         "cost" => {
             let total = state.store.session_usage(&state.session_id).await?;
@@ -305,7 +335,7 @@ fn print_help() {
     println!("  /resume <id>       continue a stored conversation");
     println!("  /rename <title>    set this conversation's title");
     println!("  /clear             forget the messages, keep the session");
-    println!("  /model [name]      show or change the model for this session");
+    println!("  /model [name]      list the provider's models, or switch to <name>");
     println!("  /tools             list enabled tools and their risk class");
     println!("  /cron              list scheduled jobs (alias /jobs)");
     println!("  /cost              token usage for this session");
@@ -359,4 +389,57 @@ fn decision_name(decision: Decision) -> &'static str {
 /// First few characters of a session id, for a compact banner.
 fn short_id(session_id: &str) -> String {
     session_id.chars().take(8).collect()
+}
+
+/// Tracks the "press Ctrl-C again to exit" gesture.
+///
+/// The first interrupt arms the exit and prints a hint; a second, consecutive
+/// interrupt exits. Any line the user actually submits re-arms the first press,
+/// so the gesture is "twice in a row" and not a sticky session-wide state. The
+/// decision is a pure function so it can be tested without a pty.
+#[derive(Debug, Default)]
+struct InterruptGuard {
+    armed: bool,
+}
+
+impl InterruptGuard {
+    /// A line was read: the next interrupt is a fresh first press.
+    fn on_line(&mut self) {
+        self.armed = false;
+    }
+
+    /// A Ctrl-C arrived. Returns `true` when the REPL should exit.
+    fn on_interrupt(&mut self) -> bool {
+        if self.armed {
+            return true;
+        }
+        self.armed = true;
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InterruptGuard;
+
+    #[test]
+    fn one_interrupt_arms_and_the_next_exits() {
+        let mut guard = InterruptGuard::default();
+
+        assert!(!guard.on_interrupt(), "the first press only warns");
+        assert!(guard.on_interrupt(), "the second consecutive press exits");
+    }
+
+    #[test]
+    fn reading_a_line_re_arms_the_first_press() {
+        let mut guard = InterruptGuard::default();
+
+        assert!(!guard.on_interrupt());
+        guard.on_line();
+        assert!(
+            !guard.on_interrupt(),
+            "after a submitted line, the next press warns again"
+        );
+        assert!(guard.on_interrupt());
+    }
 }

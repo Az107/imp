@@ -1223,7 +1223,8 @@ Interaction details:
 | Free text | New turn in the current session |
 | `!<cmd>` | Run locally in the shell, output to the terminal only (never enters model context) |
 | `/help`, `/?` | Slash command help |
-| `/model [name]` | Show or switch the model for the session |
+| `/model` | List the models advertised by the provider, marking the current one |
+| `/model <name>` | Switch the model for the session |
 | `/new` | Start a fresh conversation, keeping the same session object |
 | `/sessions` | List stored conversations, newest first |
 | `/resume <id>` | Continue a stored conversation; accepts a full id, a unique prefix, or a position from `/sessions` |
@@ -1287,6 +1288,7 @@ Global options:
   --json                --no-color            --verbose|-v  --quiet|-q
   --markdown  --no-markdown      --width <n>
   --cwd <DIR>           --resume <SESSION>    --max-iterations <N>
+  --continue|-c         # continue the most recent session in --cwd
   --config <FILE>       --db <FILE>
 ```
 

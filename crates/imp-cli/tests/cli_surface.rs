@@ -241,6 +241,59 @@ fn an_unknown_resume_target_is_a_clear_failure_not_a_crash() {
     );
 }
 
+/// `-c` with nothing stored for this directory is a clear failure, not a fresh
+/// conversation and not a crash. It is resolved before the provider is called,
+/// so this stays offline.
+#[test]
+fn continue_without_a_conversation_is_a_clear_failure() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = imp()
+        .arg("--db")
+        .arg(dir.path().join("state.db"))
+        .arg("--cwd")
+        .arg(dir.path())
+        .arg("-c")
+        .args(["run", "hi"])
+        .output()
+        .expect("run with -c and no conversation");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "no conversation is a config error; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no conversation in"),
+        "expected a clear message; was: {stderr}"
+    );
+}
+
+/// `--resume` and `--continue` pick a conversation the same way, so accepting
+/// both would be ambiguous; clap rejects the combination as a usage error.
+#[test]
+fn resume_and_continue_cannot_be_combined() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = imp()
+        .arg("--db")
+        .arg(dir.path().join("state.db"))
+        .arg("--cwd")
+        .arg(dir.path())
+        .args(["-c", "--resume", "whatever", "run", "hi"])
+        .output()
+        .expect("run with -c and --resume");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "the combination is a usage error; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// §5.12: a usage error is exit `2`, and `config show` on a default config is
 /// exit `0`.
 #[test]

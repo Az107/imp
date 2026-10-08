@@ -81,6 +81,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "SESSION")]
     pub resume: Option<String>,
 
+    /// Continue the most recent conversation in the current directory.
+    #[arg(
+        short = 'c',
+        long = "continue",
+        global = true,
+        conflicts_with = "resume"
+    )]
+    pub continue_session: bool,
+
     /// Maximum provider round-trips per turn, overriding the config.
     #[arg(long = "max-iterations", global = true, value_name = "N")]
     pub max_iterations: Option<u32>,

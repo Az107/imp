@@ -229,6 +229,35 @@ impl Store {
         .await
     }
 
+    /// The most recently updated session whose workspace is `cwd`.
+    ///
+    /// `cwd` is the exact string stored when the session was created — the
+    /// canonical workspace root — so this is what `imp --continue` matches on.
+    pub async fn latest_session_in(&self, cwd: &str) -> Result<Option<SessionRow>> {
+        let cwd = cwd.to_string();
+        self.blocking(move |conn| {
+            conn.query_row(
+                "SELECT id, title, cwd, model, provider, created_at, updated_at
+                 FROM sessions WHERE cwd = ?1 ORDER BY updated_at DESC LIMIT 1",
+                rusqlite::params![cwd],
+                |row| {
+                    Ok(SessionRow {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        cwd: row.get(2)?,
+                        model: row.get(3)?,
+                        provider: row.get(4)?,
+                        created_at: row.get(5)?,
+                        updated_at: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| Error::Store(format!("cannot read the latest session: {err}")))
+        })
+        .await
+    }
+
     /// Set a session's title.
     pub async fn rename_session(&self, id: &str, title: &str) -> Result<bool> {
         let (id, title) = (id.to_string(), title.to_string());
@@ -589,6 +618,36 @@ mod tests {
         let ids: Vec<&str> = listed.iter().map(|row| row.id.as_str()).collect();
         assert!(ids.contains(&older.id.as_str()));
         assert!(ids.contains(&newer.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn the_latest_session_is_scoped_to_one_directory() {
+        let store = Store::open_in_memory().await.unwrap();
+
+        let mut first = session();
+        first.cwd = "/ws/one".to_string();
+        store.create_session(first.clone()).await.unwrap();
+
+        let mut other = session();
+        other.cwd = "/ws/two".to_string();
+        store.create_session(other.clone()).await.unwrap();
+
+        // A second conversation in the same directory is the one `--continue`
+        // must pick, and the other directory must not leak in.
+        let mut newest = session();
+        newest.cwd = "/ws/one".to_string();
+        store.create_session(newest.clone()).await.unwrap();
+
+        let found = store.latest_session_in("/ws/one").await.unwrap();
+        assert_eq!(found.map(|row| row.id), Some(newest.id));
+        assert!(
+            store
+                .latest_session_in("/ws/three")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unknown directory has no conversation"
+        );
     }
 
     #[tokio::test]

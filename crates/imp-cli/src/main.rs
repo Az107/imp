@@ -18,7 +18,7 @@ mod setup;
 mod update;
 mod version;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -119,7 +119,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
         Some(Command::Update(args)) => update::run(&cli, &config, args.clone()).await,
         Some(Command::Run { prompt }) => {
             let prompt = resolve_prompt(prompt)?;
-            let resume = resolve_resume(&cli, &config).await?;
+            let resume = resolve_resume(&cli, &config, &cwd).await?;
             let stop = run::one_shot(&cli, &config, &cwd, prompt, resume.as_deref()).await?;
             Ok(if stop == StopReason::Completed {
                 ExitCode::SUCCESS
@@ -128,7 +128,7 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
             })
         }
         None => {
-            let resume = resolve_resume(&cli, &config).await?;
+            let resume = resolve_resume(&cli, &config, &cwd).await?;
             repl::interactive(&cli, &config, &cwd, resume.as_deref()).await?;
             Ok(ExitCode::SUCCESS)
         }
@@ -157,11 +157,41 @@ fn resolve_cwd(cli: &Cli) -> Result<PathBuf> {
 
 /// Turn `--resume <needle>` into a full session id, accepting a prefix or a
 /// position from `session list` exactly as `imp session resume` does.
-async fn resolve_resume(cli: &Cli, config: &Config) -> Result<Option<String>> {
+///
+/// `--continue`/`-c` is the other form: it picks the most recent conversation
+/// whose stored workspace is this one, so a bare `imp -c` in a project resumes
+/// that project rather than whatever was touched last anywhere.
+async fn resolve_resume(cli: &Cli, config: &Config, cwd: &Path) -> Result<Option<String>> {
+    if cli.resume.is_some() && cli.continue_session {
+        // `conflicts_with` already rejects this, but keep it obvious if a caller
+        // ever bypasses clap.
+        return Err(Error::Config(
+            "--resume and --continue cannot be used together".to_string(),
+        ));
+    }
+
+    let database = cli.db.clone().unwrap_or_else(|| config.database_path());
+
+    if cli.continue_session {
+        let store = Store::open(&database).await?;
+        let workspace = config.workspace_root(cwd)?;
+        let key = workspace.display().to_string();
+        return store
+            .latest_session_in(&key)
+            .await?
+            .map(|row| row.id)
+            .ok_or_else(|| {
+                Error::Config(format!(
+                    "no conversation in {}; run `imp` to start one",
+                    workspace.display()
+                ))
+            })
+            .map(Some);
+    }
+
     let Some(needle) = &cli.resume else {
         return Ok(None);
     };
-    let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let store = Store::open(&database).await?;
     Ok(Some(session::resolve(&store, needle).await?))
 }
