@@ -8,15 +8,15 @@ The binary measured is the static musl artifact, because that is what §9 ships:
 
 ```sh
 cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-musl
-# -> target/aarch64-unknown-linux-musl/release/minion
+# -> target/aarch64-unknown-linux-musl/release/imp
 ```
 
 That binary names the commit it was built from, so a figure can be traced back
-to its source: `minion --version` prints
+to its source: `imp --version` prints
 `<version> (<git sha> <commit date>) [features: cron,guard,mcp,update]`.
 
 > **Provenance (integration, M7 fold).** Every figure in this file was measured on
-> the M6+M7 binary. M8–M11 later put `axum`, `reqwest`/`rustls` and `minion-update` in the
+> the M6+M7 binary. M8–M11 later put `axum`, `reqwest`/`rustls` and `imp-update` in the
 > release path, so the numbers below describe that earlier artifact and have to be
 > re-measured on the merged tree. NFR-3 (static musl size, 14.58 MB against a 15 MB budget) is
 > the one to check first: the C in `aws-lc-sys` is why D24 publishes gnu binaries instead of musl.
@@ -47,7 +47,7 @@ run, `n` samples):
 
 ```python
 import os, subprocess, time
-BIN = ".../target/aarch64-unknown-linux-musl/release/minion"
+BIN = ".../target/aarch64-unknown-linux-musl/release/imp"
 env = dict(os.environ, OPENAI_API_KEY="test-key")
 def run(db, cwd):
     t = time.perf_counter()
@@ -75,24 +75,24 @@ is met at the median but with little headroom, and the p90 is over.
 ### NFR-3
 
 ```sh
-stat -c '%s bytes' target/aarch64-unknown-linux-musl/release/minion   # 14579936
-file target/aarch64-unknown-linux-musl/release/minion                 # statically linked, stripped
+stat -c '%s bytes' target/aarch64-unknown-linux-musl/release/imp   # 14579936
+file target/aarch64-unknown-linux-musl/release/imp                 # statically linked, stripped
 ```
 
 ### NFR-4, NFR-5
 
-Defaults in `minion-core::config`, asserted by `config::tests::defaults_match_the_spec`:
+Defaults in `imp-core::config`, asserted by `config::tests::defaults_match_the_spec`:
 
 ```sh
-cargo +1.89.0 test -p minion-core config::tests::defaults_match_the_spec
+cargo +1.89.0 test -p imp-core config::tests::defaults_match_the_spec
 ```
 
 ### NFR-6
 
 ```sh
-cargo +1.89.0 test -p minion-store tests::the_store_runs_in_wal_mode
-cargo +1.89.0 test -p minion-store tests::a_committed_message_survives_a_reopen
-cargo +1.89.0 test -p minion-cron   # the durable-before-dispatch test
+cargo +1.89.0 test -p imp-store tests::the_store_runs_in_wal_mode
+cargo +1.89.0 test -p imp-store tests::a_committed_message_survives_a_reopen
+cargo +1.89.0 test -p imp-cron   # the durable-before-dispatch test
 ```
 
 ### NFR-7
@@ -104,21 +104,21 @@ cargo +1.89.0 test --workspace --locked    # 427 passed, 0 failed, no network
 ### NFR-8
 
 ```sh
-cargo +1.89.0 test -p minion-cli run::tests
+cargo +1.89.0 test -p imp-cli run::tests
 ```
 
 ### NFR-9
 
 ```sh
-cargo +1.89.0 test -p minion-cli logging::tests
-cargo +1.89.0 test -p minion-cli --test cli_surface \
+cargo +1.89.0 test -p imp-cli logging::tests
+cargo +1.89.0 test -p imp-cli --test cli_surface \
     config_show_masks_a_credential_in_a_header
 ```
 
 ### NFR-10
 
 ```sh
-cargo +1.89.0 test -p minion-cli --test cli_surface init_without_check_writes_offline
+cargo +1.89.0 test -p imp-cli --test cli_surface init_without_check_writes_offline
 ```
 
 ## Building for musl on this host

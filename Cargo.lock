@@ -1014,6 +1014,175 @@ dependencies = [
 ]
 
 [[package]]
+name = "imp-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "clap",
+ "directories",
+ "futures",
+ "imp-core",
+ "imp-cron",
+ "imp-guard",
+ "imp-mcp",
+ "imp-provider",
+ "imp-store",
+ "imp-tools",
+ "imp-update",
+ "insta",
+ "libc",
+ "pulldown-cmark",
+ "rmcp",
+ "rustyline",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "imp-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "directories",
+ "futures",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "imp-cron"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "chrono-tz",
+ "cron",
+ "imp-core",
+ "imp-store",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "imp-guard"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "imp-core",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "imp-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "imp-core",
+ "insta",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "imp-provider"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "futures",
+ "imp-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "imp-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "imp-core",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "imp-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "imp-core",
+ "imp-cron",
+ "imp-store",
+ "libc",
+ "reqwest",
+ "schemars",
+ "serde",
+ "serde_json",
+ "similar 3.2.0",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "imp-update"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "imp-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1208,175 +1377,6 @@ name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
-
-[[package]]
-name = "minion-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "clap",
- "directories",
- "futures",
- "insta",
- "libc",
- "minion-core",
- "minion-cron",
- "minion-guard",
- "minion-mcp",
- "minion-provider",
- "minion-store",
- "minion-tools",
- "minion-update",
- "pulldown-cmark",
- "rmcp",
- "rustyline",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "minion-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "directories",
- "futures",
- "schemars",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "minion-cron"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "chrono-tz",
- "cron",
- "minion-core",
- "minion-store",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "minion-guard"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "minion-core",
- "reqwest",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "minion-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "insta",
- "minion-core",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "minion-provider"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "async-trait",
- "bytes",
- "futures",
- "minion-core",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "minion-store"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "minion-core",
- "rusqlite",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "minion-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "libc",
- "minion-core",
- "minion-cron",
- "minion-store",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "similar 3.2.0",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "minion-update"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "minion-core",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "mio"

@@ -1,4 +1,4 @@
-# minion
+# imp
 
 A minimal, Unix-native AI agent harness. It talks to any OpenAI-compatible
 endpoint, gives the model a small set of gated tools, and keeps every
@@ -30,21 +30,21 @@ Milestones M0 through M7 are done. What works today:
   cross-domain redirects, and a response cap
 - **In-process cron** — jobs on 5-field cron expressions in an IANA timezone,
   with run history, a concurrency cap, overlap detection, and catch-up for
-  occurrences missed while minion was closed
+  occurrences missed while imp was closed
 - **MCP client** — external MCP servers over stdio, their tools published as
   `mcp__<server>__<tool>` with the server's own schema untouched, filtered by a
   per-server `tool_allow`, gated by the same approval engine, and carried by a
   per-server policy
-- **MCP server** — `minion mcp serve` publishes the agent over stdio: `agent_ask`,
+- **MCP server** — `imp mcp serve` publishes the agent over stdio: `agent_ask`,
   the introspection tools, the `cron_*` tools, and a read-only surface by default
   (shell execution and file writes are opt-in flags, printed at startup)
 - **SQLite sessions** — resumable, with `/resume` by id, prefix, or position
-- **`minion init`** — one command from a bare machine to a working config
-- **`minion config show|path`** and **`minion doctor`** — inspection and a one-command health check
+- **`imp init`** — one command from a bare machine to a working config
+- **`imp config show|path`** and **`imp doctor`** — inspection and a one-command health check
   that exits `3` when the backend does not answer
 - **Observability** — an audit row for every tool decision *and its outcome*, a per-session `/cost`,
   and a log sink that masks credentials (`NFR.md`)
-- **Self-update** — `minion update` checks a release channel, verifies the download against
+- **Self-update** — `imp update` checks a release channel, verifies the download against
   `checksums.txt` and the commit it embeds, and replaces the installed binary atomically, keeping the
   previous one for `--rollback`
 - **Markdown rendering** on a terminal, including tables
@@ -60,7 +60,7 @@ in-process by design — see `AGENTS.md`).
 Needs Rust 1.89 or newer (the code uses let-chains, so edition 2024).
 
 ```sh
-cargo install --path crates/minion-cli     # from a checkout
+cargo install --path crates/imp-cli     # from a checkout
 ```
 
 Or with the installer, which fetches a release tarball for this host and
@@ -68,31 +68,46 @@ checksum-verifies it, or installs a binary you already built:
 
 ```sh
 ./install.sh                    # download the release for this host
-./install.sh --from target/release/minion --prefix ~/.local
+./install.sh --from target/release/imp --prefix ~/.local
 ```
 
-`make dist` builds the per-target tarballs (`dist/minion-<version>-<target>.tar.gz`)
+`make dist` builds the per-target tarballs (`dist/imp-<version>-<target>.tar.gz`)
 and their `.sha256` that `install.sh` expects; `make release` builds this host's
-binary. Build in place with `cargo build`; the binary lands at `target/debug/minion`.
+binary. Build in place with `cargo build`; the binary lands at `target/debug/imp`.
 
-Prebuilt binaries are published as assets of a tagged GitHub release; `minion update` (below) installs
+Prebuilt binaries are published as assets of a tagged GitHub release; `imp update` (below) installs
 them, and there is nothing to do by hand once one exists.
 
-`minion --version` reports what a running binary was built from:
+`imp --version` reports what a running binary was built from:
 
 ```
-minion 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
+imp 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
 ```
+
+### Upgrading an installation made under the old name
+
+The project, the binary, the crates, the assets and the environment variables are all `imp` /
+`IMP_*` now (SDD D46). The first run of the new binary migrates the previous configuration and
+state directories onto their new names and renames the session database, so stored sessions, cron
+jobs and the `0600` credentials file carry over; a workspace whose project file is still under the
+old name is read with a notice telling you to rename it.
+
+Two things are not automatic. The old environment variable names are ignored — the new ones are
+`IMP_*`, so update your shell profile and any unit files. And a binary installed before the rename
+keeps the old update channel compiled into itself: it looks for the old asset names, finds none,
+and **refuses** the update rather than installing the wrong thing. Reinstall that machine by hand
+once (`cargo install --path crates/imp-cli`, or `./install.sh --from target/release/imp` after
+`make release`); `imp update` works normally from then on.
 
 ## Use
 
 ```sh
-minion init                     # pick a preset, paste a token, done
-minion                          # REPL
-minion run "summarize the TODOs" # one shot
-minion doctor                   # env, config, database, provider reachability
-minion config show              # the effective config, secrets redacted
-minion config path              # where config, credentials and the database live
+imp init                     # pick a preset, paste a token, done
+imp                          # REPL
+imp run "summarize the TODOs" # one shot
+imp doctor                   # env, config, database, provider reachability
+imp config show              # the effective config, secrets redacted
+imp config path              # where config, credentials and the database live
 ```
 
 Global flags worth knowing:
@@ -135,7 +150,7 @@ Assistant text goes to **stdout**; tool activity, approvals, and errors go to
 **stderr**. So this gives you just the answer:
 
 ```sh
-minion run "explain this error" > answer.txt
+imp run "explain this error" > answer.txt
 ```
 
 On a terminal, assistant text is rendered as markdown — headings, emphasis,
@@ -149,15 +164,15 @@ alignment carries meaning, colour does not.
 ## Cron
 
 Jobs are prompts on a schedule. They live in the same SQLite database as the
-conversations, and they run **inside** a running minion — there is no daemon and
-no crontab entry, so a job does not fire while minion is closed. Missed
+conversations, and they run **inside** a running imp — there is no daemon and
+no crontab entry, so a job does not fire while imp is closed. Missed
 occurrences are dealt with at the next start, according to `[cron]
 missed_run_policy`.
 
 ```sh
-minion cron add --schedule '0 9 * * 1' --prompt 'summarize the week' --name weekly
-minion cron list
-minion cron remove weekly
+imp cron add --schedule '0 9 * * 1' --prompt 'summarize the week' --name weekly
+imp cron list
+imp cron remove weekly
 ```
 
 The schedule is a five-field cron expression (`minute hour day-of-month month
@@ -179,7 +194,7 @@ cannot promote itself, and it cannot reach the System One guard either. See
 
 ## MCP client
 
-minion can consume external [MCP](https://modelcontextprotocol.io) servers and give
+imp can consume external [MCP](https://modelcontextprotocol.io) servers and give
 their tools to the model. Each server is spawned over stdio and its tool list is
 republished under a namespaced name:
 
@@ -197,8 +212,8 @@ the server's own `inputSchema` passed through verbatim. Its name is the table ke
 a server name may not contain `__`.
 
 ```sh
-minion mcp list              # configured servers, whether they came up, tools published
-minion mcp tools files       # everything one server lists, and what minion publishes of it
+imp mcp list              # configured servers, whether they came up, tools published
+imp mcp tools files       # everything one server lists, and what imp publishes of it
 ```
 
 Three things are worth knowing:
@@ -220,19 +235,19 @@ Deny rules, allowlists and the command classifier still run first.
 
 ## MCP server
 
-The other direction: minion can *be* an MCP server, so another model or harness can
+The other direction: imp can *be* an MCP server, so another model or harness can
 drive it. It speaks stdio, and it never starts a REPL — both own stdin/stdout, so
 `mcp serve` is a mode of its own.
 
 ```sh
-minion mcp serve
+imp mcp serve
 ```
 
 The surface is read-only by default:
 
 | Tool | What it does |
 |---|---|
-| `agent_ask` | Run one agent turn with minion's own model backend. Params: `prompt`, `session_id?`, `model?`, `max_iterations?`, `allow_tools?` |
+| `agent_ask` | Run one agent turn with imp's own model backend. Params: `prompt`, `session_id?`, `model?`, `max_iterations?`, `allow_tools?` |
 | `agent_list_sessions` | Stored conversations, newest first |
 | `agent_get_session` | One conversation's transcript |
 | `agent_list_tools` | The read-only tools `agent_ask` may call, with risk classes |
@@ -240,8 +255,8 @@ The surface is read-only by default:
 | `agent_run_command` | Shell execution — **refused** unless `expose_exec` |
 | `agent_write_file` | File writes — **refused** unless `expose_write` |
 
-It also serves the resources `minion://sessions`, `minion://sessions/{id}`,
-`minion://jobs` and `minion://config-redacted`, and the `minion_agent` prompt for
+It also serves the resources `imp://sessions`, `imp://sessions/{id}`,
+`imp://jobs` and `imp://config-redacted`, and the `imp_agent` prompt for
 hosts that support prompts but not tools.
 
 ```toml
@@ -258,28 +273,28 @@ Three things are worth knowing:
   denied there, with the refusal written to the audit trail and returned to the caller
   as a readable tool error. Turning a flag on is the operator's consent; deny rules and
   allowlists still run first, so it cannot grant something already refused.
-- **The startup banner states the capabilities.** `minion mcp serve` prints one line per
+- **The startup banner states the capabilities.** `imp mcp serve` prints one line per
   flag on stderr, and shouts about the enabled ones, so nobody enables remote code
   execution by accident.
 - **`agent_ask` is read-only whatever the flags say.** It runs a turn against the
   read-only subset of the built-in tools; `expose_write`/`expose_exec` add the *direct*
-  tools, they do not widen the agent. `minion://config-redacted` never carries a secret.
+  tools, they do not widen the agent. `imp://config-redacted` never carries a secret.
 
 Jobs created over MCP are stored in the same database, but `mcp serve` does not run the
-scheduler — they fire the next time a process that does (a REPL or `minion run`) opens it.
+scheduler — they fire the next time a process that does (a REPL or `imp run`) opens it.
 
 ## Update
 
-`minion update` checks a release channel and, when a newer version is published, downloads the
+`imp update` checks a release channel and, when a newer version is published, downloads the
 prebuilt binary for your platform, verifies it, and replaces the installed one.
 
 ```sh
-minion update --check     # report only; exits 1 when an update is available
-minion update             # prompts, then installs
-minion update --yes       # no prompt (required when stdin is not a terminal)
-minion update --force     # reinstall even if already current
-minion update --rollback  # restore the previous binary
-minion update --check --json
+imp update --check     # report only; exits 1 when an update is available
+imp update             # prompts, then installs
+imp update --yes       # no prompt (required when stdin is not a terminal)
+imp update --force     # reinstall even if already current
+imp update --rollback  # restore the previous binary
+imp update --check --json
 ```
 
 What it checks before replacing anything:
@@ -290,15 +305,15 @@ What it checks before replacing anything:
    commit the release declares. A release that declares no commit is refused rather than trusted.
 
 Only then is the new binary moved over the old one with `rename()`, which is atomic. The previous
-binary is kept beside it as `minion.old-<version>`, which is what `--rollback` restores.
+binary is kept beside it as `imp.old-<version>`, which is what `--rollback` restores.
 
 Three things are worth knowing:
 
 - **`--check` writes nothing.** It reports the installed version, the latest, and the asset for your
   platform, and exits `0` when up to date or `1` when an update is available.
-- **Nothing is installed unattended without `--yes`.** With no terminal there is no prompt, so minion
-  refuses rather than guessing — `printf y | minion update` does not update anything.
-- **If the install directory is not writable, minion does not call `sudo`.** It verifies and stages the
+- **Nothing is installed unattended without `--yes`.** With no terminal there is no prompt, so imp
+  refuses rather than guessing — `printf y | imp update` does not update anything.
+- **If the install directory is not writable, imp does not call `sudo`.** It verifies and stages the
   binary where it can write, then prints the two commands for you to run as an administrator (back up
   the old binary, then install the new one).
 
@@ -308,8 +323,8 @@ at a mirror:
 ```toml
 [update]
 api_url = "https://api.github.com"   # https, or http only on loopback
-repo = "Az107/minion"
-asset_prefix = "minion"              # assets are `<prefix>-<os>-<arch>` plus checksums.txt
+repo = "Az107/imp"
+asset_prefix = "imp"              # assets are `<prefix>-<os>-<arch>` plus checksums.txt
 ```
 
 An update replaces exactly one file. It does not touch the config, the database, or the credentials
@@ -325,20 +340,20 @@ A **push to `main`** does the following, in order:
    `v0.1.0`; otherwise the patch is bumped, `vX.Y.Z` → `vX.Y.(Z+1)`. If `HEAD` already carries a tag
    (a re-run of the same commit), the whole job is skipped, so a published commit is never republished.
 2. **Refuses to publish** unless that version equals `[workspace.package].version` in `Cargo.toml`.
-   The binary embeds that version and `minion update` compares it to the release tag, so the two have
-   to agree — a release whose tag and embedded version disagree would make `minion update` offer the
+   The binary embeds that version and `imp update` compares it to the release tag, so the two have
+   to agree — a release whose tag and embedded version disagree would make `imp update` offer the
    same release forever.
 3. **Runs the tests** (`cargo +1.89.0 test --workspace --locked`). A red tree publishes nothing.
 4. **Builds the six targets** — `{linux, macOS, Windows} × {amd64, arm64}` — on a runner per target,
    and runs each built binary with `--version` to assert it carries the release version and commit
-   (`MINION_GIT_SHA`/`MINION_GIT_DATE`). The Linux pair is built on the pinned `ubuntu-22.04` runner
+   (`IMP_GIT_SHA`/`IMP_GIT_DATE`). The Linux pair is built on the pinned `ubuntu-22.04` runner
    (so the glibc floor of the binaries stays at 2.35 instead of moving when `ubuntu-latest` rotates);
    linux/arm64 is cross-compiled with `gcc-aarch64-linux-gnu` and run under qemu. macOS and Windows
    are built natively on their own runners — Apple's linker cannot be obtained on Linux, and
    Windows/arm64 is built on the arm64 runner because an x64 host cannot execute an arm64 binary to
-   check it. The asset names are exactly the ones `minion update` looks up:
-   `minion-linux-amd64`, `minion-linux-arm64`, `minion-darwin-amd64`, `minion-darwin-arm64`,
-   `minion-windows-amd64`, `minion-windows-arm64` (the Windows ones are the bytes of the `.exe`,
+   check it. The asset names are exactly the ones `imp update` looks up:
+   `imp-linux-amd64`, `imp-linux-arm64`, `imp-darwin-amd64`, `imp-darwin-arm64`,
+   `imp-windows-amd64`, `imp-windows-arm64` (the Windows ones are the bytes of the `.exe`,
    renamed).
 5. **Publishes a GitHub Release** at the derived tag with the six assets and a `checksums.txt` that
    covers them, then verifies the release is not left as a draft and that the uploaded `checksums.txt`
@@ -362,26 +377,26 @@ cargo +1.89.0 build --release --locked                                   # linux
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-gnu
 mkdir -p dist
-cp target/release/minion                             dist/minion-linux-amd64
-cp target/aarch64-unknown-linux-gnu/release/minion   dist/minion-linux-arm64
+cp target/release/imp                             dist/imp-linux-amd64
+cp target/aarch64-unknown-linux-gnu/release/imp   dist/imp-linux-arm64
 # ... plus, from macOS and Windows respectively:
-#   target/{x86_64,aarch64}-apple-darwin/release/minion     -> minion-darwin-{amd64,arm64}
-#   target/{x86_64,aarch64}-pc-windows-msvc/release/minion.exe -> minion-windows-{amd64,arm64}
-# All six must be present; `minion update` gets a 404 on a platform whose asset is missing,
+#   target/{x86_64,aarch64}-apple-darwin/release/imp     -> imp-darwin-{amd64,arm64}
+#   target/{x86_64,aarch64}-pc-windows-msvc/release/imp.exe -> imp-windows-{amd64,arm64}
+# All six must be present; `imp update` gets a 404 on a platform whose asset is missing,
 # and refuses the release outright if its manifest is missing (`checksums.txt` is not a
-# `minion-*` file, so the glob below does not pick it up — name it explicitly).
-( cd dist && sha256sum minion-* >checksums.txt )
+# `imp-*` file, so the glob below does not pick it up — name it explicitly).
+( cd dist && sha256sum imp-* >checksums.txt )
 gh release create v0.2.0 --title v0.2.0 \
   --notes "build-commit: $(git rev-parse --short=12 HEAD)" \
-  dist/minion-* dist/checksums.txt
+  dist/imp-* dist/checksums.txt
 ```
 
 **Verifying a release:**
 
 ```sh
-gh release view v0.1.0                 # assets: the six minion-* binaries plus checksums.txt
-minion update --check                  # exits 0 (up to date) or 1 (update available)
-minion update --check --json           # installed, latest, asset and the commit the release declares
+gh release view v0.1.0                 # assets: the six imp-* binaries plus checksums.txt
+imp update --check                  # exits 0 (up to date) or 1 (update available)
+imp update --check --json           # installed, latest, asset and the commit the release declares
 ```
 
 ## Observability
@@ -394,7 +409,7 @@ same row; a refusal is a finished decision and is written as it happens. Each ro
 also carries the conversation and provider round-trip it belonged to.
 
 ```sh
-sqlite3 ~/.local/state/minion/minion.db \
+sqlite3 ~/.local/state/imp/imp.db \
   "SELECT ts, tool, decision, outcome, duration_ms FROM audit_log ORDER BY id DESC LIMIT 20"
 ```
 
@@ -439,7 +454,7 @@ writes or executes goes through a policy engine that decides *before* the call:
 - **The MCP server is read-only by default.** `agent_ask` runs a turn with the read-only tool subset;
   shell execution and file writes over MCP are opt-in flags that are printed at startup, and a
   disabled capability is refused by the policy engine — visibly, and in the audit trail — rather than
-  quietly absent. `minion://config-redacted` strips secret-shaped header values.
+  quietly absent. `imp://config-redacted` strips secret-shaped header values.
 - Approval is remembered by **verb**, so approving one `cargo build` does not
   approve every `cargo` invocation.
 

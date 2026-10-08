@@ -1,14 +1,14 @@
 #!/bin/sh
-# Install minion (§9).
+# Install imp (§9).
 #
 #   ./install.sh                 # download the release for this host
-#   ./install.sh --from ./minion # install a binary you built yourself
+#   ./install.sh --from ./imp # install a binary you built yourself
 #   ./install.sh --prefix /usr/local
 #
 # The download path is overridable so a mirror, a self-hosted Forgejo release,
 # or a local file server can serve the same layout:
 #
-#   MINION_RELEASE_URL=https://git.albruiz.dev/albruiz/minion/releases/download \
+#   IMP_RELEASE_URL=https://git.albruiz.dev/albruiz/imp/releases/download \
 #     ./install.sh
 #
 # Every downloaded file is checksum-verified when the release publishes a
@@ -16,9 +16,9 @@
 
 set -eu
 
-REPO="${MINION_REPO:-albruiz/minion}"
-BASE="${MINION_RELEASE_URL:-https://git.albruiz.dev/${REPO}/releases/download}"
-VERSION="${MINION_VERSION:-latest}"
+REPO="${IMP_REPO:-albruiz/imp}"
+BASE="${IMP_RELEASE_URL:-https://git.albruiz.dev/${REPO}/releases/download}"
+VERSION="${IMP_VERSION:-latest}"
 PREFIX="${PREFIX:-$HOME/.local}"
 FROM=""
 
@@ -64,12 +64,12 @@ if [ -n "$FROM" ]; then
         echo "install.sh: $FROM is not a file" >&2
         exit 1
     fi
-    install -m 0755 "$FROM" "$bindir/minion"
-    echo "installed $(basename "$FROM") to $bindir/minion"
+    install -m 0755 "$FROM" "$bindir/imp"
+    echo "installed $(basename "$FROM") to $bindir/imp"
     exit 0
 fi
 
-asset="minion-${VERSION}-${target}.tar.gz"
+asset="imp-${VERSION}-${target}.tar.gz"
 url="${BASE}/${VERSION}/${asset}"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT INT TERM
@@ -77,7 +77,7 @@ trap 'rm -rf "$tmpdir"' EXIT INT TERM
 echo "downloading $url"
 if ! curl -fsSL "$url" -o "$tmpdir/$asset"; then
     echo "install.sh: could not download $url" >&2
-    echo "install.sh: build from source instead: cargo install --path crates/minion-cli" >&2
+    echo "install.sh: build from source instead: cargo install --path crates/imp-cli" >&2
     exit 1
 fi
 
@@ -97,11 +97,11 @@ else
 fi
 
 tar -xzf "$tmpdir/$asset" -C "$tmpdir"
-install -m 0755 "$tmpdir/minion" "$bindir/minion"
+install -m 0755 "$tmpdir/imp" "$bindir/imp"
 
-echo "installed minion to $bindir/minion"
+echo "installed imp to $bindir/imp"
 case ":$PATH:" in
     *":$bindir:"*) ;;
     *) echo "note: add $bindir to your PATH" ;;
 esac
-"$bindir/minion" --version
+"$bindir/imp" --version

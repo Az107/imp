@@ -1,16 +1,16 @@
-# Software Design Document — `minion`
+# Software Design Document — `imp`
 
 **A minimal, Unix-native AI agent harness with a shell-like REPL, an OpenAI-compatible model client, and an MCP server.**
 
 | Field | Value |
 |---|---|
-| Project | `minion` |
+| Project | `imp` |
 | Document | Software Design Document (SDD) |
 | Version | 0.1 (Draft) |
 | Status | For review |
 | Date | 2026-09-29 |
 | Language | Rust (edition 2024), `tokio` async runtime |
-| Primary artifact | Single static binary `minion` |
+| Primary artifact | Single static binary `imp` |
 | Platforms | macOS, Linux (primary); Windows best-effort |
 
 ### Glossary
@@ -32,7 +32,7 @@
 
 Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a daemon with a web UI, and a large dependency surface. That makes them awkward to embed, script, pipe, and audit. `fx` (Vercel Labs, Zig) demonstrated the opposite: an agent that behaves like a **Unix shell** — preserves scrollback, emits minimal output, and composes with pipes and scripts.
 
-`minion` applies that philosophy to a general-purpose (not coding-specific) mini agent that:
+`imp` applies that philosophy to a general-purpose (not coding-specific) mini agent that:
 
 1. Talks to any **OpenAI-compatible** `/v1/chat/completions` endpoint.
 2. Ships a **small, audited tool set** — command execution, file access, HTTP, cron, memory.
@@ -139,12 +139,12 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 
 | ID | Requirement |
 |---|---|
-| FR-26 | REPL default; one-shot `minion run "<prompt>"`; stdin piping |
+| FR-26 | REPL default; one-shot `imp run "<prompt>"`; stdin piping |
 | FR-27 | Slash commands for local control (`/help`, `/model`, `/sessions`, `/cron`, `/allow`, `/quit`) |
 | FR-28 | `!<cmd>` shell escape that bypasses the model |
 | FR-29 | `--json` machine-readable output for one-shot and management subcommands |
 | FR-30 | Session management: list, show, resume, delete |
-| FR-31 | `minion init` configures the model backend (base URL, API key env var, model) and writes a config file |
+| FR-31 | `imp init` configures the model backend (base URL, API key env var, model) and writes a config file |
 | FR-32 | The config file records only the API key env var *name*; the key value is never written to a config, so a config may be committed |
 | FR-33 | `init` discovers models via `GET {base_url}/models` when reachable, and falls back to free-text entry when it is not |
 | FR-34 | `init` is idempotent and non-destructive: an existing config is diffed and requires `--force` to replace, and writes are atomic |
@@ -179,7 +179,7 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 ### 3.1 High-level view
 
 ```
-┌────────────┐        ┌──────────────────────── minion (one binary) ─────────────────────┐
+┌────────────┐        ┌──────────────────────── imp (one binary) ─────────────────────┐
 │  Terminal  │        │                                                                  │
 │ TTY / pipe │◄──────►│  ┌──────────┐        ┌──────────────┐      ┌────────────────┐     │
 └────────────┘        │  │  REPL /  │        │  Agent Loop  │      │  Provider      │─────┼──► OpenAI-compatible
@@ -227,7 +227,7 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 | Cron Scheduler | Compute due jobs, dispatch prompts, record runs | Mutate job definitions |
 | SQLite Store | Sole persistence: sessions, messages, jobs, runs, memory, policy | Hold secrets in plaintext |
 | MCP Client | Discover/call external MCP tools | Bypass approval |
-| MCP Server | Expose minion capabilities to other models | Expose `run_command` by default |
+| MCP Server | Expose imp capabilities to other models | Expose `run_command` by default |
 
 ### 3.3 Execution model
 
@@ -265,20 +265,20 @@ Most AI agent harnesses are heavy: a full-screen TUI, an IDE-like pane layout, a
 Proposed crates (single workspace, one binary + library for testability):
 
 ```
-minion/
+imp/
 ├── Cargo.toml                # workspace
 ├── crates/
-│   ├── minion-core/          # lib: loop, messages, tool traits, policy  (no I/O deps on terminal)
-│   ├── minion-provider/      # OpenAI-compatible client (SSE, retries, usage)
-│   ├── minion-tools/         # built-in tools + registry
-│   ├── minion-store/         # SQLite schema, migrations, repositories
-│   ├── minion-cron/          # scheduler + catch-up policy
-│   ├── minion-mcp/           # MCP server + client (rmcp)
-│   └── minion-cli/           # bin: clap, REPL frontend, subcommands
+│   ├── imp-core/          # lib: loop, messages, tool traits, policy  (no I/O deps on terminal)
+│   ├── imp-provider/      # OpenAI-compatible client (SSE, retries, usage)
+│   ├── imp-tools/         # built-in tools + registry
+│   ├── imp-store/         # SQLite schema, migrations, repositories
+│   ├── imp-cron/          # scheduler + catch-up policy
+│   ├── imp-mcp/           # MCP server + client (rmcp)
+│   └── imp-cli/           # bin: clap, REPL frontend, subcommands
 └── tests/                    # cross-crate integration + fixtures
 ```
 
-Rationale: `minion-core` has zero terminal and zero network dependencies, so the loop is unit-testable with a scripted mock provider.
+Rationale: `imp-core` has zero terminal and zero network dependencies, so the loop is unit-testable with a scripted mock provider.
 
 ### 4.1 Dependencies (indicative)
 
@@ -308,15 +308,15 @@ Rationale: `minion-core` has zero terminal and zero network dependencies, so the
 
 ### 5.1 Configuration
 
-**Precedence** (highest first): CLI flags → env vars (`MINION_*`) → project `minion.toml` → synced master layer (`config sync`, §5.14) → user config → built-in defaults.
+**Precedence** (highest first): CLI flags → env vars (`IMP_*`) → project `imp.toml` → synced master layer (`config sync`, §5.14) → user config → built-in defaults.
 
-Locations: `$XDG_CONFIG_HOME/minion/config.toml` (or `~/Library/Application Support/minion/` on macOS), plus `./minion.toml` in the workspace, plus the machine-local `synced.toml` written by `config sync` (§5.14).
+Locations: `$XDG_CONFIG_HOME/imp/config.toml` (or `~/Library/Application Support/imp/` on macOS), plus `./imp.toml` in the workspace, plus the machine-local `synced.toml` written by `config sync` (§5.14).
 
 ```toml
 [provider]
 base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"   # name only; the value is never stored or logged
-api_key_file = "~/.config/minion/credentials"  # the value itself lives here, 0600
+api_key_file = "~/.config/imp/credentials"  # the value itself lives here, 0600
 model = "gpt-4.1-mini"
 temperature = 0.2
 stream = true
@@ -335,7 +335,7 @@ strict_tool_arguments = false   # ask the backend to constrain tool args to the 
 "x-opencode-session" = "${session}"
 
 [agent]
-system_prompt_file = "~/.config/minion/system.md"
+system_prompt_file = "~/.config/imp/system.md"
 max_iterations = 25
 max_tool_calls_per_turn = 0    # 0 = unlimited; a small model benefits from a small number (M10.3)
 small_model = false            # append short numbered rules for a 2-4B local model (M10.3)
@@ -409,7 +409,7 @@ expose_write = false
 expose_cron_write = true
 
 # A server is reached one of two ways, and they are mutually exclusive: a
-# `command` minion spawns over stdio, or a `url` it speaks Streamable HTTP to.
+# `command` imp spawns over stdio, or a `url` it speaks Streamable HTTP to.
 [mcp.client.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
@@ -418,14 +418,14 @@ tool_allow = ["read_file", "list_directory"]
 
 [mcp.client.servers.peer]
 url = "http://peer.tailnet.ts.net:8788/mcp"
-token_file = "~/.config/minion/peer.credentials"
+token_file = "~/.config/imp/peer.credentials"
 approval = "ask"
 tool_allow = ["*"]
 
 [logging]
 level = "info"
 format = "text"                  # text | json
-file = "~/.local/state/minion/minion.log"
+file = "~/.local/state/imp/imp.log"
 redact_env = true
 
 # The master config channel (M11, §5.14). This section is read from the *local*
@@ -433,7 +433,7 @@ redact_env = true
 # so the synced layer itself may never define it. `remote`/`ref` name the git
 # channel; `node` names *this* machine and is resolved when it is empty.
 [configsync]
-remote = "https://git.albruiz.dev/albruiz/minion-config.git"
+remote = "https://git.albruiz.dev/albruiz/imp-config.git"
 ref = "main"                     # branch or tag; a pinned commit is also accepted
 node = ""                        # empty → `hostname -s` → the self entry of `tailscale status`
 ```
@@ -447,7 +447,7 @@ credentials file, so a config may be committed while the secret never is.
 
 1. `provider.api_key_env` — if the named variable is set and non-empty, it wins. This is what lets a
    single shell or CI job override a stored key without editing anything.
-2. `provider.api_key_file` — a TOML file holding `api_key = "…"`, written by `minion init`.
+2. `provider.api_key_file` — a TOML file holding `api_key = "…"`, written by `imp init`.
 3. Otherwise an error naming both sources, *unless both are empty*, which is how a keyless local
    backend is expressed.
 
@@ -457,7 +457,7 @@ therefore has to set **both** to `""` — clearing only `api_key_env` would leav
 credentials path active and the backend would still appear to need a key.
 
 
-#### 5.1.1 `minion init` — configuring the model backend
+#### 5.1.1 `imp init` — configuring the model backend
 
 `init` is the supported way to produce a first config. It is an opinionated wizard over the schema
 above: it asks only for what the provider layer actually needs, then writes one file.
@@ -490,7 +490,7 @@ above: it asks only for what the provider layer actually needs, then writes one 
 7. **Confirmation** showing the target path and a summary of the values about to be written.
 
 **Where the key is stored.** The token goes to a `0600` credentials file beside the user config
-(`$XDG_CONFIG_HOME/minion/credentials`), created inside a `0700` directory. The config is written
+(`$XDG_CONFIG_HOME/imp/credentials`), created inside a `0700` directory. The config is written
 *without* the value, so `--project` output stays committable. `--credentials-file` chooses a
 different location, and that path is then recorded as `provider.api_key_file` so the two cannot
 disagree. In the default case the path is left unstated, because a machine-specific path in a shared
@@ -502,12 +502,12 @@ This is how a backend whose gateway requires a routing header — OpenCode Go's
 `x-opencode-session` — is configured without a bespoke code path:
 
 ```
-minion init --non-interactive --preset custom \
+imp init --non-interactive --preset custom \
   --base-url https://gateway.internal/v1 --model internal-1 \
   --api-key-env GATEWAY_KEY --header 'x-opencode-session: ${session}'
 ```
 
-**Target file.** The user config path from §5.1 by default; `--project` writes `./minion.toml`
+**Target file.** The user config path from §5.1 by default; `--project` writes `./imp.toml`
 instead (for a shared, secret-free setup that can be committed). Parent directories are created
 `0700` and the file is created `0600`. Writes are atomic (temp file in the same directory, then
 rename), so an interrupted `init` never leaves a partial config.
@@ -518,7 +518,7 @@ change and exits `4` without writing, unless `--force` is passed.
 **Non-interactive form.** Every prompt has a flag, so `init` is usable from provisioning scripts:
 
 ```
-minion init --non-interactive \
+imp init --non-interactive \
   --base-url http://localhost:11434/v1 \
   --model llama3.1 --no-api-key --project --force
 ```
@@ -529,7 +529,7 @@ nothing and exits `3` with the provider's own message, so a misconfigured backen
 config that merely looks correct.
 
 **Credential warning.** If a credential is named but nothing can be found — the env var is unset and
-no token was just stored — the config is still written, but the gap is printed, and `minion doctor`
+no token was just stored — the config is still written, but the gap is printed, and `imp doctor`
 repeats it. Storing a token *is* a credential, so a key saved moments earlier must not trigger this
 warning.
 
@@ -537,8 +537,8 @@ warning.
 so scripted setups can consume the result. It reports the credentials *path*; the value is never in
 the output.
 
-**Relationship to `config`.** `minion config init` is retained as an alias for `minion init`;
-`minion config show|path` stay read-only.
+**Relationship to `config`.** `imp config init` is retained as an alias for `imp init`;
+`imp config show|path` stay read-only.
 
 ### 5.2 Provider client
 
@@ -905,7 +905,7 @@ Catch-up replays occurrences with no overlap check, because the occurrences bein
 
 ### 5.8 SQLite store
 
-Location: `$XDG_STATE_HOME/minion/minion.db` (or macOS Application Support). WAL mode, `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL`.
+Location: `$XDG_STATE_HOME/imp/imp.db` (or macOS Application Support). WAL mode, `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL`.
 
 ```sql
 CREATE TABLE schema_migrations (
@@ -1019,7 +1019,7 @@ Notes:
 - `args_digest` stores a hash of sensitive arguments so the audit trail is useful without persisting secrets.
 - Messages are append-only; the `seq` counter is allocated inside the transaction that writes the message.
 
-**Migrations.** A forward-only list in `minion-store::migrate`, each entry applied once and recorded
+**Migrations.** A forward-only list in `imp-store::migrate`, each entry applied once and recorded
 in `schema_migrations`. A database newer than this build understands is refused rather than read
 optimistically, and `PRAGMA quick_check` runs before any migration so a corrupt file fails loudly
 instead of half-initialising. Tables that later milestones own are created up front, with the FTS
@@ -1036,7 +1036,7 @@ results were dropped is rejected by the provider, so a turn must never be split.
 
 ### 5.9 MCP server
 
-The server task is started with `minion mcp serve`, over **stdio** or **Streamable HTTP**
+The server task is started with `imp mcp serve`, over **stdio** or **Streamable HTTP**
 (`[mcp.server].transport = "http"`). It uses `rmcp`'s server trait and shares the same core loop, store, and policy engine.
 
 **Exposed tools** (default surface):
@@ -1051,14 +1051,14 @@ The server task is started with `minion mcp serve`, over **stdio** or **Streamab
 | `agent_run_command` | Shell execution | **denied unless `mcp.server.expose_exec = true`** |
 | `agent_write_file` | File writes | **denied unless `mcp.server.expose_write = true`** |
 
-**Resources:** `minion://sessions`, `minion://sessions/{id}`, `minion://jobs`, `minion://config-redacted`.
+**Resources:** `imp://sessions`, `imp://sessions/{id}`, `imp://jobs`, `imp://config-redacted`.
 
-**Prompts:** `minion_agent` — a parameterized prompt that frames a task for the agent, so hosts that only support prompts (not tools) can still use minion.
+**Prompts:** `imp_agent` — a parameterized prompt that frames a task for the agent, so hosts that only support prompts (not tools) can still use imp.
 
 **Protocol posture:** read-only by default; write/exec capabilities are opt-in flags that are printed loudly at server startup, so an operator cannot enable them unknowingly.
 
-**As implemented (M6).** The server is `minion mcp serve` over stdio, in
-`minion-cli::mcp_serve`. It assembles the same pieces a session does — the same
+**As implemented (M6).** The server is `imp mcp serve` over stdio, in
+`imp-cli::mcp_serve`. It assembles the same pieces a session does — the same
 store, the same built-in tool registry, the same `PolicyEngine` — and it never
 starts a REPL, because both own stdin/stdout (R5). A turn's output goes nowhere
 but the protocol, so diagnostics stay on stderr.
@@ -1083,9 +1083,9 @@ but the protocol, so diagnostics stay on stderr.
   is why `agent_run_command` is decided under the name `run_command` — an
   operator's existing `run_command` rules protect the MCP surface too, and the
   command classifier still sees the command.
-- **Resources and prompt.** `minion://sessions`, `minion://jobs`,
-  `minion://config-redacted` and the `minion://sessions/{id}` template; the
-  `minion_agent` prompt frames a task for a host that has prompts but no tools.
+- **Resources and prompt.** `imp://sessions`, `imp://jobs`,
+  `imp://config-redacted` and the `imp://sessions/{id}` template; the
+  `imp_agent` prompt frames a task for a host that has prompts but no tools.
   `config-redacted` serialises the effective config with header values whose
   *name* looks like a credential replaced by `<redacted>`, so the resource cannot
   become an exfiltration path for a hand-written config.
@@ -1113,14 +1113,14 @@ address — is the authentication boundary. There is no TLS, also deliberately
 ### 5.10 MCP client
 
 - Servers from `[mcp.client.servers.*]` are reached at startup — spawned over stdio when they have a `command`, or contacted over Streamable HTTP when they have a `url` (lazily on first use if `lazy = true`).
-- `tools/list` results are flattened into the registry as `mcp__<server>__<tool>`, with `inputSchema` passed through verbatim (minion does not rewrite third-party schemas).
+- `tools/list` results are flattened into the registry as `mcp__<server>__<tool>`, with `inputSchema` passed through verbatim (imp does not rewrite third-party schemas).
 - `tool_allow` per server filters what reaches the model; anything not listed is invisible and uncallable.
 - Per-server approval policy overrides the global default, so a trusted local server can be `auto` while a network server is `ask`.
 - Server failures degrade gracefully: the tools are removed from the catalog and a `system` notice explains why. They are retried on the next turn.
 - Tool name collisions with built-ins are resolved by prefixing, never shadowing: built-ins always win.
 
 **Configuration.** Each `[mcp.client.servers.<name>]` entry is reached one of two ways, and they are
-mutually exclusive: a `command` (with `args`) minion spawns over stdio, or a `url` it speaks
+mutually exclusive: a `command` (with `args`) imp spawns over stdio, or a `url` it speaks
 Streamable HTTP to. `Config::validate` accepts exactly one of the two — both, or neither, is a startup
 error, as is an `args` list beside a `url` or a scheme that is not `http(s)`. A `url` server may name a
 bearer token source — `token_env` (a variable *name*) or `token_file` (a credentials-file *path*),
@@ -1137,9 +1137,9 @@ lazy = true                       # contact it on the first turn, not at startup
 tool_allow = ["read_*", "list"]   # empty allows nothing; ["*"] allows everything
 approval = "auto"                 # this server's tools substitute the global default
 
-[mcp.client.servers.peer]         # a second minion, on the same tailnet
+[mcp.client.servers.peer]         # a second imp, on the same tailnet
 url = "http://peer.tailnet.ts.net:8788/mcp"
-token_file = "~/.config/minion/peer.credentials"   # api_key = "…", mode 0600
+token_file = "~/.config/imp/peer.credentials"   # api_key = "…", mode 0600
 approval = "ask"
 tool_allow = ["*"]
 ```
@@ -1148,13 +1148,13 @@ tool_allow = ["*"]
 the same registry, the same `Agent::dispatch`, and the same approval gate as `run_command`. There is no
 path from the model to a server that skips a policy decision. Its risk class is always `Network` —
 `§5.5` says "inherited from the target tool's declared risk, minimum `Network`", and since MCP states
-risk only in `ToolAnnotations`, which are *hints from a server minion does not vouch for*, an inherited
+risk only in `ToolAnnotations`, which are *hints from a server imp does not vouch for*, an inherited
 hint could only ever lower the class. With the floor at `Network` the honest reading is the floor
 itself (D21, T6). `tool_allow` is applied before the catalogue is built, so a tool the operator did not
 name is absent from the schemas the model receives *and* unresolvable by name; there is one thing the
 operator has to write to widen it, and it is in the config.
 
-**The catalogue is live, not a snapshot.** `minion-core` exposes a `ToolCatalog` trait, and the
+**The catalogue is live, not a snapshot.** `imp-core` exposes a `ToolCatalog` trait, and the
 registry consults it on every read of the tool list. That is what makes §5.10's "retried on the next
 turn" real: at the start of each turn the client re-attempts every server that is not up, and a server
 that answers publishes its tools into the catalogue the model is about to be offered — through the
@@ -1165,7 +1165,7 @@ built-in, whatever a server calls itself.
 **`lazy`.** A lazy server is not contacted while the session is assembled; the first turn does it
 (`OnStart::Eager` versus `OnStart::All`). Its tools still reach the catalogue from that point, because
 a tool list cannot be discovered without a connection — `lazy` buys a cheaper session start, not a
-hidden tool set. `minion mcp list` and `minion mcp tools <server>` are explicit uses and start a lazy
+hidden tool set. `imp mcp list` and `imp mcp tools <server>` are explicit uses and start a lazy
 server immediately, which is also how an operator inspects one.
 
 **HTTP transport (as implemented, M10).** A `url` server goes through the same
@@ -1176,14 +1176,14 @@ spawn is. The difference is the handshake: `connect_http` opens `rmcp`'s Streama
 HTTP client against the endpoint and, when a token is configured, sends it as
 `Authorization: Bearer` on every request. The token is resolved from `token_env`
 then `token_file` with the provider's resolution; a source that is *named* but
-yields nothing is an error rather than a silent anonymous call. `minion mcp list`
+yields nothing is an error rather than a silent anonymous call. `imp mcp list`
 prints the `url` in place of the `command` line for such a server.
 
 **Failure.** A server that cannot be started costs its tools and nothing else: the turn completes, the
 tools are gone from the catalogue, and the reason arrives as a `system` message. Notices are emitted on
 *transitions* only, so a server that stays down is explained once rather than on every turn.
 
-**Shutdown.** `minion` closes its MCP connections on the way out of both the REPL and a one-shot run,
+**Shutdown.** `imp` closes its MCP connections on the way out of both the REPL and a one-shot run,
 so a session does not leave server processes behind. A hard kill (SIGKILL) can still orphan a child;
 that is documented rather than hidden.
 
@@ -1198,8 +1198,8 @@ Deferred rather than half-gated; see AGENTS.md's known gaps.
 **Philosophy:** the terminal is a scrollback, not a canvas. No alternate screen, no full redraw, no mouse capture.
 
 ```
-$ minion
-minion 0.1 · gpt-4.1-mini · /Users/me/proj · policy: ask
+$ imp
+imp 0.1 · gpt-4.1-mini · /Users/me/proj · policy: ask
 
 › summarize the TODOs in this repo and open a job to nag me weekly
 
@@ -1245,37 +1245,37 @@ restart — that is the point of the header, and a fresh id would look like a ne
 gateway.
 
 Rendering rules:
-- Assistant text streams to stdout; tool activity goes to **stderr** as single dimmed lines, so `minion run ... > out.txt` yields clean output.
+- Assistant text streams to stdout; tool activity goes to **stderr** as single dimmed lines, so `imp run ... > out.txt` yields clean output.
 - On a terminal, assistant text is rendered as markdown: headings, bold/italic/strikethrough, inline and fenced code, lists, blockquotes, rules, and pipe tables with box-drawing borders and column alignment. Rendering is **per block**, not per token — a block is drawn as soon as it is complete and nothing already printed is ever revised, which is what keeps the scrollback intact. A table cannot be laid out until its last row arrives, so it waits for one.
 - **Piped output is not rendered.** When stdout is not a terminal the raw markdown is emitted, because the source is the more useful thing to capture and reformat later. `--markdown` does not override this.
 - Layout and colour are separate. `NO_COLOR` and `--no-color` suppress the ANSI escapes but keep table borders and list markers, since alignment carries meaning that colour does not. `--no-markdown` turns rendering off entirely.
 - Width comes from `--width`, then `$COLUMNS`, then 80. A table that cannot fit the width is emitted as plain rows rather than drawn into a mangled grid.
 - `--json` emits newline-delimited JSON events (`{"type":"text"…}`, `{"type":"tool_call"…}`, `{"type":"done"…}`) for scripting, and never renders markdown: a JSON consumer wants the model's own text, not a drawn table.
-- Piped stdin: `echo "..." | minion run -` reads the prompt from stdin; combined with a non-TTY, policy is enforced as non-interactive.
+- Piped stdin: `echo "..." | imp run -` reads the prompt from stdin; combined with a non-TTY, policy is enforced as non-interactive.
 - Colors via a tiny ANSI helper honoring `NO_COLOR` and `--no-color`; no truecolor dependency.
 
 ### 5.12 CLI surface
 
 ```
-minion [OPTIONS] [PROMPT]              # REPL, or one-shot if PROMPT given
-minion run [OPTIONS] <PROMPT|->        # one-shot, non-interactive-friendly
-minion session list|show <id>|rm <id>|resume <id>
-minion cron add --schedule <CRON> --prompt <TEXT> [--name N] [--cwd P]
-minion cron list [--json]
-minion cron remove <id|name>
-minion mcp serve [--stdio]             # run as MCP server
-minion mcp list                        # configured servers + discovered tools
-minion mcp tools <server>              # inspect one server
-minion init [--check] [--project] [--force] [--non-interactive]
+imp [OPTIONS] [PROMPT]              # REPL, or one-shot if PROMPT given
+imp run [OPTIONS] <PROMPT|->        # one-shot, non-interactive-friendly
+imp session list|show <id>|rm <id>|resume <id>
+imp cron add --schedule <CRON> --prompt <TEXT> [--name N] [--cwd P]
+imp cron list [--json]
+imp cron remove <id|name>
+imp mcp serve [--stdio]             # run as MCP server
+imp mcp list                        # configured servers + discovered tools
+imp mcp tools <server>              # inspect one server
+imp init [--check] [--project] [--force] [--non-interactive]
             [--header 'Name: value']… [--credentials-file <PATH>] [--no-store-token]
                                        # first-run setup for the model backend (§5.1.1)
-minion config show|path [--origin] [--json]
+imp config show|path [--origin] [--json]
                                        # read-only; `--origin` names the layer each value
-                                       # came from (§5.14); `config init` aliases `minion init`
-minion config sync [--dry-run] [--check] [--node <NAME>] [--remote <URL>] [--ref <REF>]
+                                       # came from (§5.14); `config init` aliases `imp init`
+imp config sync [--dry-run] [--check] [--node <NAME>] [--remote <URL>] [--ref <REF>]
                                        # converge the machine layer from the master repo (§5.14)
-minion doctor                          # env, config, db, provider reachability
-minion update [--check] [--yes] [--force] [--rollback]
+imp doctor                          # env, config, db, provider reachability
+imp update [--check] [--yes] [--force] [--rollback]
                                        # check a release channel and replace the installed
                                        # binary (§9); `--check` writes nothing and exits 1
                                        # when an update is available
@@ -1290,20 +1290,20 @@ Global options:
   --config <FILE>       --db <FILE>
 ```
 
-**Exit codes:** `0` success · `1` turn failed, or `minion update --check` found an update available · `2` usage error · `3` provider/auth error, or an update could not reach its release channel · `4` refused (policy denied in non-interactive mode, or an operation declined to proceed — e.g. `init` against an existing config without `--force`, an update whose checksum or commit did not verify, or one cancelled at the prompt) · `5` internal error.
+**Exit codes:** `0` success · `1` turn failed, or `imp update --check` found an update available · `2` usage error · `3` provider/auth error, or an update could not reach its release channel · `4` refused (policy denied in non-interactive mode, or an operation declined to proceed — e.g. `init` against an existing config without `--force`, an update whose checksum or commit did not verify, or one cancelled at the prompt) · `5` internal error.
 
 ---
 
 ### 5.13 Peers — asking a larger model
 
-A **peer** is another minion's `mcp serve` endpoint. Nothing new is spoken: a peer is
+A **peer** is another imp's `mcp serve` endpoint. Nothing new is spoken: a peer is
 an MCP server like any other (M10.1, D25). What this section adds is the *shape of the
 delegation* — how a small local model hands a hard question to a big remote one.
 
 ```toml
 [peers.big]                                  # one delegation tool, `peer__big_ask`
-url = "http://big.tailnet.ts.net:8788/mcp"   # a remote minion; `command` is the local form
-token_file = "~/.config/minion/big.credentials"   # api_key = "…", mode 0600
+url = "http://big.tailnet.ts.net:8788/mcp"   # a remote imp; `command` is the local form
+token_file = "~/.config/imp/big.credentials"   # api_key = "…", mode 0600
 max_tokens = 512          # forwarded to the peer's `agent_ask` when a call does not name one
 result_cap_bytes = 8192   # what the local model sees; around 8 KB by default
 approval = "ask"          # this peer's fallback, substituting policy.default (D21)
@@ -1340,7 +1340,7 @@ approval = "ask"          # this peer's fallback, substituting policy.default (D
   `Network`, so it is never in that subset: a peer cannot pass the brief on to a third
   model. The cap is the read/write line itself (D15), not a counter a caller could reset,
   and `mcp serve` never assembles `[peers.*]` — so two small models passing the ball is
-  not reachable by construction. `crates/minion-cli/src/mcp_serve.rs` pins the property
+  not reachable by construction. `crates/imp-cli/src/mcp_serve.rs` pins the property
   with a test on the inner surface.
 - **Cost is visible.** The peer's `agent_ask` reports the tokens it spent; the delegation
   tool puts them in the tool result's metadata (`usage`), and the loop folds them into the
@@ -1358,14 +1358,14 @@ the second hop the depth cap exists to forbid.
 
 ---
 
-### 5.14 Master config layer — `minion config sync`
+### 5.14 Master config layer — `imp config sync`
 
 A **master** lets one place describe how all the other nodes are configured, without depending on
 the network between them. It is deliberately *not* a process: the master is a **git repository plus
 a convention**, and each node converges by pulling it. This section fixes the shape of that pull;
 it is a design proposal (M11), not a built feature (D38–D42).
 
-**Pull, never push.** Every node runs `minion config sync`. The master never reaches into a node,
+**Pull, never push.** Every node runs `imp config sync`. The master never reaches into a node,
 so convergence works for a node behind NAT, on a different network, or on one that is not on the
 tailnet at all — which is the case of the 1050 Ti today. The evaluated alternative is an HTTP
 endpoint served by the master (either a live `GET /config` or a push channel): it is **refused**
@@ -1379,13 +1379,13 @@ the **local layers only** (flags or the user config), because this is the bootst
 node where the master is — the synced layer itself may never define it.
 
 ```
-minion-config/                 # a repo of its own (Forgejo), not the minion source tree
+imp-config/                 # a repo of its own (Forgejo), not the imp source tree
 ├── base.toml                  # shared by every node
 ├── nodes/<name>.toml          # the overlay for one node
 └── checksums.txt              # the commit and a sha256 per file (generated, committed)
 ```
 
-`sync` shells out to the system `git` (a bare mirror under `$XDG_CACHE_HOME/minion/config-sync/`),
+`sync` shells out to the system `git` (a bare mirror under `$XDG_CACHE_HOME/imp/config-sync/`),
 rather than growing a second protocol: git is already where the nodes are, it already carries the
 host's auth (SSH key or HTTPS token), and it is the versioned, auditable store this milestone is
 about. If `git` is absent the command fails loudly — it never degrades to a silent no-op.
@@ -1406,11 +1406,11 @@ fails to parse is a hard error — a policy that cannot be honoured must not be 
 **Precedence.** The synced layer fits the existing order without replacing it (highest first):
 
 ```
-CLI flags → env (MINION_*) → project minion.toml → synced layer → user config → defaults
+CLI flags → env (IMP_*) → project imp.toml → synced layer → user config → defaults
 ```
 
 The argument is the one the existing order already uses — *more specific wins*. The synced layer is
-a **machine** layer; a project `minion.toml` is a **workspace** layer, therefore more specific, and
+a **machine** layer; a project `imp.toml` is a **workspace** layer, therefore more specific, and
 stays above it; the user config is also machine-level but expresses a personal preference, and an
 admin policy outranks it, so the synced layer sits above the user file. `sync` writes the merged
 base+overlay to a machine-local `synced.toml` beside the user config (never committed, never part
@@ -1419,7 +1419,7 @@ applied_at}`; `Config::load` then merges it like any other layer, so a machine t
 has no file and behaves exactly as today. No database is involved. **D39**.
 
 Two consequences are written down rather than hidden. Because the project file is above the synced
-layer, **a cloned repository's committed `minion.toml` can override master policy** (for example
+layer, **a cloned repository's committed `imp.toml` can override master policy** (for example
 widen `[policy.allow]`); and because the synced layer is above the user file, **an operator cannot
 override master policy in their own config**. If master policy should instead be a floor that
 neither can loosen, that is a different mechanism — a "locked keys" list, not an order — and it is
@@ -1428,38 +1428,38 @@ flagged for the spec owner (§11, R10) rather than decided here.
 **Observability is mandatory, not a nicety.** A sync nobody can inspect is magic, and magic is not
 debuggable.
 
-- `minion config sync --dry-run` fetches and verifies, prints the *effective* diff, and writes
+- `imp config sync --dry-run` fetches and verifies, prints the *effective* diff, and writes
   nothing:
 
   ```
   config sync: node "1050ti" (from hostname)
-    channel  https://git.albruiz.dev/albruiz/minion-config.git @ 4f2a1c9 (ref main)
+    channel  https://git.albruiz.dev/albruiz/imp-config.git @ 4f2a1c9 (ref main)
     verified 3 files, sha256 ok, commit ok
     synced layer (base.toml + nodes/1050ti.toml):
       + peers.big.url          nodes/1050ti.toml
       + peers.big.token_file   base.toml
-      ~ policy.noninteractive  base.toml   "ask" -> "deny"   (shadowed by project ./minion.toml)
+      ~ policy.noninteractive  base.toml   "ask" -> "deny"   (shadowed by project ./imp.toml)
     dry-run: nothing written
   ```
 
-- `minion config sync --check` resolves the remote commit and exits `1` when it differs from the
-  applied one, writing nothing — the same shape as `minion update --check`.
+- `imp config sync --check` resolves the remote commit and exits `1` when it differs from the
+  applied one, writing nothing — the same shape as `imp update --check`.
 
-- `minion config show --origin` names, for every effective key, the layer it came from:
+- `imp config show --origin` names, for every effective key, the layer it came from:
   `default` / `user:<path>` / `synced:<commit> <file>` / `project:<path>` / `env:<VAR>` / `flag`.
   It is implemented by keeping each layer's `toml::Value` and walking them highest-first: a leaf's
   origin is the topmost layer that defines it. `--json` is the script form.
 
   ```
-  provider.model         = "qwen2.5:14b"   [user:~/.config/minion/config.toml]
+  provider.model         = "qwen2.5:14b"   [user:~/.config/imp/config.toml]
   peers.big.url          = "http://big…"   [synced:4f2a1c9 nodes/1050ti.toml]
-  policy.noninteractive  = "deny"          [project:./minion.toml]
+  policy.noninteractive  = "deny"          [project:./imp.toml]
   workspace.roots        = ["."]           [default]
   ```
 
-**Integrity, the same contract as `minion update` (D23).** The bundle carries `checksums.txt` with
+**Integrity, the same contract as `imp update` (D23).** The bundle carries `checksums.txt` with
 the commit and a sha256 per config file. Before anything is applied, in order: **(1)** every file
-hashes (computed in-tree, `minion_core::sha256`) to its entry, and **(2)** the commit the ref
+hashes (computed in-tree, `imp_core::sha256`) to its entry, and **(2)** the commit the ref
 resolves to equals the `commit` line. Any mismatch refuses the whole bundle — exit `4`, nothing
 written (fail-closed). Two checks, not one, for update's reason: the **checksum** binds the bytes to
 the manifest and the **commit** binds the manifest to a revision, so a bundle that swapped both
@@ -1484,7 +1484,7 @@ lives once in `base.toml`:
 # base.toml
 [peers.big]
 url = "http://big.tailnet.ts.net:8788/mcp"
-token_file = "~/.config/minion/big.credentials"   # a path, never the token
+token_file = "~/.config/imp/big.credentials"   # a path, never the token
 approval = "ask"
 ```
 
@@ -1502,18 +1502,18 @@ value; provisioning those values is out of scope, below.
 - **Automatic node discovery or enrolment.** A node is in the repo because a human put it there.
   No tailnet scan, no self-registration, no "join" protocol.
 - **Any permanently-running master service.** No daemon, no endpoint, no listener (D38).
-- **A sync timer inside minion.** `sync` runs when it is invoked. A node that wants it periodic
-  wires its own cron/launchd to call `minion config sync`; minion starts no background loop for it.
+- **A sync timer inside imp.** `sync` runs when it is invoked. A node that wants it periodic
+  wires its own cron/launchd to call `imp config sync`; imp starts no background loop for it.
 
 **Exit codes:** `0` up to date · `2` usage · `3` channel unreachable (remote, auth, or ref missing)
 · `4` refused (integrity mismatch, or a listed overlay that will not parse) · `5` internal.
 `--check` exits `1` when drift exists.
 
 **Placement.** The rules — bundle shape, the manifest parse, verification, the overlay merge and the
-origin walk — are pure and live in `minion-core` (they take bytes and return values, no I/O). The
-one part that shells out to `git` lives in a new small crate **`minion-master`**, mirroring the split
-`minion-update` and `minion-guard` already use to keep `minion-core` free of I/O; the subcommand is
-`minion-cli/src/config.rs`. `[configsync]` is `ConfigSyncConfig` in `minion-core/src/config.rs`.
+origin walk — are pure and live in `imp-core` (they take bytes and return values, no I/O). The
+one part that shells out to `git` lives in a new small crate **`imp-master`**, mirroring the split
+`imp-update` and `imp-guard` already use to keep `imp-core` free of I/O; the subcommand is
+`imp-cli/src/config.rs`. `[configsync]` is `ConfigSyncConfig` in `imp-core/src/config.rs`.
 
 ---
 
@@ -1541,7 +1541,7 @@ API keys; filesystem contents; shell access; the SQLite store (may contain sensi
 | T11 | `init` writes a config that leaks a credential | The value goes only to the separate `0600` credentials file; the config records env var *names* and paths, so `--project` output stays committable; the token is never printed, never logged, and never appears in `--json` |
 | T12 | `init` silently overwrites a hand-tuned config | Existing target is diffed and requires `--force`; writes go through a temp file and rename, so no partial config is left behind |
 | T13 | The API key leaks into terminal scrollback or a screen share | Echo is disabled *before* the prompt is printed, not after, closing the window in which a fast paste would be echoed; the guard restores the previous termios on drop, including on panic |
-| T15 | The master config channel is the softest target in the fleet: whoever controls it controls the effective policy of *every* node | The bundle is verified before it is applied (per-file SHA-256 against a committed manifest, plus the commit the ref resolves to), fail-closed (D41, §5.14); the channel can only *name* secrets, never carry a value (§5.1), so a compromised channel cannot exfiltrate keys — it can only distribute policy; sync is an explicit pull, never a daemon, so nothing applies without a decision. The residual — a manifest that agrees with a malicious commit — is publisher trust, the same acknowledged limit `minion update` carries (D23) |
+| T15 | The master config channel is the softest target in the fleet: whoever controls it controls the effective policy of *every* node | The bundle is verified before it is applied (per-file SHA-256 against a committed manifest, plus the commit the ref resolves to), fail-closed (D41, §5.14); the channel can only *name* secrets, never carry a value (§5.1), so a compromised channel cannot exfiltrate keys — it can only distribute policy; sync is an explicit pull, never a daemon, so nothing applies without a decision. The residual — a manifest that agrees with a malicious commit — is publisher trust, the same acknowledged limit `imp update` carries (D23) |
 
 ### 6.3 Principle of least exposure
 
@@ -1590,18 +1590,18 @@ var's value, secret-shaped header values and any `Bearer` token before the line 
 ## 9. Packaging and distribution
 
 - `cargo build --release` produces one binary; a release workflow builds the platform targets and publishes them as assets of a tagged GitHub release, with a `checksums.txt` alongside. (The workflow itself is a separate deliverable; this section states the contract it must meet.)
-- **Release pipeline.** `.github/workflows/release.yml` runs on a push to `main`. A single `gate` job derives the next `vX.Y.Z` from the newest tag, refuses to publish unless that equals `[workspace.package].version`, and runs `cargo +1.89.0 test --workspace --locked`; a `build` matrix then produces the six assets — `{linux, macOS, Windows} × {amd64, arm64}` — each carrying the commit and date embedded (`MINION_GIT_SHA`/`MINION_GIT_DATE`), and a `publish` job hashes all six into one `checksums.txt` and attaches the seven files to a GitHub Release, verifying the release is not left as a draft and that the uploaded manifest is the one hashed. Each target is built on a runner that can also *run* it and the built binary is executed with `--version` to assert both stamps before it is published, so no architecture goes out unverified (D28). The six asset names are exactly the ones `minion-core::update::asset_for` looks up (§9.1): a name published differently is a 404 to `minion update`, not a fallback, and a unit test pins the table so the two cannot drift. The tag, the version the binary reports, and the assets are the three things `minion update` consumes; the workflow fails rather than publishing a set that disagrees. The procedure, and how to cut a tag by hand, are in README → Releasing. The Linux assets are gnu rather than musl (D24); the per-target runner choices are D28.
-- Homebrew tap, `cargo install minion-cli`, and a curl installer script.
-- **Version reporting.** `minion --version` prints the workspace version, the git SHA and commit date the binary was built from, and the capability families compiled in:
+- **Release pipeline.** `.github/workflows/release.yml` runs on a push to `main`. A single `gate` job derives the next `vX.Y.Z` from the newest tag, refuses to publish unless that equals `[workspace.package].version`, and runs `cargo +1.89.0 test --workspace --locked`; a `build` matrix then produces the six assets — `{linux, macOS, Windows} × {amd64, arm64}` — each carrying the commit and date embedded (`IMP_GIT_SHA`/`IMP_GIT_DATE`), and a `publish` job hashes all six into one `checksums.txt` and attaches the seven files to a GitHub Release, verifying the release is not left as a draft and that the uploaded manifest is the one hashed. Each target is built on a runner that can also *run* it and the built binary is executed with `--version` to assert both stamps before it is published, so no architecture goes out unverified (D28). The six asset names are exactly the ones `imp-core::update::asset_for` looks up (§9.1): a name published differently is a 404 to `imp update`, not a fallback, and a unit test pins the table so the two cannot drift. The tag, the version the binary reports, and the assets are the three things `imp update` consumes; the workflow fails rather than publishing a set that disagrees. The procedure, and how to cut a tag by hand, are in README → Releasing. The Linux assets are gnu rather than musl (D24); the per-target runner choices are D28.
+- Homebrew tap, `cargo install imp-cli`, and a curl installer script.
+- **Version reporting.** `imp --version` prints the workspace version, the git SHA and commit date the binary was built from, and the capability families compiled in:
 
   ```
-  minion 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
+  imp 0.1.0 (f7581dae470a 2026-10-07) [features: cron,guard,mcp,update]
   ```
 
-  The stamps are embedded at compile time (`minion-cli/build.rs`), so `--version` needs no git, no network and no config, and it degrades to `unknown` rather than failing when git is absent. `minion update` reads the same line back out of a downloaded binary to tie it to a commit.
+  The stamps are embedded at compile time (`imp-cli/build.rs`), so `--version` needs no git, no network and no config, and it degrades to `unknown` rather than failing when git is absent. `imp update` reads the same line back out of a downloaded binary to tie it to a commit.
 - Config/db paths created on first run with `0600`/`0700` permissions.
 
-### 9.1 `minion update`
+### 9.1 `imp update`
 
 `update` is the self-update path: it asks a release channel what the latest version is and, when it is newer, downloads the prebuilt binary for the current platform, verifies it, and replaces the installed one.
 
@@ -1610,8 +1610,8 @@ var's value, secret-shaped header values and any `Bearer` token before the line 
 ```toml
 [update]
 api_url = "https://api.github.com"   # or a mirror; https, or http only on loopback
-repo = "Az107/minion"                # owner/name
-asset_prefix = "minion"              # assets are `<prefix>-<os>-<arch>` and `checksums.txt`
+repo = "Az107/imp"                # owner/name
+asset_prefix = "imp"              # assets are `<prefix>-<os>-<arch>` and `checksums.txt`
 ```
 
 No token is sent: the repository is public. A `401`/`403`/`404` is reported as "this works without a token only for a public repository" rather than retried, and authentication is deliberately not implemented (D23).
@@ -1620,12 +1620,12 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 
 **Verification, in order, before anything is replaced:**
 
-1. The `checksums.txt` asset of the *same release* is fetched and the downloaded binary's SHA-256 must match its entry; a mismatch aborts with the binary untouched. The hash is computed in-tree (`minion-core::sha256`) so the check adds no dependency.
+1. The `checksums.txt` asset of the *same release* is fetched and the downloaded binary's SHA-256 must match its entry; a mismatch aborts with the binary untouched. The hash is computed in-tree (`imp-core::sha256`) so the check adds no dependency.
 2. The commit the release declares (`target_commitish` as a hex SHA, or a `build-commit:` line in the notes) must match the SHA the downloaded binary reports for `--version`. A release that declares no commit is refused rather than trusted, and a binary reporting a different commit is not installed.
 
-**Replacement.** The verified bytes are written to a staging file beside the target and moved over it with `rename()`, which is atomic and works for a running binary on Linux. The previous binary is kept as `minion.old-<version>`, which `--rollback` restores (keeping the replaced one in turn). The target is `current_exe()`, canonicalized, or `$MINION_UPDATE_BINARY` when set. Nothing else is touched: not the config, not the database, not the credentials file.
+**Replacement.** The verified bytes are written to a staging file beside the target and moved over it with `rename()`, which is atomic and works for a running binary on Linux. The previous binary is kept as `imp.old-<version>`, which `--rollback` restores (keeping the replaced one in turn). The target is `current_exe()`, canonicalized, or `$IMP_UPDATE_BINARY` when set. Nothing else is touched: not the config, not the database, not the credentials file.
 
-**When the directory is not writable**, minion does not elevate. The verified binary is staged under the temp directory and the operator is handed the two literal commands to run with `sudo` (back up first, then install), exiting `4`.
+**When the directory is not writable**, imp does not elevate. The verified binary is staged under the temp directory and the operator is handed the two literal commands to run with `sudo` (back up first, then install), exiting `4`.
 
 **Consent.** Without `--yes` and without a terminal, nothing is installed: the same fail-closed rule as the rest of the tool. On a terminal the release notes are shown and one `y`/`yes` proceeds.
 
@@ -1635,11 +1635,11 @@ No token is sent: the repository is public. A `401`/`403`/`404` is reported as "
 
 Implemented (M7): `cargo build --release` produces one binary (`lto = "thin"`,
 `codegen-units = 1`, `strip = true`); `make dist` builds the per-target tarballs and
-`.sha256` that `install.sh` consumes; `minion --version` reports the git SHA and the
+`.sha256` that `install.sh` consumes; `imp --version` reports the git SHA and the
 enabled features from `build.rs` (which watches `.git/refs`, `.git/logs/HEAD` and
 `.git/packed-refs` so the SHA tracks the commit, not just `.git/HEAD` — the suite
 asserts the banner against `git rev-parse`); `write_private_file` and `Store::open` set
-`0600`/`0700` before writing content, and `minion doctor` warns when a private file is
+`0600`/`0700` before writing content, and `imp doctor` warns when a private file is
 not owner-only. A musl C compiler is required for the static Linux targets — see
 `NFR.md` for the no-root recipe used here.
 
@@ -1650,7 +1650,7 @@ not owner-only. A musl C compiler is required for the static Linux targets — s
 | Milestone | Status | Scope | Exit criteria |
 |---|---|---|---|
 | M0 — Skeleton | done | Workspace, config loading, provider client, `run` one-shot | A prompt returns streamed text from a compatible endpoint |
-| M0.5 — Provider init | done | `minion init` wizard, presets, `/models` discovery, `--check`, `--project`/`--force`, `--header`, session-id headers | A fresh machine reaches a working config in one command, an existing config is never clobbered, and a gateway requiring `${session}` headers works unmodified |
+| M0.5 — Provider init | done | `imp init` wizard, presets, `/models` discovery, `--check`, `--project`/`--force`, `--header`, session-id headers | A fresh machine reaches a working config in one command, an existing config is never clobbered, and a gateway requiring `${session}` headers works unmodified |
 | M1 — Session core | done | Store, migrations, sessions/messages, REPL with streaming | `/resume` restores a conversation |
 | M2 — Tools + policy | done | Registry, `read_file`/`write_file`/`edit_file`, `run_command`, approval engine, allowlist | A risky command cannot run without consent |
 | M3 — Memory + HTTP | done | `remember`/`recall`, `http_fetch` with allowlist | FTS recall works; SSRF guard tested |
@@ -1659,17 +1659,17 @@ not owner-only. A musl C compiler is required for the static Linux targets — s
 | M5 — MCP client | done | External servers, namespaced tools, per-server policy | External tool callable with approval |
 | M6 — MCP server | done | `mcp serve` with read-only default surface and opt-in exec/write | Another model drives `agent_ask` end to end |
 | M7 — Hardening | done | `--json`, `doctor`, audit log, redaction, packaging, docs | NFR targets met and measured (`NFR.md`); installers written (`install.sh`, `make dist`). Uploading a tagged release is the remaining step and needs a tag on `main`, which is the owner's |
-| M8 — Self-update | done | `minion update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
-| M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `minion update` installs; a mismatched version or a failing test publishes nothing |
-| M9.1 — Six targets | done | The release pipeline covers `{linux, macOS, Windows} × {amd64, arm64}`: macOS and Windows on their own runners, Windows/arm64 native, every built binary run to assert both stamps, and one `checksums.txt` over the six named assets (D24, D28) | A push to `main` publishes all six assets under the names `minion update` looks up, each carrying the version and commit it was built from, and the uploaded `checksums.txt` covers the six |
-| M10 — Peer transport | done | Streamable HTTP for both halves: `url` on `[mcp.client.servers.*]` with bearer-token auth (`token_env`/`token_file`), `transport = "http"` + `bind` on `[mcp.server]`, a fail-closed bind policy, no TLS by design | Two minion instances on a tailnet discover and call each other's gated tools over HTTP; a non-loopback bind with no token refuses to start; a wrong token lists nothing |
+| M8 — Self-update | done | `imp update`: release channel, checksum and commit verification, atomic replace, `--rollback`, and `--version` carrying the git SHA | An installed binary fetches, verifies and replaces itself from a published release; a bad checksum or an unverifiable release changes nothing; `--check` writes nothing |
+| M9 — Release pipeline | done | GitHub Actions workflow: version derivation from tags, tag/`Cargo.toml` agreement gate, test gate, `linux/amd64` + `linux/arm64` via gcc cross, `checksums.txt`, GitHub Release | A push to `main` publishes a coherent release (tag, embedded version and assets agree) that `imp update` installs; a mismatched version or a failing test publishes nothing |
+| M9.1 — Six targets | done | The release pipeline covers `{linux, macOS, Windows} × {amd64, arm64}`: macOS and Windows on their own runners, Windows/arm64 native, every built binary run to assert both stamps, and one `checksums.txt` over the six named assets (D24, D28) | A push to `main` publishes all six assets under the names `imp update` looks up, each carrying the version and commit it was built from, and the uploaded `checksums.txt` covers the six |
+| M10 — Peer transport | done | Streamable HTTP for both halves: `url` on `[mcp.client.servers.*]` with bearer-token auth (`token_env`/`token_file`), `transport = "http"` + `bind` on `[mcp.server]`, a fail-closed bind policy, no TLS by design | Two imp instances on a tailnet discover and call each other's gated tools over HTTP; a non-loopback bind with no token refuses to start; a wrong token lists nothing |
 | M10.2 — Peer delegation | done | One `peer__<name>_ask` tool per `[peers.*]` entry, carrying a *brief* to the peer's `agent_ask`; a configurable result cap (~8 KB), the read-only depth cap, remote usage folded into the turn, and the whole thing behind the `Network` gate | A small model escalates a self-contained brief to a bigger peer through the gate and gets its answer as tool-result data; a cron job cannot escalate; the gate decides before the network is touched; a peer that fails or goes missing is a tool error, never a panic or a hang |
 | M10.3 — Small-model loop ergonomics | done | A trimmable tool surface (`[tools] only`/`hide`), recovery from a tool call cut off by `finish_reason: length`, per-turn dedup of repeated calls, `agent.max_tool_calls_per_turn` with a `tool_budget` stop, numbered imperative rules behind `agent.small_model`, and strict tool arguments behind `[provider] strict_tool_arguments` | A 2–4B model drives a turn end to end without a parse error or a runaway loop: a truncated call is discarded and re-asked, a repeated call runs once, the budget ends the turn with every `tool_call_id` answered, and every knob is inert unless set |
-| M11 — Master config node | proposed | A master as a **git repo, not a service**: `minion config sync` converges a machine-local synced layer (`base.toml` + `nodes/<name>.toml`) from a Forgejo repo, under the D23 integrity contract, slotted into the existing precedence, with `--dry-run` and `config show --origin`. Design only (§5.14, D38–D42); no code in this milestone card | A node behind NAT — or one not yet on the tailnet — converges its config by *pulling*; a manipulated bundle is refused and nothing changes; adding a peer cohort member is one edit to the repo, not N node configs |
+| M11 — Master config node | proposed | A master as a **git repo, not a service**: `imp config sync` converges a machine-local synced layer (`base.toml` + `nodes/<name>.toml`) from a Forgejo repo, under the D23 integrity contract, slotted into the existing precedence, with `--dry-run` and `config show --origin`. Design only (§5.14, D38–D42); no code in this milestone card | A node behind NAT — or one not yet on the tailnet — converges its config by *pulling*; a manipulated bundle is refused and nothing changes; adding a peer cohort member is one edit to the repo, not N node configs |
 
 *Note (integration, M7 fold):* the M7 row is `m7-hardening`'s own claim, merged here. The NFR figures
 in `NFR.md` were measured on the **M6+M7** binary, before M8–M11 put `axum`, `reqwest`/`rustls` and
-`minion-update` in the release path, so they describe that artifact rather than this one and are
+`imp-update` in the release path, so they describe that artifact rather than this one and are
 pending re-measurement — NFR-3 (static musl size, 14.58 MB against a 15 MB budget) is the one to
 check first, because the C in `aws-lc-sys` is why D24 publishes gnu instead of musl.
 
@@ -1685,7 +1685,7 @@ check first, because the C in `aws-lc-sys` is why D24 publishes gnu instead of m
 | R3 | History summarization can lose critical detail | Mark summaries explicitly; keep the full transcript in SQLite; allow `/compact off` |
 | R4 | Provider drift across OpenAI-compatible endpoints | Keep the client thin, expose quirk flags, and add a compatibility test matrix |
 | R5 | MCP server + REPL contend for stdio | Mutually exclusive modes; `mcp serve` never starts a REPL |
-| R6 | Cron in-process means jobs don't run when minion is closed | Documented; optional `--system` crontab/launchd integration deferred to v2 |
+| R6 | Cron in-process means jobs don't run when imp is closed | Documented; optional `--system` crontab/launchd integration deferred to v2 |
 | R7 | `always` allowlist could persist an over-broad pattern | Show the exact pattern before persisting; require explicit confirmation; cap pattern length and forbid wildcards alone |
 | R8 | Token/cost accounting differs per provider | Treat usage as advisory; never block a turn solely on a missing usage field |
 | R10 | The master channel is the fleet's single point of policy injection, and the chosen precedence lets a cloned project — and blocks a local user — override master policy | The bundle is verified before it is applied, fail-closed (D41), and the channel carries names, never secret values (§5.1), so a compromised master distributes policy but cannot exfiltrate keys; recorded as T15. The residual (a manifest that agrees with a malicious commit) is publisher trust, the same limit D23 carries. Whether master policy should instead be a *floor* a project or user cannot loosen — a "locked keys" mechanism with its own decision — is left open for the spec owner |
@@ -1697,7 +1697,7 @@ check first, because the C in `aws-lc-sys` is why D24 publishes gnu instead of m
    dev server is reachable without weakening the default; a wildcard entry grants `https` only.
    Matches §5.5's guard row. Implemented (D17, which also records the separate, stricter handling of
    §5.5's approval row).
-2. ~~Should job prompts be able to opt into the interactive policy when minion is attached to a TTY, or always fail closed?~~ **Resolved — always fail closed.** A job's prompt is not a person at a keyboard, even when the scheduler happens to be ticking inside a REPL that has one. Its gate is built with `interactive = false` and no approval UI at all, so a tool the policy would `ask` about is decided by `policy.noninteractive` (`deny` by default) and a job cannot promote it to `auto`. A prompt that appeared at an unrelated moment would be approved by whoever was mid-keystroke, which is exactly the consent that means nothing. Deny rules and allowlists still run first, so an allowlisted command runs unattended; the guard is not consulted either, because it only ever resolves a prompt and there is none. See D19.
+2. ~~Should job prompts be able to opt into the interactive policy when imp is attached to a TTY, or always fail closed?~~ **Resolved — always fail closed.** A job's prompt is not a person at a keyboard, even when the scheduler happens to be ticking inside a REPL that has one. Its gate is built with `interactive = false` and no approval UI at all, so a tool the policy would `ask` about is decided by `policy.noninteractive` (`deny` by default) and a job cannot promote it to `auto`. A prompt that appeared at an unrelated moment would be approved by whoever was mid-keystroke, which is exactly the consent that means nothing. Deny rules and allowlists still run first, so an allowlisted command runs unattended; the guard is not consulted either, because it only ever resolves a prompt and there is none. See D19.
 3. ~~Is `edit_file`'s exact-match semantics sufficient, or is a patch-based tool wanted for large
    edits?~~ **Resolved — both are provided.** `edit_file` stays for a single surgical replacement;
    `apply_patch` handles multi-site and multi-file edits in one atomic call. See §5.5 and D13.
@@ -1753,7 +1753,7 @@ than editing individual tools.
   "tools": [ /* Appendix A shape */ ],
   "tool_choice": "auto",
   "messages": [
-    { "role": "system", "content": "You are minion…\nWorkspace: /Users/me/proj (read-write)\nMode: interactive\nTools: …\nDenied: run_command *sudo*" },
+    { "role": "system", "content": "You are imp…\nWorkspace: /Users/me/proj (read-write)\nMode: interactive\nTools: …\nDenied: run_command *sudo*" },
     { "role": "user", "content": "list the largest files here" },
     { "role": "assistant", "tool_calls": [
         { "id": "call_1", "type": "function",
@@ -1813,3 +1813,6 @@ than editing individual tools.
 | D42 | The master carries **names, never secret values**, and the non-goals are explicit: no secret centralization, no node discovery, no always-on service, no sync timer | The invariant that makes the design safe is §5.1's: a config records *where* a secret comes from, never the secret. If the master could carry values it would become the single place where every node's keys live — the exact centralization this milestone is told not to build, and a single point of compromise for the fleet. So the channel distributes `token_file` paths and `token_env` names; values are provisioned per node by whatever the operator already uses (environment, a credentials file, or the separate token-manager system), which keeps this milestone out of the secrets business. Node discovery and self-enrolment are refused because a node appears in the repo because a human put it there — scanning a tailnet and trusting whatever answers is a different threat model. And because the whole value of the design is that the master is *not* a process, anything that would require one — an endpoint, a listener, a background sync loop — is out of scope by construction; a node that wants periodic sync wires its own cron to call `minion config sync`, so minion still starts no daemon (the spirit of D5) |
 | D43 | An audit row carries the tool decision **and its result**, written once, and redaction lives in the log sink rather than at each call site | §7 says the trail records "every tool decision and outcome", which one row per call can only do if the row is finished after the tool runs. A refusal is a finished decision the moment it is made, so it is written at `check` with `outcome = denied`; an allow is not, so `RecordingGate` holds it and `ToolGate::record_outcome` completes it with `ok`/`error` and the wall-clock duration. The alternative — writing the allow row eagerly — either loses the outcome or forces a second row and doubles the table for every call. The context (`session_id`, `turn_id`) is stamped per turn by the agent, so a decision can be grouped back to its conversation without threading a session handle through the policy engine, which has no business knowing about conversations. Redaction is the sink's job for the same reason the audit is the gate's: a guarantee that depends on every `tracing!` call remembering to be careful is not a guarantee. `RedactingMakeWriter` masks the resolved key, the configured env var's value, secret-shaped header values and any `Bearer` token before a byte reaches stderr or the log file, and the `--version`/`--quiet` surface is generated from `build.rs` so a released binary states its commit and configured features (NFR-9, §9) |
 | D44 | `minion doctor` treats a reachable-but-`/models`-less backend as up, and the NFR targets are measured rather than assumed | `/models` is optional in the OpenAI-compatible world, so "the provider did not answer" has to mean a transport failure or an auth rejection, not a 404 from an endpoint that is plainly serving. A doctor that failed on a missing `/models` would be wrong about a working backend, which is worse than being silent about a capability it cannot see. The probe is therefore reachability plus credentials — the two things that actually stop a user — and it runs last, after config and database, so a broken setup is reported before a socket is opened and exits `3`. The NFR work follows the same principle: `NFR.md` records the measured figure next to each target, with the command that produced it. Where a target was only just met (NFR-1's cold start, which includes the harness's own `fork`/`exec`) the number says so instead of the target being quietly loosened, and musl's C-toolchain requirement is documented rather than hidden behind a target that was not reproduced |
+| D45 | A **lean** switch (`--lean`) fills a small-model profile over M10.3's knobs, and the loop gains a token budget, a tool-result cap, argument repair, one bounded nudge and provider wire compatibility | M10.3 gave a weak model a trimmable surface, a tool-call budget, repeat dedup and strict-argument hints, but three holes remained. First, context was still measured in **messages** (`history_window`), and a single `read_file` result of 20 000 lines could overflow a 4k window before the count was reached — and tool results accumulate *between* iterations, so a load-time-only trim cannot see them. The budget is therefore enforced inside `Agent::run`, before every provider call, dropping whole oldest turns and never splitting a `tool_calls`/result pair (the same invariant as the message window); the estimator is a dependency-free character heuristic, and a prompt-plus-schemas cost larger than the budget fails the turn with an explanation instead of sending a request that will be rejected. Second, a local backend is often slow, non-conforming or strict: the stream idle timeout was a hardcoded 60s that a CPU prefill can exceed before the first token, so it is configurable; a chunk with object-shaped `arguments` or an unparseable frame used to end the turn, so it is tolerated (and a stream that yields *no* events is now an error rather than a silent empty completion); `$schema`/`title`/`format` and `["T","null"]` unions are stripped because grammar-based decoders compile the schema and choke on them, keeping `description`/`enum`/`required`/bounds; `[provider.extra_body]` admits backend-specific sampling while core request keys are rejected; and a non-streaming endpoint is driven by synthesizing the same events. Third, a weak model's *output* is imperfect: a fenced or trailing-comma argument string is repaired after a normal parse fails (never before), a missing tool-call id gets a unique `call_{index}` fallback, an unknown tool error lists the names that would have resolved, and a reply with neither text nor a call is given exactly one bounded second chance before the turn ends. `--lean` is a CLI convenience that fills these plus `small_model`, the budget, the caps and the compatibility quirks — applied after the config file, exactly as every global flag, and filling each key only where it is still at its default, so it is a profile and not a second code path. None of it touches the gate: the tool surface is still narrowed by D32's `[tools]`, the budget refuses calls by D30's rule, and a small model gets no policy exemption |
+
+| D46 | The project, the binary and the crate family are renamed `minion` -> `imp`, and the rename migrates state instead of abandoning it | The name was aspirational and wrong: `minion` describes a subordinate, and this is the harness that drives a model, not something a larger agent commands. The rename is done in one commit across all three vocabularies because splitting them is what breaks things: the `--version` line is the *client contract* of the release gate (`grep -q "^imp ${VERSION#v} "`) and of `imp update`'s commit check, so the program name, the workspace crate names, the binary name, the asset names and the workflow's grep can only change together. Twelve environment variables move `MINION_*` -> `IMP_*`; a stale `MINION_MODEL` is simply not read, which is the one behaviour change a user can notice and the reason the release notes name the new names rather than both. The offline state is the single place where a wrong rename loses data, so `imp` **migrates instead of starting empty**: on the first run it renames the legacy `~/.config/minion` and `$XDG_STATE_HOME/minion` directories to their `imp` counterparts (a directory `rename()` is atomic, keeps the `0600` mode of the credentials file and moves the database with everything else), and inside the state directory it renames `minion.db` (plus any `-wal`/`-shm`/`-journal` sidecar) to `imp.db`. The migration only ever runs when the destination does not already exist: with both directories present nothing is touched and the manual procedure is printed instead, because the one thing worse than a missing database is a half-merged one. It is not fatal on failure either - a `rename()` that cannot proceed leaves the old files exactly where they were and says so, rather than starting on an empty database in silence. A project `minion.toml` cannot be migrated from inside the binary (the binary does not know which directories hold one), so `imp.toml` wins when both are present and a bare `minion.toml` is still read with a deprecation warning; the rename is a `git mv` the user does when they like. The auto-update channel changes as one unit too: `repo = "Az107/imp"` and `asset_prefix = "imp"` in the same commit as the `imp-<os>-<arch>` assets. An installed `minion` binary carries the old channel in its bytes and looks for `minion-*` assets, so after the switch it finds none and **refuses** the update (fail-closed, D23) rather than installing something wrong - with a handful of machines the documented transition is one manual reinstall, not a compatibility release that would have to be maintained forever. The decision log itself is a historical record: entries D1-D45 keep the words they were written with, and this entry is the one place the rename is described. |

@@ -1,0 +1,67 @@
+---
+source: crates/imp-mcp/tests/mcp_client.rs
+expression: catalogue
+---
+[
+  {
+    "description": "Echo the `text` argument back.",
+    "name": "mcp__stub__echo",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object",
+      "x-stub-marker": "passed through verbatim"
+    }
+  },
+  {
+    "description": "A server-side file read, not imp's.",
+    "name": "mcp__stub__read_file",
+    "parameters": {
+      "properties": {
+        "path": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "description": "Always reports an error.",
+    "name": "mcp__stub__explode",
+    "parameters": {
+      "type": "object"
+    }
+  },
+  {
+    "description": "A tool a config may hide with tool_allow.",
+    "name": "mcp__stub__secret",
+    "parameters": {
+      "type": "object"
+    }
+  },
+  {
+    "description": "Stand-in for a imp peer: answers a brief with JSON, like the real server.",
+    "name": "mcp__stub__agent_ask",
+    "parameters": {
+      "properties": {
+        "max_tokens": {
+          "type": "integer"
+        },
+        "prompt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    }
+  }
+]
