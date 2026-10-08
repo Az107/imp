@@ -136,9 +136,14 @@ which those gateways require.
 
 ```
 /new  /sessions  /resume <id>  /rename  /clear  /model  /tools  /cost
-/cron  /session  /where  /help  /quit
+/cron  /auto  /session  /where  /help  /quit
 !<command>          run a shell command directly, bypassing the model
 ```
+
+`/auto` turns on the opt-in read-only-command shortcut: recognised read-only
+commands (`ls`, `git status`, `grep`, …) then run without an approval prompt,
+while a command that uses shell syntax or is not recognised still prompts. See
+`[policy.read_only]` to start a session with it already on.
 
 `/session` shows the conversation id that goes out in `${session}` headers. It
 is stable for the whole conversation on purpose — regenerating it per request
@@ -441,6 +446,11 @@ writes or executes goes through a policy engine that decides *before* the call:
   accidentally run something.
 - `--yes` replaces the default *decision*, not the engine. Deny rules and the
   classifier still apply.
+- **Read-only shell commands can run unattended, opt-in.** `[policy.read_only]
+  enabled = true` (or the REPL's `/auto`) lets a command that only observes —
+  `ls`, `git status`, `grep` — run without approval. It is fail-closed: a
+  command using shell syntax (`;`, `&&`, `|`, `>`, `$(…)`, quotes) or an
+  unrecognised verb still prompts. It is a classification, not a sandbox.
 - Path-taking tools are confined to the workspace root.
 - `http_fetch` reaches only hosts in its `[http_fetch]` allowlist, refuses
   private, loopback, link-local and cloud-metadata addresses, and does not

@@ -17,6 +17,7 @@ use imp_core::message::{Message, Role};
 use imp_core::new_session_id;
 use imp_core::policy::{PolicyEngine, RecordingGate, ToolGate};
 use imp_core::provider::Provider;
+use imp_core::read_only::AutoCommands;
 use imp_core::tool::ToolRegistry;
 use imp_cron::RunReport;
 use imp_guard::HttpSystemOneGuard;
@@ -56,6 +57,9 @@ pub struct Session {
     spec: ProviderSpec,
     /// The approval gate, shared so session-scoped allows accumulate.
     gate: Arc<dyn ToolGate>,
+    /// The read-only-command switch `/auto` flips. Shared with the gate, so a
+    /// REPL command changes what the next `check` sees.
+    pub auto: Arc<AutoCommands>,
     /// The external servers this session consumes, shared so a turn can retry
     /// one that was down and the catalogue follows.
     mcp: Arc<McpServers>,
@@ -341,6 +345,12 @@ pub async fn build(
     // Whether anyone can answer a prompt. `--yes` forces the permissive path;
     // a non-TTY still cannot be prompted, so it falls back to `noninteractive`.
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    // The read-only-command shortcut is off by default; `/auto` flips this at
+    // runtime, so the same handle goes to the gate and the session.
+    let auto = AutoCommands::new(
+        config.policy.read_only.enabled,
+        config.policy.read_only.extra.clone(),
+    );
     let gate = recording(
         build_gate(
             config,
@@ -350,6 +360,7 @@ pub async fn build(
             cli.yes,
             cli.deny,
             families.clone(),
+            auto.clone(),
         ),
         &store,
     );
@@ -387,6 +398,7 @@ pub async fn build(
         cron_runner,
         spec,
         gate,
+        auto,
         mcp,
         peers,
     };
@@ -430,6 +442,7 @@ pub(crate) fn cron_context(config: &Config) -> CronContext {
 /// `--yes` replaces the default decision rather than the whole engine, so deny
 /// rules and the command classifier keep applying: it means "do not ask me",
 /// not "do whatever you like".
+#[allow(clippy::too_many_arguments)]
 fn build_gate(
     config: &Config,
     store: &Arc<Store>,
@@ -438,6 +451,7 @@ fn build_gate(
     yes: bool,
     deny: bool,
     policies: Vec<imp_core::policy::ToolPolicy>,
+    auto: Arc<AutoCommands>,
 ) -> Arc<PolicyEngine> {
     let allow = config
         .policy
@@ -479,7 +493,8 @@ fn build_gate(
     )
     .with_ui(approval::ui_for(tty))
     .with_store(store.approvals())
-    .with_tool_policies(policies);
+    .with_tool_policies(policies)
+    .with_auto_commands(auto);
 
     // The optional System One guard (SDD §5.6, D16). Disabled by default; when
     // enabled it can only shorten a prompt into a silent allow, and it is never
@@ -508,6 +523,9 @@ fn build_gate(
 /// Deny rules and allow rules still apply first, so an allowlisted command runs
 /// and a denied one is still denied: this narrows nothing and widens nothing
 /// except the absence of a human.
+///
+/// The read-only-command shortcut is built from the config, never from the
+/// session handle `/auto` flips, so an interactive toggle never reaches a job.
 pub fn build_cron_gate(
     config: &Config,
     store: &Arc<Store>,
@@ -537,7 +555,11 @@ pub fn build_cron_gate(
             false,
         )
         .with_store(store.approvals())
-        .with_tool_policies(policies),
+        .with_tool_policies(policies)
+        .with_auto_commands(AutoCommands::new(
+            config.policy.read_only.enabled,
+            config.policy.read_only.extra.clone(),
+        )),
     )
 }
 

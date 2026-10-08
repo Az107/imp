@@ -363,6 +363,8 @@ pub struct PolicyConfig {
     pub allow: Vec<AllowRule>,
     /// Patterns that always refuse a tool call. Always beats `allow`.
     pub deny: Vec<DenyRule>,
+    /// Automatic approval for recognised read-only shell commands.
+    pub read_only: ReadOnlyConfig,
 }
 
 impl Default for PolicyConfig {
@@ -372,8 +374,27 @@ impl Default for PolicyConfig {
             noninteractive: Decision::Deny,
             allow: Vec::new(),
             deny: Vec::new(),
+            read_only: ReadOnlyConfig::default(),
         }
     }
+}
+
+/// Automatic approval for read-only shell commands (SDD §5.6, D48).
+///
+/// `run_command` is `Risk::Execute`, so without this every `ls` or `git status`
+/// prompts. When enabled, a command the classifier in [`crate::read_only`]
+/// recognises as read-only runs without a prompt. Off by default; the `/auto`
+/// REPL command flips [`enabled`](Self::enabled) for the process.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadOnlyConfig {
+    /// Start a session with the read-only-command shortcut on.
+    pub enabled: bool,
+    /// Extra bare verbs to treat as read-only, beyond the built-in set.
+    ///
+    /// Each entry is a command name (`fd`, `delta`), never a path or a pattern;
+    /// a command with extra verbs is still refused if it uses shell syntax.
+    pub extra: Vec<String>,
 }
 
 /// What policy decides about an invocation.
@@ -1117,6 +1138,16 @@ impl Config {
             if names.iter().any(|name| name.trim().is_empty()) {
                 return Err(Error::Config(format!(
                     "{section} must not name an empty tool"
+                )));
+            }
+        }
+        // A `[policy.read_only].extra` entry is a bare command verb. A path, a
+        // pattern or an empty string can never match the way the classifier
+        // does, so it is a typo worth surfacing rather than a silent no-op.
+        for verb in &self.policy.read_only.extra {
+            if !crate::read_only::is_bare_verb(verb) {
+                return Err(Error::Config(format!(
+                    "policy.read_only.extra entry `{verb}` must be a bare command verb"
                 )));
             }
         }
@@ -2370,6 +2401,41 @@ mod tests {
         assert_eq!(config.policy.default, Decision::Ask);
         assert_eq!(config.policy.allow.len(), 1);
         assert_eq!(config.policy.allow[0].scope, "session");
+    }
+
+    #[test]
+    fn the_read_only_command_table_parses_and_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        write(
+            &cwd.join("imp.toml"),
+            "[policy.read_only]\nenabled = true\nextra = [\"fd\", \"delta\"]\n",
+        );
+
+        let config = Config::load_with(None, None, cwd).unwrap();
+
+        assert!(config.policy.read_only.enabled);
+        assert_eq!(config.policy.read_only.extra, vec!["fd", "delta"]);
+
+        // Absent, it is off and empty.
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+        assert!(!config.policy.read_only.enabled);
+        assert!(config.policy.read_only.extra.is_empty());
+    }
+
+    #[test]
+    fn a_read_only_extra_entry_that_is_not_a_bare_verb_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        write(
+            &cwd.join("imp.toml"),
+            "[policy.read_only]\nextra = [\"rm -rf\"]\n",
+        );
+
+        let err = Config::load_with(None, None, cwd).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
     }
 
     #[test]

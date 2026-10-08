@@ -239,7 +239,18 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 ## Policy rules
 
 - **Rule order in `PolicyEngine::check` is the security property.** Deny → allow → classifier →
-  ReadOnly → non-interactive → default. Reordering lets a later rule skip an earlier refusal.
+  read-only command (opt-in) → ReadOnly → non-interactive → default. Reordering lets a later rule skip
+  an earlier refusal.
+- **The read-only-command shortcut is opt-in and fail-closed (D48).** With `[policy.read_only].enabled`
+  (default off) or after the REPL's `/auto`, a `run_command` the classifier in `imp-core/src/read_only.rs`
+  recognises as an observation runs without a prompt. It is rule 3b: after deny, allow and the
+  classifier, and only when the classifier flagged nothing, so it can shorten the path to a prompt but
+  never bypass a refusal. It sits before the non-interactive branch (a read is free unattended, like
+  `ReadOnly`, D15) and `--deny` does not suppress it. The classifier is a whitelist that refuses any
+  shell syntax it cannot model (`;`, `&&`, `|`, `>`, `$(…)`, backticks, quotes, a leading `VAR=value`);
+  an unrecognised command is not refused, merely put back on the ordinary path. `/auto` flips one
+  `Arc<AutoCommands>` shared with the gate; a cron gate builds its own from config. It is not a sandbox,
+  and `/auto full` (System One) is reserved.
 - **`ReadOnly` is checked *before* the non-interactive rule; `Network` is not.** D15, and it
   deliberately does not match `Risk::requires_consent`. A piped `imp run ... > out.md` can read
   and recall, but a write or an `http_fetch` still needs `--yes` or an allowlist entry. Use
