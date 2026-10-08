@@ -1,6 +1,5 @@
 //! One-shot execution.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use imp_core::agent::{AgentEvent, StopReason};
@@ -12,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cli::Cli;
 use crate::markdown::Style;
-use crate::render::Renderer;
+use crate::render::{Activity, Renderer};
 use crate::setup;
+use crate::style::{self, Theme};
 
 /// Run one prompt to completion and report why the turn ended.
 pub async fn one_shot(
@@ -54,8 +54,9 @@ pub async fn one_shot(
     let rendering = tokio::spawn(render_events(
         receiver,
         cli.json,
-        style_for(cli),
-        colour_enabled(cli),
+        style_for(cli, config),
+        style::stderr_theme(cli, config),
+        activity_enabled(cli, config),
     ));
 
     let cancel = CancellationToken::new();
@@ -106,13 +107,28 @@ pub async fn render_events(
     mut receiver: mpsc::UnboundedReceiver<AgentEvent>,
     json: bool,
     style: Style,
-    colour: bool,
+    theme: Theme,
+    activity: bool,
 ) {
-    let mut renderer = Renderer::new(json, style, colour);
+    // The activity line lives only until the first real event, where the
+    // renderer erases it. The task is separate so it can be aborted here.
+    let (spinner, task) = if activity {
+        let (spinner, task) = Activity::spawn(theme);
+        (Some(spinner), Some(task))
+    } else {
+        (None, None)
+    };
+    let mut renderer = Renderer::new(json, style, theme);
+    if let Some(spinner) = &spinner {
+        renderer = renderer.with_activity(spinner.clone());
+    }
     while let Some(event) = receiver.recv().await {
         renderer.handle(&event);
     }
     renderer.finish();
+    if let Some(task) = task {
+        task.abort();
+    }
 }
 
 /// Cancel `cancel` on the first Ctrl-C.
@@ -124,23 +140,31 @@ pub fn spawn_interrupt_watcher(cancel: CancellationToken) -> tokio::task::JoinHa
     })
 }
 
-/// Whether ANSI colour should be used: not `--no-color`, not `NO_COLOR`, and a TTY.
-pub fn colour_enabled(cli: &Cli) -> bool {
-    !cli.no_color && std::env::var_os("NO_COLOR").is_none() && std::io::stderr().is_terminal()
+/// Whether the activity line may be drawn: asked for, and drawable.
+///
+/// It is on by default, but `--json` and `--quiet` are machine channels and a
+/// pipe is not a terminal, so none of them gets a spinner.
+pub fn activity_enabled(cli: &Cli, config: &Config) -> bool {
+    config.ui.spinner
+        && !cli.json
+        && !cli.quiet
+        && std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
 /// The markdown style to render with.
 ///
 /// Rendering follows the terminal, not the flag alone: on a pipe the raw
 /// markdown is more useful than a drawn table, so `--markdown` cannot override
-/// it. Colour is separately refused by `NO_COLOR` and `--no-color`, but layout
-/// survives, so a `NO_COLOR` user still gets aligned tables.
-pub fn style_for(cli: &Cli) -> Style {
+/// it. Colour is separately refused by `NO_COLOR`, `--no-color` and
+/// `[ui].color`, but layout survives, so a `NO_COLOR` user still gets aligned
+/// tables.
+pub fn style_for(cli: &Cli, config: &Config) -> Style {
     if cli.no_markdown || !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         return Style::plain();
     }
-    let colour = !cli.no_color && std::env::var_os("NO_COLOR").is_none();
-    Style::rendered(colour, cli.width.unwrap_or_else(terminal_width))
+    let theme = style::stdout_theme(cli, config);
+    Style::rendered(theme.color(), cli.width.unwrap_or_else(terminal_width))
+        .with_icons(theme.icons())
 }
 
 /// Prefer an explicit width, then `COLUMNS`, then a sane default.
@@ -164,16 +188,37 @@ mod tests {
     fn piped_output_is_not_rendered() {
         let cli = Cli::parse_from(["imp", "run", "hi"]);
 
-        assert_eq!(style_for(&cli), Style::plain());
+        assert_eq!(style_for(&cli, &Config::default()), Style::plain());
     }
 
-    /// NFR-8: colour is refused without a terminal, and neither `--no-color`
-    /// nor `NO_COLOR` can make a pipe coloured in the first place.
+    /// The activity line is drawn only when it can be seen: a terminal, not
+    /// `--json`, not `--quiet`. It is on by default.
     #[test]
-    fn colour_is_refused_without_a_terminal() {
-        let cli = Cli::parse_from(["imp", "run", "hi"]);
+    fn activity_follows_the_terminal_and_the_machine_flags() {
+        let mut cli = Cli::parse_from(["imp", "run", "hi"]);
+        let config = Config::default();
 
-        assert!(!colour_enabled(&cli));
+        assert!(
+            config.ui.spinner,
+            "the spinner is on by default, so the check below is meaningful"
+        );
+        assert!(
+            !activity_enabled(&cli, &config),
+            "a test process has no terminal to draw it on"
+        );
+
+        cli.quiet = true;
+        assert!(
+            !activity_enabled(&cli, &config),
+            "--quiet is a machine channel"
+        );
+
+        cli.quiet = false;
+        cli.json = true;
+        assert!(
+            !activity_enabled(&cli, &config),
+            "--json is a machine channel"
+        );
     }
 
     /// NFR-8: disabling colour keeps the layout, so a `NO_COLOR` user still

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,7 +15,7 @@ use crate::message::{FunctionCall, Message, Role, ToolCall};
 use crate::policy::ToolGate;
 use crate::provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
 use crate::tokens::{estimate_message, estimate_messages, estimate_tools};
-use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
+use crate::tool::{Risk, ToolCtx, ToolOutput, ToolRegistry};
 
 /// Why a turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,8 @@ pub enum AgentEvent {
         name: String,
         /// Raw JSON arguments.
         arguments: String,
+        /// Its risk class, so a renderer can colour it without a lookup.
+        risk: Risk,
     },
     /// A tool finished, successfully or not.
     ToolFinished {
@@ -80,6 +83,9 @@ pub enum AgentEvent {
         ok: bool,
         /// One-line summary for display.
         summary: String,
+        /// Wall-clock milliseconds the call spent, or `None` when it never ran
+        /// (a repeat answer or a budget refusal).
+        duration_ms: Option<u64>,
     },
     /// The turn is ending because of a provider failure.
     Failed(String),
@@ -335,6 +341,14 @@ impl Agent {
                 let name = call.function.name.clone();
                 let arguments = call.function.arguments.clone();
 
+                // The risk class travels with the event so a renderer can
+                // colour the line without reaching back into the registry.
+                let risk = self
+                    .tools
+                    .get(&name)
+                    .map(|tool| tool.risk())
+                    .unwrap_or(Risk::ReadOnly);
+
                 // The budget counts every call the model asked for, a repeat
                 // included: it bounds a runaway loop, not merely its cost. The
                 // refused call is still *answered*, so the stored transcript
@@ -345,6 +359,7 @@ impl Agent {
                         name: name.clone(),
                         ok: false,
                         summary: BUDGET_EXHAUSTED_SUMMARY.to_string(),
+                        duration_ms: None,
                     });
                     history.push(Message::tool_result(call.id.clone(), budget_payload()));
                     continue;
@@ -357,6 +372,7 @@ impl Agent {
                         name: name.clone(),
                         ok: *ok,
                         summary: format!("{} {}", REPEAT_SUMMARY, summarize(content)),
+                        duration_ms: None,
                     });
                     history.push(Message::tool_result(call.id.clone(), content.clone()));
                     continue;
@@ -364,11 +380,7 @@ impl Agent {
 
                 // A call that may change the machine invalidates reads answered
                 // before it: their answers might no longer be true.
-                let observation = self
-                    .tools
-                    .get(&name)
-                    .map(|tool| tool.risk().is_observation())
-                    .unwrap_or(true);
+                let observation = risk.is_observation();
                 if !observation {
                     answered.clear();
                 }
@@ -376,10 +388,13 @@ impl Agent {
                 let _ = sink.send(AgentEvent::ToolStarted {
                     name: name.clone(),
                     arguments: arguments.clone(),
+                    risk,
                 });
 
+                let started = Instant::now();
                 match self.dispatch(&name, &arguments, cancel.clone()).await {
                     Ok(output) => {
+                        let duration_ms = Some(started.elapsed().as_millis() as u64);
                         // A tool may have spent tokens on a backend this turn's
                         // provider never saw — a peer call, for one. Fold the
                         // value it reported into the turn's usage (R8, §5.13).
@@ -390,15 +405,18 @@ impl Agent {
                             name: name.clone(),
                             ok: true,
                             summary: summarize(&output.content),
+                            duration_ms,
                         });
                         answered.insert(key, (true, output.content.clone()));
                         history.push(Message::tool_result(call.id.clone(), output.content));
                     }
                     Err(err) => {
+                        let duration_ms = Some(started.elapsed().as_millis() as u64);
                         let _ = sink.send(AgentEvent::ToolFinished {
                             name: name.clone(),
                             ok: false,
                             summary: err.to_string(),
+                            duration_ms,
                         });
                         let payload = error_payload(&err);
                         answered.insert(key, (false, payload.clone()));
@@ -1063,16 +1081,19 @@ mod tests {
             .await;
 
         let observed: Vec<AgentEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-        assert!(
-            observed
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolStarted { name, .. } if name == "echo"))
-        );
-        assert!(
-            observed
-                .iter()
-                .any(|e| matches!(e, AgentEvent::ToolFinished { ok: true, .. }))
-        );
+        assert!(observed.iter().any(
+            |e| matches!(e, AgentEvent::ToolStarted { name, risk, .. } if name == "echo" && *risk == Risk::ReadOnly)
+        ));
+        // A real run is timed; the class and the duration are what the tool
+        // line draws (§5.11).
+        assert!(observed.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolFinished {
+                ok: true,
+                duration_ms: Some(_),
+                ..
+            }
+        )));
     }
 
     #[tokio::test]

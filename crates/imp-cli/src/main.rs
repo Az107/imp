@@ -15,6 +15,7 @@ mod repl;
 mod run;
 mod session;
 mod setup;
+mod style;
 mod update;
 mod version;
 

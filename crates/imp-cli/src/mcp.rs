@@ -18,16 +18,18 @@ use imp_core::error::{Error, Result};
 use imp_mcp::{McpServers, OnStart};
 
 use crate::cli::{Cli, McpAction, McpArgs};
+use crate::style::{self, Glyph, Theme};
 
 /// Run a `imp mcp` subcommand.
 pub async fn run(cli: &Cli, config: &Config, cwd: &Path, args: McpArgs) -> Result<ExitCode> {
     match args.action {
         McpAction::Serve { stdio } => crate::mcp_serve::run(cli, config, cwd, stdio).await,
         action => {
+            let theme = style::stdout_theme(cli, config);
             let servers = McpServers::new(&config.mcp.client, config.exec.output_cap_bytes);
             match action {
-                McpAction::List => list(cli, &servers).await,
-                McpAction::Tools { server } => tools(cli, &servers, &server).await,
+                McpAction::List => list(cli, theme, &servers).await,
+                McpAction::Tools { server } => tools(cli, theme, &servers, &server).await,
                 McpAction::Serve { .. } => unreachable!("handled above"),
             }
         }
@@ -35,7 +37,7 @@ pub async fn run(cli: &Cli, config: &Config, cwd: &Path, args: McpArgs) -> Resul
 }
 
 /// Every configured server, with its state and the tools it publishes.
-async fn list(cli: &Cli, servers: &McpServers) -> Result<ExitCode> {
+async fn list(cli: &Cli, theme: Theme, servers: &McpServers) -> Result<ExitCode> {
     let configured: Vec<(String, McpServerConfig)> = servers
         .configured()
         .map(|(name, config)| (name.to_string(), config.clone()))
@@ -44,7 +46,10 @@ async fn list(cli: &Cli, servers: &McpServers) -> Result<ExitCode> {
         if cli.json {
             println!("{}", serde_json::json!({ "type": "mcp", "servers": [] }));
         } else {
-            println!("No MCP servers configured. Add one under [mcp.client.servers.<name>].");
+            println!(
+                "{}",
+                theme.dim("No MCP servers configured. Add one under [mcp.client.servers.<name>].")
+            );
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -78,32 +83,48 @@ async fn list(cli: &Cli, servers: &McpServers) -> Result<ExitCode> {
     }
 
     for (name, config) in &configured {
-        println!("{name}  {}", status_of(servers, name));
+        println!(
+            "{} {}  {}",
+            theme.dim(theme.glyph(Glyph::Selected)),
+            theme.bold(name),
+            status_label(theme, servers, name)
+        );
         if config.is_http() {
-            println!("  url: {}", config.url);
+            println!("  {} {}", theme.dim("url:"), config.url);
         } else {
-            println!("  command: {} {}", config.command, config.args.join(" "));
+            println!(
+                "  {} {} {}",
+                theme.dim("command:"),
+                config.command,
+                config.args.join(" ")
+            );
         }
         println!(
-            "  approval: {}  lazy: {}  tool_allow: [{}]",
+            "  {} {}  {} {}  {} [{}]",
+            theme.dim("approval:"),
             config
                 .approval
                 .map(decision_name)
                 .unwrap_or_else(|| "global".to_string()),
+            theme.dim("lazy:"),
             config.lazy,
+            theme.dim("tool_allow:"),
             config.tool_allow.join(", ")
         );
         if let Some(error) = servers.failure(name) {
-            println!("  {error}");
+            println!("  {}", theme.error(&error));
         }
         let published = published_names(servers, name);
         for tool in &published {
-            println!("  ▸ {tool}");
+            println!("  {} {}", theme.info(theme.glyph(Glyph::Selected)), tool);
         }
         if servers.is_up(name) {
             let hidden = discovered_names(servers, name).len() - published.len();
             if hidden > 0 {
-                println!("  ({hidden} tool(s) hidden by tool_allow)");
+                println!(
+                    "  {}",
+                    theme.dim(&format!("({hidden} tool(s) hidden by tool_allow)"))
+                );
             }
         }
     }
@@ -113,7 +134,7 @@ async fn list(cli: &Cli, servers: &McpServers) -> Result<ExitCode> {
 }
 
 /// Everything one server lists, and what imp publishes of it.
-async fn tools(cli: &Cli, servers: &McpServers, server: &str) -> Result<ExitCode> {
+async fn tools(cli: &Cli, theme: Theme, servers: &McpServers, server: &str) -> Result<ExitCode> {
     let Some((name, config)) = servers
         .configured()
         .find(|(name, _)| *name == server)
@@ -127,7 +148,10 @@ async fn tools(cli: &Cli, servers: &McpServers, server: &str) -> Result<ExitCode
     // A failure is reported, not fatal: the command's job is to describe what
     // is there, and "nothing, because the server is down" is a description.
     if let Err(error) = servers.connect(&name).await {
-        eprintln!("imp: MCP server `{name}` is unavailable: {error}");
+        eprintln!(
+            "{}",
+            theme.error(&format!("imp: MCP server `{name}` is unavailable: {error}"))
+        );
         servers.shutdown().await;
         return Ok(ExitCode::from(4));
     }
@@ -155,26 +179,29 @@ async fn tools(cli: &Cli, servers: &McpServers, server: &str) -> Result<ExitCode
 
     println!(
         "{} — {} tool(s) listed, {} published",
-        name,
+        theme.bold(&name),
         discovered.len(),
         servers.published(&name).len()
     );
     for info in &discovered {
         let allowed = config.allows(&info.name);
-        println!(
-            "  {} {}  {}",
-            if allowed { "▸" } else { "·" },
-            McpServerConfig::flattened(&name, &info.name),
-            if allowed {
-                info.description.clone().unwrap_or_default()
-            } else {
-                "hidden by tool_allow".to_string()
-            }
-        );
         if allowed {
             println!(
+                "  {} {}  {}",
+                theme.info(theme.glyph(Glyph::Selected)),
+                McpServerConfig::flattened(&name, &info.name),
+                theme.dim(info.description.as_deref().unwrap_or("")),
+            );
+            println!(
                 "      {}",
-                serde_json::to_string(&info.input_schema).unwrap_or_default()
+                theme.dim(&serde_json::to_string(&info.input_schema).unwrap_or_default())
+            );
+        } else {
+            println!(
+                "  {} {}  {}",
+                theme.dim(theme.glyph(Glyph::Hidden)),
+                theme.dim(&McpServerConfig::flattened(&name, &info.name)),
+                theme.dim("hidden by tool_allow"),
             );
         }
     }
@@ -188,6 +215,15 @@ fn status_of(servers: &McpServers, name: &str) -> String {
         "up".to_string()
     } else {
         "down".to_string()
+    }
+}
+
+/// The server's state, coloured by outcome.
+fn status_label(theme: Theme, servers: &McpServers, name: &str) -> String {
+    if servers.is_up(name) {
+        theme.success("up")
+    } else {
+        theme.error("down")
     }
 }
 

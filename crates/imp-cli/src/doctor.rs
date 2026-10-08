@@ -19,6 +19,7 @@ use imp_store::Store;
 
 use crate::cli::Cli;
 use crate::config_cmd::mode_of;
+use crate::style::{self, Glyph, Theme};
 
 /// The provider probe gets its own, shorter budget than a chat request: a
 /// doctor run should not hang for the length of a generation.
@@ -66,7 +67,7 @@ pub async fn run(cli: &Cli, config: &Config, cwd: &Path) -> Result<ExitCode> {
     checks.push(provider_check);
 
     let all_ok = checks.iter().all(|check| check.ok);
-    report(cli, &checks);
+    report(cli, style::stdout_theme(cli, config), &checks);
 
     Ok(if all_ok {
         ExitCode::SUCCESS
@@ -254,7 +255,7 @@ async fn provider_check(config: &Config) -> Check {
 }
 
 /// Print the checks, as prose or as one JSON object.
-fn report(cli: &Cli, checks: &[Check]) {
+fn report(cli: &Cli, theme: Theme, checks: &[Check]) {
     let ok = checks.iter().all(|check| check.ok);
     if cli.json {
         let items: Vec<serde_json::Value> = checks
@@ -276,10 +277,29 @@ fn report(cli: &Cli, checks: &[Check]) {
     }
 
     for check in checks {
-        let mark = if check.ok { "ok  " } else { "FAIL" };
-        println!("{mark}  {:<16} {}", check.area, check.detail);
+        let (mark, label) = if check.ok {
+            (
+                theme.success(theme.glyph(Glyph::Check)),
+                theme.success("ok  "),
+            )
+        } else {
+            (theme.error(theme.glyph(Glyph::Cross)), theme.error("FAIL"))
+        };
+        println!(
+            "{mark}  {label} {:<16} {}",
+            theme.bold(&format!("{:<16}", check.area)),
+            check.detail
+        );
     }
-    if !ok {
-        eprintln!("imp: doctor found a problem; see the FAIL lines above");
+    if ok {
+        println!(
+            "{}",
+            theme.success("all checks passed — imp is ready to run")
+        );
+    } else {
+        eprintln!(
+            "{}",
+            theme.error("imp: doctor found a problem; see the FAIL lines above")
+        );
     }
 }

@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cli::{Cli, CronAction, CronArgs};
+use crate::style::{self, Glyph, Theme};
 
 /// Run a `imp cron` subcommand.
 pub async fn run(cli: &Cli, config: &Config, args: CronArgs) -> Result<ExitCode> {
@@ -32,6 +33,7 @@ pub async fn run(cli: &Cli, config: &Config, args: CronArgs) -> Result<ExitCode>
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let store = Arc::new(Store::open(&database).await?);
     let jobs = store.jobs();
+    let theme = style::stdout_theme(cli, config);
 
     match args.action {
         CronAction::Add {
@@ -79,7 +81,7 @@ pub async fn run(cli: &Cli, config: &Config, args: CronArgs) -> Result<ExitCode>
                     })
                 );
             } else {
-                println!("{}", announce(&job));
+                println!("{}", announce(&job, theme));
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -108,11 +110,18 @@ pub async fn run(cli: &Cli, config: &Config, args: CronArgs) -> Result<ExitCode>
                 return Ok(ExitCode::SUCCESS);
             }
             if jobs.is_empty() {
-                println!("No jobs scheduled.");
+                println!(
+                    "{}",
+                    theme.dim("No jobs scheduled. Add one with `imp cron add`.")
+                );
                 return Ok(ExitCode::SUCCESS);
             }
             for job in &jobs {
-                println!("{}", describe(job));
+                println!(
+                    "  {} {}",
+                    theme.dim(theme.glyph(Glyph::Selected)),
+                    describe(job)
+                );
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -125,9 +134,9 @@ pub async fn run(cli: &Cli, config: &Config, args: CronArgs) -> Result<ExitCode>
                     serde_json::json!({ "type": "job_removed", "key": key, "removed": removed })
                 );
             } else if removed {
-                println!("removed {key}");
+                println!("{} {}", theme.success("removed"), theme.bold(&key));
             } else {
-                println!("no job matches `{key}`");
+                println!("{}", theme.warn(&format!("no job matches `{key}`")));
             }
             Ok(if removed {
                 ExitCode::SUCCESS
@@ -139,7 +148,7 @@ pub async fn run(cli: &Cli, config: &Config, args: CronArgs) -> Result<ExitCode>
 }
 
 /// One line describing a newly created job, in its own timezone.
-fn announce(job: &Job) -> String {
+fn announce(job: &Job, theme: Theme) -> String {
     let label = job.label();
     let next = match imp_core::parse_stamp(job.next_run_at.as_deref().unwrap_or_default()) {
         Ok(at) => imp_cron::timezone(&job.timezone)
@@ -152,7 +161,10 @@ fn announce(job: &Job) -> String {
         Err(_) => "never".to_string(),
     };
     format!(
-        "Created job \"{label}\" — next run {next} ({} {}, {} session)",
+        "{} \"{}\" — next run {} ({} {}, {} session)",
+        theme.success("Created job"),
+        theme.bold(&label),
+        theme.info(&next),
         job.schedule,
         job.timezone,
         job.session_mode.as_str()

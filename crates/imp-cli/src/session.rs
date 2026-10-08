@@ -9,6 +9,7 @@ use imp_store::Store;
 
 use crate::cli::{Cli, SessionAction, SessionArgs};
 use crate::repl;
+use crate::style::{self, Glyph, Theme};
 
 /// Exit code when a requested session does not exist.
 const EXIT_NOT_FOUND: u8 = 4;
@@ -22,11 +23,12 @@ pub async fn run(cli: &Cli, config: &Config, args: SessionArgs) -> Result<ExitCo
         .unwrap_or(std::env::current_dir()?);
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let store = Store::open(&database).await?;
+    let theme = style::stdout_theme(cli, config);
 
     match &args.action {
-        SessionAction::List { limit } => list(cli, &store, *limit).await,
-        SessionAction::Show { id } => show(cli, &store, id).await,
-        SessionAction::Rm { id } => remove(cli, &store, id).await,
+        SessionAction::List { limit } => list(cli, theme, &store, *limit).await,
+        SessionAction::Show { id } => show(cli, theme, &store, id).await,
+        SessionAction::Rm { id } => remove(cli, theme, &store, id).await,
         SessionAction::Resume { id } => {
             // Resolution first, so a bad id fails before the REPL takes the
             // terminal and the user is left staring at a prompt.
@@ -38,7 +40,7 @@ pub async fn run(cli: &Cli, config: &Config, args: SessionArgs) -> Result<ExitCo
     }
 }
 
-async fn list(cli: &Cli, store: &Store, limit: usize) -> Result<ExitCode> {
+async fn list(cli: &Cli, theme: Theme, store: &Store, limit: usize) -> Result<ExitCode> {
     let rows = store.list_sessions(limit).await?;
 
     if cli.json {
@@ -64,27 +66,33 @@ async fn list(cli: &Cli, store: &Store, limit: usize) -> Result<ExitCode> {
     }
 
     if rows.is_empty() {
-        println!("No conversations yet.");
+        println!(
+            "{}",
+            theme.dim("No conversations yet. Ask something to start one.")
+        );
         return Ok(ExitCode::SUCCESS);
     }
-    let header = format!("{:<10}  {:<25}  TITLE", "ID", "UPDATED");
-    println!("{header}");
+    println!(
+        "{}",
+        theme.dim(&format!("{:<10}  {:<25}  TITLE", "ID", "UPDATED"))
+    );
     for row in &rows {
-        let title = row
-            .title
-            .clone()
-            .unwrap_or_else(|| "(untitled)".to_string());
+        let id = &row.id[..8.min(row.id.len())];
+        let title = match &row.title {
+            Some(title) => theme.bold(title),
+            None => theme.dim("(untitled)"),
+        };
         println!(
-            "{:<10}  {:<25}  {}",
-            &row.id[..8.min(row.id.len())],
-            row.updated_at,
+            "{}  {}  {}",
+            theme.info(id),
+            theme.dim(&row.updated_at),
             title
         );
     }
     Ok(ExitCode::SUCCESS)
 }
 
-async fn show(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
+async fn show(cli: &Cli, theme: Theme, store: &Store, id: &str) -> Result<ExitCode> {
     let id = resolve(store, id).await?;
     let row = store.session(&id).await?;
     let messages = store.load_messages(&id).await?;
@@ -109,13 +117,15 @@ async fn show(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
     if let Some(row) = row {
         println!(
             "{}  {}",
-            &row.id[..8.min(row.id.len())],
-            row.title.clone().unwrap_or_default()
+            theme.info(&row.id[..8.min(row.id.len())]),
+            theme.bold(&row.title.clone().unwrap_or_default())
         );
         println!(
-            "workspace {}  model {}",
+            "{} {}  {} {}",
+            theme.dim("workspace"),
             row.cwd,
-            row.model.clone().unwrap_or_default()
+            theme.dim("model"),
+            theme.bold(&row.model.clone().unwrap_or_default())
         );
         println!();
     }
@@ -124,9 +134,9 @@ async fn show(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
             continue;
         }
         let tag = match message.role {
-            Role::User => "you",
-            Role::Assistant => "imp",
-            Role::Tool => "tool",
+            Role::User => theme.info("you"),
+            Role::Assistant => theme.accent("imp"),
+            Role::Tool => theme.dim("tool"),
             Role::System => continue,
         };
         if let Some(text) = &message.content {
@@ -134,14 +144,19 @@ async fn show(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
         }
         if let Some(calls) = &message.tool_calls {
             for call in calls {
-                println!("  ▸ {} {}", call.function.name, call.function.arguments);
+                println!(
+                    "  {} {} {}",
+                    theme.dim(theme.glyph(Glyph::Tool)),
+                    theme.bold(&call.function.name),
+                    theme.dim(&call.function.arguments)
+                );
             }
         }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-async fn remove(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
+async fn remove(cli: &Cli, theme: Theme, store: &Store, id: &str) -> Result<ExitCode> {
     let id = resolve(store, id).await?;
     let deleted = store.delete_session(&id).await?;
 
@@ -151,9 +166,13 @@ async fn remove(cli: &Cli, store: &Store, id: &str) -> Result<ExitCode> {
             serde_json::json!({ "type": "session_deleted", "id": id, "deleted": deleted })
         );
     } else if deleted {
-        println!("deleted {}", &id[..8.min(id.len())]);
+        println!(
+            "{} {}",
+            theme.success("deleted"),
+            theme.info(&id[..8.min(id.len())])
+        );
     } else {
-        println!("no session matches `{id}`");
+        println!("{}", theme.warn(&format!("no session matches `{id}`")));
     }
     Ok(if deleted {
         ExitCode::SUCCESS
