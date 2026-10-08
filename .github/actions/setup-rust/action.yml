@@ -1,0 +1,36 @@
+name: Set up Rust
+description: Install the pinned Rust toolchain and restore the cargo/target cache.
+
+# Each matrix job runs on its own fresh runner, so the toolchain has to be
+# installed once per job — there is no way to share an installed toolchain
+# across OS/arch runners. What *can* be shared is the definition (this action)
+# and the compiler's own work (the cache below), which is the expensive part:
+# the first build compiles aws-lc-sys and the bundled SQLite from source.
+
+inputs:
+  targets:
+    description: Extra rustup targets to install, comma-separated (e.g. the matrix triple).
+    required: false
+    default: ""
+  cache-key:
+    description: Extra key material for the cargo cache, usually the target triple.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust 1.89
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: "1.89.0"
+        targets: ${{ inputs.targets }}
+
+    # Caches ~/.cargo (registry + git) and the workspace target directory, keyed
+    # per target so the six builds never evict each other. `cache-on-failure`
+    # keeps a target that failed to link from starting over on the next run.
+    - name: Cache cargo and target
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}
+        cache-on-failure: "true"
