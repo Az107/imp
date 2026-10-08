@@ -131,6 +131,7 @@ fn agent(provider: Arc<dyn Provider>, registry: ToolRegistry, gate: Arc<dyn Tool
             include_usage: false,
             max_tool_calls_per_turn: 0,
             workspace_root: std::env::temp_dir(),
+            ..AgentOptions::default()
         },
     )
     .with_gate(gate)

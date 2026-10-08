@@ -11,7 +11,9 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use minion_core::error::{Error, Result};
-use minion_core::provider::{ChatEvent, ChatRequest, FinishReason, Provider, Usage};
+use minion_core::provider::{
+    ChatEvent, ChatRequest, FinishReason, Provider, Usage, sanitize_schema,
+};
 
 use crate::sse::SseDecoder;
 
@@ -61,6 +63,13 @@ pub struct OpenAiProvider {
     strict_tool_arguments: bool,
     headers: Vec<(String, String)>,
     session_id: Option<String>,
+    stream: bool,
+    stream_idle_timeout: Duration,
+    sanitize_schemas: bool,
+    omit_parallel_tool_calls: bool,
+    omit_tool_choice: bool,
+    empty_assistant_content: bool,
+    extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 impl OpenAiProvider {
@@ -80,7 +89,59 @@ impl OpenAiProvider {
             strict_tool_arguments: false,
             headers: Vec::new(),
             session_id: None,
+            stream: true,
+            stream_idle_timeout: STREAM_IDLE_TIMEOUT,
+            sanitize_schemas: true,
+            omit_parallel_tool_calls: false,
+            omit_tool_choice: false,
+            empty_assistant_content: false,
+            extra_body: serde_json::Map::new(),
         }
+    }
+
+    /// Use the streaming or the whole-response endpoint.
+    ///
+    /// A backend with a broken SSE implementation can be driven non-streaming;
+    /// the events are synthesized from the single JSON response.
+    pub fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
+    }
+
+    /// Set the idle budget between stream chunks.
+    pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
+    /// Strip non-essential keywords from the advertised tool schemas.
+    pub fn with_sanitize_schemas(mut self, sanitize: bool) -> Self {
+        self.sanitize_schemas = sanitize;
+        self
+    }
+
+    /// Omit `parallel_tool_calls` even when the loop asks for it.
+    pub fn with_omit_parallel_tool_calls(mut self, omit: bool) -> Self {
+        self.omit_parallel_tool_calls = omit;
+        self
+    }
+
+    /// Omit `tool_choice` entirely.
+    pub fn with_omit_tool_choice(mut self, omit: bool) -> Self {
+        self.omit_tool_choice = omit;
+        self
+    }
+
+    /// Send `"content": null` on assistant tool-call messages.
+    pub fn with_empty_assistant_content(mut self, empty: bool) -> Self {
+        self.empty_assistant_content = empty;
+        self
+    }
+
+    /// Merge extra keys into every request body (backend-specific sampling).
+    pub fn with_extra_body(mut self, extra: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.extra_body = extra;
+        self
     }
 
     /// Set the retry budget for pre-stream failures.
@@ -203,8 +264,8 @@ impl OpenAiProvider {
     fn body(&self, request: &ChatRequest) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": request.model,
-            "messages": request.messages,
-            "stream": true,
+            "messages": self.wire_messages(request),
+            "stream": self.stream,
         });
         let object = body.as_object_mut().expect("body is an object");
 
@@ -220,12 +281,26 @@ impl OpenAiProvider {
             let tools: Vec<serde_json::Value> = request
                 .tools
                 .iter()
-                .map(|tool| tool.to_wire_strict(self.strict_tool_arguments))
+                .map(|tool| {
+                    let mut wire = tool.to_wire_strict(self.strict_tool_arguments);
+                    if self.sanitize_schemas
+                        && let Some(parameters) = wire
+                            .get_mut("function")
+                            .and_then(|function| function.get_mut("parameters"))
+                    {
+                        sanitize_schema(parameters);
+                    }
+                    wire
+                })
                 .collect();
             object.insert("tools".to_string(), serde_json::json!(tools));
-            object.insert("tool_choice".to_string(), serde_json::json!("auto"));
+            if !self.omit_tool_choice {
+                object.insert("tool_choice".to_string(), serde_json::json!("auto"));
+            }
         }
-        if let Some(parallel) = request.parallel_tool_calls {
+        if let Some(parallel) = request.parallel_tool_calls
+            && !self.omit_parallel_tool_calls
+        {
             object.insert(
                 "parallel_tool_calls".to_string(),
                 serde_json::json!(parallel),
@@ -237,7 +312,35 @@ impl OpenAiProvider {
                 serde_json::json!({ "include_usage": true }),
             );
         }
+        // Backend-specific sampling goes last. Collisions with the core keys are
+        // rejected by `Config::validate`, so this only ever adds or overrides
+        // sampling fields such as `temperature`.
+        for (key, value) in &self.extra_body {
+            object.insert(key.clone(), value.clone());
+        }
         body
+    }
+
+    /// Serialize the messages, optionally forcing `"content": null` on an
+    /// assistant tool-call message for templates that require the key.
+    fn wire_messages(&self, request: &ChatRequest) -> serde_json::Value {
+        let mut messages =
+            serde_json::to_value(&request.messages).unwrap_or_else(|_| serde_json::json!([]));
+        if !self.empty_assistant_content {
+            return messages;
+        }
+        if let Some(list) = messages.as_array_mut() {
+            for message in list {
+                let is_tool_call_assistant = message.get("role").and_then(|role| role.as_str())
+                    == Some("assistant")
+                    && message.get("tool_calls").is_some()
+                    && message.get("content").is_none();
+                if is_tool_call_assistant && let Some(object) = message.as_object_mut() {
+                    object.insert("content".to_string(), serde_json::Value::Null);
+                }
+            }
+        }
+        messages
     }
 }
 
@@ -260,9 +363,26 @@ impl Provider for OpenAiProvider {
                 }
             };
 
+            // A non-streaming backend returns one JSON body; synthesize the
+            // same event sequence so the agent loop cannot tell the difference.
+            if !this.stream {
+                let payload = match response.text().await {
+                    Ok(text) => text,
+                    Err(err) => {
+                        yield Err(Error::Provider(err.to_string()));
+                        return;
+                    }
+                };
+                for event in parse_completion(&payload) {
+                    yield event;
+                }
+                return;
+            }
+
             let mut bytes = response.bytes_stream();
             let mut decoder = SseDecoder::new();
             let mut finish_reason = None;
+            let mut saw_event = false;
 
             loop {
                 if cancel.is_cancelled() {
@@ -272,7 +392,7 @@ impl Provider for OpenAiProvider {
 
                 let raced = tokio::select! {
                     _ = cancel.cancelled() => None,
-                    outcome = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()) => Some(outcome),
+                    outcome = tokio::time::timeout(this.stream_idle_timeout, bytes.next()) => Some(outcome),
                 };
 
                 let Some(outcome) = raced else {
@@ -288,11 +408,12 @@ impl Provider for OpenAiProvider {
                         yield Err(Error::Provider(err.to_string()));
                         return;
                     }
-                    // Idle timeout: the provider stalled mid-stream.
+                    // Idle timeout: the provider stalled mid-stream. The budget
+                    // is configurable because local prefill can be slow.
                     Err(_) => {
                         yield Err(Error::Provider(format!(
                             "stream stalled for more than {}s",
-                            STREAM_IDLE_TIMEOUT.as_secs()
+                            this.stream_idle_timeout.as_secs()
                         )));
                         return;
                     }
@@ -309,12 +430,16 @@ impl Provider for OpenAiProvider {
                     let parsed: Chunk = match serde_json::from_str(&payload) {
                         Ok(parsed) => parsed,
                         Err(err) => {
-                            yield Err(Error::Provider(format!("malformed stream chunk: {err}")));
-                            return;
+                            // One non-conforming frame is not worth ending a
+                            // turn over; note it and keep reading. If nothing
+                            // valid arrives at all, the check below fails.
+                            tracing::warn!(error = %err, "skipping an unparseable stream chunk");
+                            continue;
                         }
                     };
 
                     if let Some(wire) = parsed.usage {
+                        saw_event = true;
                         yield Ok(ChatEvent::Usage(Usage {
                             prompt_tokens: wire.prompt_tokens.unwrap_or(0),
                             completion_tokens: wire.completion_tokens.unwrap_or(0),
@@ -326,6 +451,7 @@ impl Provider for OpenAiProvider {
                         if let Some(content) = choice.delta.content
                             && !content.is_empty()
                         {
+                            saw_event = true;
                             yield Ok(ChatEvent::TextDelta(content));
                         }
                         for call in choice.delta.tool_calls.unwrap_or_default() {
@@ -333,14 +459,16 @@ impl Provider for OpenAiProvider {
                                 Some(function) => (function.name, function.arguments),
                                 None => (None, None),
                             };
+                            saw_event = true;
                             yield Ok(ChatEvent::ToolCallDelta {
                                 index: call.index,
                                 id: call.id,
                                 name,
-                                arguments: arguments.unwrap_or_default(),
+                                arguments: arguments.map(stringify_arguments).unwrap_or_default(),
                             });
                         }
                         if let Some(reason) = choice.finish_reason {
+                            saw_event = true;
                             finish_reason = Some(FinishReason::from_wire(&reason));
                         }
                     }
@@ -351,11 +479,84 @@ impl Provider for OpenAiProvider {
                 }
             }
 
+            if !saw_event {
+                yield Err(Error::Provider(
+                    "the stream ended without any events; is this an OpenAI-compatible endpoint?"
+                        .to_string(),
+                ));
+                return;
+            }
+
             yield Ok(ChatEvent::Done {
                 finish_reason: finish_reason.unwrap_or(FinishReason::Other),
             });
         })
     }
+}
+
+/// Render a tool-call `arguments` value as the string the layer above expects.
+///
+/// The wire type is normally a string, but a non-conforming backend may send an
+/// object or an array; stringifying it is cheaper than failing the whole chunk.
+fn stringify_arguments(value: serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text,
+        other => other.to_string(),
+    }
+}
+
+/// Turn one whole (non-streaming) completion into the streaming event sequence.
+fn parse_completion(payload: &str) -> Vec<Result<ChatEvent>> {
+    let completion: Completion = match serde_json::from_str(payload) {
+        Ok(completion) => completion,
+        Err(err) => {
+            return vec![Err(Error::Provider(format!(
+                "unreadable completion body: {err}"
+            )))];
+        }
+    };
+
+    let mut events = Vec::new();
+    if let Some(wire) = completion.usage {
+        events.push(Ok(ChatEvent::Usage(Usage {
+            prompt_tokens: wire.prompt_tokens.unwrap_or(0),
+            completion_tokens: wire.completion_tokens.unwrap_or(0),
+            total_tokens: wire.total_tokens.unwrap_or(0),
+        })));
+    }
+
+    let mut finish_reason = FinishReason::Other;
+    for choice in completion.choices {
+        if let Some(content) = choice.message.content
+            && !content.is_empty()
+        {
+            events.push(Ok(ChatEvent::TextDelta(content)));
+        }
+        for (index, call) in choice
+            .message
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+        {
+            let (name, arguments) = match call.function {
+                Some(function) => (function.name, function.arguments),
+                None => (None, None),
+            };
+            events.push(Ok(ChatEvent::ToolCallDelta {
+                index,
+                id: call.id,
+                name,
+                arguments: arguments.map(stringify_arguments).unwrap_or_default(),
+            }));
+        }
+        if let Some(reason) = choice.finish_reason {
+            finish_reason = FinishReason::from_wire(&reason);
+        }
+    }
+
+    events.push(Ok(ChatEvent::Done { finish_reason }));
+    events
 }
 
 impl OpenAiProvider {
@@ -514,8 +715,43 @@ struct DeltaToolCall {
 struct DeltaFunction {
     #[serde(default)]
     name: Option<String>,
+    /// A string on a conforming backend; a `Value` so an object or array does
+    /// not fail the whole chunk.
     #[serde(default)]
-    arguments: Option<String>,
+    arguments: Option<serde_json::Value>,
+}
+
+/// One whole `chat.completion` response, for the non-streaming path.
+#[derive(Debug, Deserialize)]
+struct Completion {
+    #[serde(default)]
+    choices: Vec<CompletionChoice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionChoice {
+    #[serde(default)]
+    message: CompletionMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CompletionMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<CompleteToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteToolCall {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<DeltaFunction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,5 +984,136 @@ mod tests {
         let provider = OpenAiProvider::new("http://localhost:11434/v1", "");
 
         assert!(provider.api_key.is_empty());
+    }
+
+    fn request_with_tool() -> ChatRequest {
+        ChatRequest {
+            model: "m".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![minion_core::provider::ToolSchema {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "title": "ReadFileArgs",
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                }),
+            }],
+            temperature: None,
+            max_tokens: None,
+            parallel_tool_calls: Some(true),
+            include_usage: false,
+        }
+    }
+
+    #[test]
+    fn schemas_are_sanitized_on_the_wire_by_default() {
+        let provider = OpenAiProvider::new("http://localhost/v1", "k");
+
+        let body = provider.body(&request_with_tool());
+        let parameters = &body["tools"][0]["function"]["parameters"];
+
+        assert!(parameters.get("$schema").is_none());
+        assert!(parameters.get("title").is_none());
+        assert_eq!(parameters["additionalProperties"], serde_json::json!(false));
+        assert_eq!(parameters["properties"]["path"]["type"], "string");
+    }
+
+    #[test]
+    fn sanitizing_can_be_turned_off() {
+        let provider = OpenAiProvider::new("http://localhost/v1", "k").with_sanitize_schemas(false);
+
+        let body = provider.body(&request_with_tool());
+
+        assert!(
+            body["tools"][0]["function"]["parameters"]
+                .get("$schema")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn tool_choice_can_be_omitted() {
+        let provider = OpenAiProvider::new("http://localhost/v1", "k").with_omit_tool_choice(true);
+
+        let body = provider.body(&request_with_tool());
+
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn parallel_tool_calls_can_be_omitted() {
+        let provider =
+            OpenAiProvider::new("http://localhost/v1", "k").with_omit_parallel_tool_calls(true);
+
+        let body = provider.body(&request_with_tool());
+
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn extra_body_is_merged_into_the_request() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("top_p".to_string(), serde_json::json!(0.9));
+        extra.insert("repeat_penalty".to_string(), serde_json::json!(1.05));
+        let provider = OpenAiProvider::new("http://localhost/v1", "k").with_extra_body(extra);
+
+        let body = provider.body(&request_with_tool());
+
+        assert_eq!(body["top_p"], serde_json::json!(0.9));
+        assert_eq!(body["repeat_penalty"], serde_json::json!(1.05));
+    }
+
+    #[test]
+    fn the_stream_flag_reaches_the_request_body() {
+        let provider = OpenAiProvider::new("http://localhost/v1", "k").with_stream(false);
+
+        assert_eq!(provider.body(&request_with_tool())["stream"], false);
+    }
+
+    #[test]
+    fn an_object_arguments_payload_is_stringified_not_rejected() {
+        let chunk = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1",
+            "function":{"name":"read_file","arguments":{"path":"a.rs"}}}]}}]}"#;
+        let parsed: Chunk = serde_json::from_str(chunk).expect("object arguments parse");
+        let function = parsed.choices[0].delta.tool_calls.as_ref().unwrap()[0]
+            .function
+            .as_ref()
+            .unwrap();
+        let rendered = function.arguments.clone().map(stringify_arguments).unwrap();
+        assert!(rendered.contains("\"path\""));
+    }
+
+    #[test]
+    fn a_non_streaming_completion_becomes_the_same_events() {
+        let payload = r#"{
+            "choices": [{
+                "message": {
+                    "content": "hello",
+                    "tool_calls": [{"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"a.rs\"}"}}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }"#;
+
+        let events: Vec<ChatEvent> = parse_completion(payload)
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+
+        assert!(matches!(&events[0], ChatEvent::TextDelta(text) if text == "hello"));
+        assert!(matches!(
+            &events[1],
+            ChatEvent::ToolCallDelta { name, arguments, .. }
+                if name.as_deref() == Some("read_file") && arguments == "{\"path\":\"a.rs\"}"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ChatEvent::Done {
+                finish_reason: FinishReason::ToolCalls
+            })
+        ));
     }
 }
