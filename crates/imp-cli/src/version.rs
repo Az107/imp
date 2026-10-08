@@ -28,7 +28,11 @@ mod tests {
     #[test]
     fn the_version_line_carries_what_update_needs_to_read_back() {
         let line = format!("imp {VERSION}");
-        assert_eq!(version_from_output(&line).as_deref(), Some("0.1.0"));
+        assert_eq!(
+            version_from_output(&line).as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "the version line must round-trip the package version"
+        );
         // The build stamps a SHA unless git and the environment are both absent.
         if !VERSION.contains("(unknown unknown)") {
             assert!(

@@ -247,7 +247,10 @@ fn version_reports_the_commit_the_date_and_the_features() {
         .expect("run");
     let line = stdout(&output);
     let line = line.trim();
-    assert!(line.starts_with("imp 0.1.0 ("), "was: {line}");
+    assert!(
+        line.starts_with(&format!("imp {} (", env!("CARGO_PKG_VERSION"))),
+        "was: {line}"
+    );
     assert!(
         line.contains("features: cron,guard,mcp,update"),
         "was: {line}"
