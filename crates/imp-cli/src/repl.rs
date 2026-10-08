@@ -10,7 +10,7 @@ use std::sync::Arc;
 use imp_core::agent::StopReason;
 use imp_core::config::{Config, Decision};
 use imp_core::error::{Error, Result};
-use imp_core::message::Message;
+use imp_core::message::{Message, Role};
 use imp_core::provider::Usage;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -22,6 +22,7 @@ use crate::cli::Cli;
 use crate::run;
 use crate::session;
 use crate::setup::{self, Session};
+use crate::style::{self, Glyph, Theme};
 
 /// Run the interactive loop until the user quits or stdin closes.
 ///
@@ -45,18 +46,29 @@ pub async fn interactive(
     let interrupt = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_interrupt_swapper(interrupt.clone());
 
+    let theme = style::stdout_theme(cli, config);
     if !cli.quiet {
         println!(
-            "imp {} · {} · {} · policy: {}",
+            "{} {} · {} · {} · policy: {}",
+            theme.accent("imp"),
             env!("CARGO_PKG_VERSION"),
-            state.options.model,
-            state.workspace_root.display(),
-            decision_name(config.policy.default)
+            theme.bold(&state.options.model),
+            theme.dim(&state.workspace_root.display().to_string()),
+            theme.bold(decision_name(config.policy.default)),
         );
         println!(
-            "session {} · /help for commands, /quit to exit",
-            short_id(&state.session_id)
+            "{} {} · {}",
+            theme.dim("session"),
+            theme.info(&short_id(&state.session_id)),
+            theme.dim("/help for commands, /quit to exit"),
         );
+    }
+
+    // Resuming prints the conversation, so the user sees the context they are
+    // continuing rather than an empty prompt. `--no-history` and `--quiet` opt
+    // out; quiet already suppresses the banner for the same reason.
+    if resume.is_some() && !cli.no_history && !cli.quiet {
+        print_history(&state.history, theme);
     }
 
     let mut usage = Usage::default();
@@ -95,7 +107,7 @@ pub async fn interactive(
             continue;
         }
         if let Some(command) = trimmed.strip_prefix('/') {
-            match handle_slash(command, &mut state, &usage, cli).await {
+            match handle_slash(command, &mut state, &usage, cli, config).await {
                 Ok(true) => break,
                 Ok(false) => continue,
                 Err(err) => {
@@ -126,8 +138,9 @@ pub async fn interactive(
         let rendering = tokio::spawn(run::render_events(
             receiver,
             cli.json,
-            run::style_for(cli),
-            run::colour_enabled(cli),
+            run::style_for(cli, config),
+            style::stderr_theme(cli, config),
+            run::activity_enabled(cli, config),
         ));
 
         let cancel = interrupt.lock().await.clone();
@@ -198,7 +211,9 @@ async fn handle_slash(
     state: &mut Session,
     usage: &Usage,
     cli: &Cli,
+    config: &Config,
 ) -> Result<bool> {
+    let theme = style::stdout_theme(cli, config);
     let mut parts = command.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or_default();
     let argument = parts
@@ -208,23 +223,40 @@ async fn handle_slash(
 
     match name {
         "quit" | "exit" | "q" => return Ok(true),
-        "help" | "?" => print_help(),
+        "help" | "?" => print_help(theme),
         "tools" => {
-            for (tool, risk) in state.tools.risks() {
-                println!("  {tool:<20} {}", risk.as_str());
+            let risks = state.tools.risks();
+            if risks.is_empty() {
+                println!("{}", theme.dim("No tools are enabled."));
+            }
+            let width = risks.iter().map(|(tool, _)| tool.len()).max().unwrap_or(0);
+            for (tool, risk) in risks {
+                println!(
+                    "  {} {:<width$}  {}",
+                    theme.glyph(Glyph::Selected),
+                    theme.bold(tool),
+                    theme.risk(risk),
+                );
             }
         }
         "new" => {
             state.reset().await?;
-            println!("new session {}", short_id(&state.session_id));
+            println!(
+                "{} {}",
+                theme.success("new session"),
+                theme.info(&short_id(&state.session_id))
+            );
         }
         "sessions" => {
             let rows = state.store.list_sessions(20).await?;
             if rows.is_empty() {
-                println!("No conversations yet.");
+                println!(
+                    "{}",
+                    theme.dim("No conversations yet. Ask something to start one.")
+                );
             }
             for row in rows {
-                println!("  {}", setup::describe_session(&row));
+                println!("  {}", setup::describe_session(&row, theme));
             }
         }
         "resume" => {
@@ -246,8 +278,14 @@ async fn handle_slash(
                 history.insert(0, system);
             }
             state.adopt(&id);
+            let count = history.len();
             state.history = history;
-            println!("resumed {id} ({} messages)", state.history.len());
+            println!(
+                "{} {} {}",
+                theme.success("resumed"),
+                theme.info(&id),
+                theme.dim(&format!("({count} messages)")),
+            );
         }
         "rename" => {
             let title =
@@ -257,39 +295,53 @@ async fn handle_slash(
                     "this session is no longer in the database".to_string(),
                 ));
             }
-            println!("renamed to {title}");
+            println!("{} {}", theme.success("renamed to"), theme.bold(title));
         }
         "clear" => {
             // Forget the conversation, keep the system prompt and the session id
             // so the transcript stays continuous and resumable.
             let system = state.history.first().cloned();
             state.history = system.into_iter().collect();
-            println!("history cleared");
+            println!("{}", theme.success("history cleared"));
         }
         "model" => match argument {
             Some(model) => {
                 state.options.model = model.to_string();
-                println!("model set to {}", state.options.model);
+                println!(
+                    "{} {}",
+                    theme.success("model set to"),
+                    theme.bold(&state.options.model)
+                );
             }
             None => {
-                println!("current model: {}", state.options.model);
+                println!(
+                    "{} {}",
+                    theme.dim("current model:"),
+                    theme.bold(&state.options.model)
+                );
                 match state.list_models().await {
                     Ok(models) if models.is_empty() => {
-                        println!("the provider advertised no models");
+                        println!("{}", theme.dim("the provider advertised no models"));
                     }
                     Ok(models) => {
-                        println!("available models ({}):", models.len());
+                        println!(
+                            "{}",
+                            theme.dim(&format!("available models ({}):", models.len()))
+                        );
                         for model in &models {
-                            let marker = if *model == state.options.model {
-                                "›"
+                            if *model == state.options.model {
+                                println!(
+                                    "  {} {}",
+                                    theme.glyph(Glyph::Selected),
+                                    theme.bold(model)
+                                );
                             } else {
-                                " "
-                            };
-                            println!("  {marker} {model}");
+                                println!("    {model}");
+                            }
                         }
                     }
                     Err(err) => {
-                        println!("could not list models from the provider: {err}");
+                        println!("{}", theme.warn(&format!("could not list models: {err}")));
                     }
                 }
             }
@@ -297,52 +349,138 @@ async fn handle_slash(
         "cost" => {
             let total = state.store.session_usage(&state.session_id).await?;
             println!(
-                "session: prompt {} · completion {} · total {} tokens over {} turn(s)",
-                total.prompt_tokens, total.completion_tokens, total.total_tokens, total.turns
+                "{} prompt {} · completion {} · total {} tokens over {} turn(s)",
+                theme.dim("session:"),
+                theme.info(&total.prompt_tokens.to_string()),
+                theme.info(&total.completion_tokens.to_string()),
+                theme.bold(&total.total_tokens.to_string()),
+                total.turns,
             );
             println!(
-                "this process: prompt {} · completion {} · total {} tokens",
-                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+                "{} prompt {} · completion {} · total {} tokens",
+                theme.dim("process:"),
+                theme.info(&usage.prompt_tokens.to_string()),
+                theme.info(&usage.completion_tokens.to_string()),
+                theme.bold(&usage.total_tokens.to_string()),
             );
         }
         "session" => {
-            println!("{}", state.session_id);
-            let note = "This is the conversation id substituted into any ${session} header.";
-            println!("{note}");
+            println!("{}", theme.info(&state.session_id));
+            println!(
+                "{}",
+                theme.dim("This is the conversation id substituted into any ${session} header.")
+            );
         }
-        "where" => println!("{}", state.store.path().display()),
+        "where" => println!("{}", theme.info(&state.store.path().display().to_string())),
         "cron" | "jobs" => {
             let jobs = state.store.jobs().list_jobs().await?;
             if jobs.is_empty() {
-                println!("No jobs scheduled. Add one with `imp cron add`.");
+                println!(
+                    "{}",
+                    theme.dim("No jobs scheduled. Add one with `imp cron add` or ask the agent.")
+                );
             }
             for job in jobs {
-                println!("  {}", imp_cron::describe(&job));
+                println!("  {}", theme.bold(&imp_cron::describe(&job)));
             }
         }
         other => {
             let _ = cli;
-            eprintln!("unknown command `/{other}` — try /help");
+            eprintln!(
+                "{} {}",
+                theme.warn(&format!("unknown command `/{other}`")),
+                theme.dim("— try /help")
+            );
         }
     }
     Ok(false)
 }
 
-fn print_help() {
-    println!("  /help              this message");
-    println!("  /new               start a fresh conversation");
-    println!("  /sessions          list stored conversations");
-    println!("  /resume <id>       continue a stored conversation");
-    println!("  /rename <title>    set this conversation's title");
-    println!("  /clear             forget the messages, keep the session");
-    println!("  /model [name]      list the provider's models, or switch to <name>");
-    println!("  /tools             list enabled tools and their risk class");
-    println!("  /cron              list scheduled jobs (alias /jobs)");
-    println!("  /cost              token usage for this session");
-    println!("  /session           show the conversation id sent to the provider");
-    println!("  /where             show the database path");
-    println!("  /quit              exit");
-    println!("  !<command>         run a shell command directly, bypassing the model");
+/// A grouped, coloured `/help`.
+fn print_help(theme: Theme) {
+    let head = |title: &str| println!("{}", theme.accent(title));
+    let row = |name: &str, description: &str| {
+        println!(
+            "  {} {}",
+            theme.info(&format!("{name:<18}")),
+            theme.dim(description)
+        );
+    };
+
+    head("Conversation");
+    row("/new", "start a fresh conversation");
+    row("/clear", "forget the messages, keep the session id");
+    row("/sessions", "list stored conversations");
+    row("/resume <id>", "continue a stored conversation");
+    row("/rename <title>", "set this conversation's title");
+    head("Model");
+    row("/model", "list the provider's models");
+    row("/model <name>", "switch the model for this session");
+    head("Session");
+    row("/tools", "enabled tools, risk class and approval");
+    row("/cron", "scheduled jobs (alias /jobs)");
+    row("/cost", "token usage for this session");
+    row("/session", "the id sent to the provider as ${session}");
+    row("/where", "the database path");
+    head("Other");
+    row("/help", "this message");
+    row("/quit", "exit (or press Ctrl-C twice)");
+    row(
+        "!<command>",
+        "run a shell command directly, bypassing the model",
+    );
+}
+
+/// Print a resumed conversation, so continuing shows its context.
+///
+/// It is shaped like the live REPL: the user's prompts carry the `›` prompt and
+/// the assistant's replies are printed bare, so a resumed session reads as one
+/// continuous scrollback rather than a transcript. An assistant turn's tool calls
+/// are shown as one indented line each; tool *results* are the model's context
+/// rather than the conversation and are left out. The system prompt is never
+/// shown.
+fn print_history(history: &[Message], theme: Theme) {
+    let messages: Vec<&Message> = history
+        .iter()
+        .filter(|message| message.role != Role::System && message.role != Role::Tool)
+        .collect();
+    if messages.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        theme.dim(&format!(
+            "— {} message(s) from this conversation —",
+            messages.len()
+        ))
+    );
+    let glyph = theme.glyph(Glyph::Prompt);
+    let prompt = theme.accent(if glyph.is_empty() { ">" } else { glyph });
+    for message in messages {
+        match message.role {
+            Role::User => {
+                if let Some(text) = &message.content {
+                    println!("{prompt} {text}");
+                }
+            }
+            Role::Assistant => {
+                if let Some(text) = &message.content {
+                    println!("{text}");
+                }
+                if let Some(calls) = &message.tool_calls {
+                    for call in calls {
+                        println!(
+                            "  {} {} {}",
+                            theme.dim(theme.glyph(Glyph::Tool)),
+                            theme.bold(&call.function.name),
+                            theme.dim(&call.function.arguments)
+                        );
+                    }
+                }
+            }
+            Role::Tool | Role::System => continue,
+        }
+    }
 }
 
 /// Run a local shell command, bypassing the model entirely.

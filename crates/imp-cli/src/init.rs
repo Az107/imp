@@ -21,6 +21,7 @@ use imp_core::write_private_file;
 use imp_provider::OpenAiProvider;
 
 use crate::cli::{Cli, InitArgs};
+use crate::style;
 
 /// Exit code for "refused to proceed" — an existing config without `--force`.
 const EXIT_REFUSED: u8 = 4;
@@ -221,16 +222,21 @@ pub async fn run(cli: &Cli, args: InitArgs) -> Result<ExitCode> {
     };
 
     if target.exists() && !args.force {
+        let theme = style::stderr_theme_default(cli);
         let existing = std::fs::read_to_string(&target)?;
         if existing == contents {
             report(cli, &args, &plan, &target, None, "unchanged")?;
             return Ok(ExitCode::SUCCESS);
         }
-        eprintln!("imp: {} already exists.", target.display());
+        let message = format!("{} already exists.", target.display());
+        eprintln!("{} {}", theme.warn("imp:"), theme.warn(&message));
         for line in diff_keys(&existing, &contents) {
             eprintln!("  {line}");
         }
-        eprintln!("imp: nothing was written. Rerun with --force to replace it.");
+        eprintln!(
+            "{}",
+            theme.warn("imp: nothing was written. Rerun with --force to replace it.")
+        );
         return Ok(ExitCode::from(EXIT_REFUSED));
     }
 
@@ -240,8 +246,13 @@ pub async fn run(cli: &Cli, args: InitArgs) -> Result<ExitCode> {
     if args.check
         && let Err(err) = probe(&plan, probe_key.as_deref()).await
     {
-        eprintln!("imp: backend check failed: {err}");
-        eprintln!("imp: nothing was written. Fix the backend or drop --check.");
+        let theme = style::stderr_theme_default(cli);
+        let message = format!("backend check failed: {err}");
+        eprintln!("{} {}", theme.error("imp:"), theme.error(&message));
+        eprintln!(
+            "{}",
+            theme.warn("imp: nothing was written. Fix the backend or drop --check.")
+        );
         return Ok(ExitCode::from(EXIT_PROVIDER));
     }
 
@@ -249,9 +260,13 @@ pub async fn run(cli: &Cli, args: InitArgs) -> Result<ExitCode> {
     // credential that does not exist yet.
     if let Some(token) = &token {
         Credentials::write(&credentials, token)?;
+        let theme = style::stderr_theme_default(cli);
         eprintln!(
-            "imp: stored the API key in {} (owner-only, never commit it).",
-            credentials.display()
+            "{}",
+            theme.dim(&format!(
+                "imp: stored the API key in {} (owner-only, never commit it).",
+                credentials.display()
+            ))
         );
     }
 
@@ -966,25 +981,55 @@ fn report(
         return Ok(());
     }
 
-    println!("Wrote {}", target.display());
-    println!("  provider.base_url   {}", plan.base_url);
-    println!("  provider.model      {}", plan.model);
+    let theme = style::stdout_theme_default(cli);
+    let label = |name: &str| theme.dim(&format!("  {name:<21}"));
+
+    println!(
+        "{} {}",
+        theme.success("Wrote"),
+        theme.bold(&target.display().to_string())
+    );
+    println!(
+        "{} {}",
+        label("provider.base_url"),
+        theme.info(&plan.base_url)
+    );
+    println!("{} {}", label("provider.model"), theme.bold(&plan.model));
     match &plan.api_key_env {
-        Some(name) => println!("  provider.api_key_env {name}"),
-        None => println!("  provider.api_key_env (none — no credentials are sent)"),
+        Some(name) => println!("{} {}", label("provider.api_key_env"), theme.info(name)),
+        None => println!(
+            "{} {}",
+            label("provider.api_key_env"),
+            theme.dim("(none — no credentials are sent)")
+        ),
     }
     match &credentials {
-        Some(path) => println!("  credentials          {}", path.display()),
-        None => println!("  credentials          (nothing stored)"),
+        Some(path) => println!(
+            "{} {}",
+            label("credentials"),
+            theme.info(&path.display().to_string())
+        ),
+        None => println!("{} {}", label("credentials"), theme.dim("(nothing stored)")),
     }
     if !plan.headers.is_empty() {
         for (name, value) in &plan.headers {
-            println!("  provider.headers.{name} = {value}");
+            println!(
+                "{} {}",
+                label(&format!("provider.headers.{name}")),
+                theme.info(value)
+            );
         }
     }
-    println!("  workspace.roots     {}", plan.workspace_root);
+    println!(
+        "{} {}",
+        label("workspace.roots"),
+        theme.info(&plan.workspace_root)
+    );
     if !args.check {
-        println!("\nTip: rerun with --check to verify the backend before writing.");
+        println!(
+            "\n{}",
+            theme.dim("Tip: rerun with --check to verify the backend before writing.")
+        );
     }
     Ok(())
 }
