@@ -250,6 +250,43 @@ jobs:
             dist/imp-windows-arm64
             dist/checksums.txt
 
+      # The tag `action-gh-release` creates lives only on GitHub, but Gitea
+      # mirrors *to* GitHub with a force-push that prunes refs missing on Gitea.
+      # So the next sync deletes that tag, un-tags the release and leaves it a
+      # draft — invisible to `imp update`, which reads `/releases/latest`. Create
+      # the tag on Gitea too, so the mirror preserves it. `sync_on_commit` means
+      # this is picked up on the next push rather than immediately, which is fine
+      # because the GitHub tag exists until then.
+      - name: Tag the release on Gitea
+        shell: bash
+        env:
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          TAG: ${{ needs.gate.outputs.next }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITEA_TOKEN}" ]; then
+            echo "GITEA_TOKEN is not set; the release tag would not survive the mirror sync" >&2
+            exit 1
+          fi
+          api="https://git.albruiz.dev/api/v1/repos/albruiz/imp/tags"
+          # `target` is the same commit SHA on both remotes: git SHAs are the
+          # bytes of the commit, so the mirrored commit has the same id.
+          code="$(curl -sS -o /tmp/gitea-tag.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data "$(printf '{"tag_name":"%s","target":"%s"}' "${TAG}" "${GITHUB_SHA}")" \
+            "${api}")"
+          case "${code}" in
+            201) echo "created Gitea tag ${TAG} at ${GITHUB_SHA}" ;;
+            409) echo "Gitea tag ${TAG} already exists" ;;
+            *)
+              echo "could not create Gitea tag ${TAG} (HTTP ${code}):" >&2
+              cat /tmp/gitea-tag.json >&2
+              exit 1
+              ;;
+          esac
+
       - name: Verify the release is published
         shell: bash
         env:

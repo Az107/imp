@@ -358,6 +358,11 @@ A **push to `main`** does the following, in order:
 5. **Publishes a GitHub Release** at the derived tag with the six assets and a `checksums.txt` that
    covers them, then verifies the release is not left as a draft and that the uploaded `checksums.txt`
    matches the one built.
+6. **Creates the same tag on Gitea.** Gitea mirrors *to* GitHub with a force-push that prunes refs
+   Gitea does not have, so a tag that exists only on GitHub is deleted on the next sync — which
+   un-tags the release and leaves it a draft that `imp update` cannot see. This step needs the
+   `GITEA_TOKEN` Actions secret: a Gitea token with `write:repository`. Without it the run fails
+   rather than publish a release whose tag will vanish.
 
 **So a normal release is: bump `[workspace.package].version` to the next patch in a commit and push it
 to `main`.** The bump is what step 2 checks; forgetting it fails the run rather than publishing a
