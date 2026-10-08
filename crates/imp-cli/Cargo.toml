@@ -1,0 +1,59 @@
+[package]
+name = "imp-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Optional capabilities (§9). Both default on, and `imp --version` reports
+# which were enabled, so a stripped build says so instead of letting an operator
+# discover a missing subcommand by trying it.
+default = ["mcp", "cron"]
+mcp = []
+cron = []
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+libc = "0.2.189"
+imp-core = { version = "0.1.0", path = "../imp-core" }
+imp-cron = { version = "0.1.0", path = "../imp-cron" }
+imp-guard = { version = "0.1.0", path = "../imp-guard" }
+imp-mcp = { version = "0.1.0", path = "../imp-mcp" }
+imp-provider = { version = "0.1.0", path = "../imp-provider" }
+imp-store = { version = "0.1.0", path = "../imp-store" }
+imp-tools = { version = "0.1.0", path = "../imp-tools" }
+imp-update = { version = "0.1.0", path = "../imp-update" }
+pulldown-cmark = "0.13.4"
+# `server` for the stdio MCP server (M6); `transport-streamable-http-server`
+# adds the Streamable HTTP surface `[mcp.server] transport = "http"` serves
+# (M10.1), which needs an HTTP listener of our own.
+rmcp = { version = "3.5.0", features = [
+    "server",
+    "transport-async-rw",
+    "transport-streamable-http-server",
+] }
+# The HTTP listener for the Streamable HTTP transport. axum is a thin layer over
+# the hyper/tower crates the workspace already builds; `tokio` is the server
+# runtime adapter, and default features are off to keep the surface small.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+rustyline = "18.0.1"
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync", "io-std", "io-util"] }
+tokio-util = "0.7.19"
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[[bin]]
+name = "imp"
+path = "src/main.rs"
+
+[dev-dependencies]
+futures = "0.3.34"
+insta = { version = "1.43.1", features = ["json"] }
+tempfile = "3.27.0"

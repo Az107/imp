@@ -1,0 +1,25 @@
+[package]
+name = "imp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+futures = "0.3.34"
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "rt-multi-thread"] }
+tokio-util = "0.7.19"
+toml = "1.1.6"
+tracing = "0.1.44"
+uuid = { version = "1.26.1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

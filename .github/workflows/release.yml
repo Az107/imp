@@ -3,7 +3,7 @@ name: release
 # Publish a release only when `main` moves. The patch version is derived from the
 # newest `vX.Y.Z` tag, the workspace is tested once, and the six published assets
 # — {linux,macOS,Windows} × {amd64,arm64} — plus a `checksums.txt` are attached
-# to a GitHub Release. That is the shape `minion update` consumes (SDD §9, D24,
+# to a GitHub Release. That is the shape `imp update` consumes (SDD §9, D24,
 # D28): the six asset names are what its `asset_for` mapping looks up, so a name
 # published differently here is a 404 there rather than a fallback.
 on:
@@ -12,7 +12,7 @@ on:
 
 # One release at a time. Never cancel a half-finished publish: a cancelled run
 # can leave a draft release, or a tag with some assets missing, which
-# `minion update` would then see as the latest release.
+# `imp update` would then see as the latest release.
 concurrency:
   group: release-main
   cancel-in-progress: false
@@ -54,7 +54,7 @@ jobs:
         run: bash scripts/next-version.sh
 
       # The tag we are about to cut must equal the version the binary will
-      # report, or `minion update` would install a binary whose `--version`
+      # report, or `imp update` would install a binary whose `--version`
       # disagrees with the release and then offer the same update forever.
       # Failing here is the point: publish something coherent or nothing.
       - name: The tag and Cargo.toml must agree
@@ -89,30 +89,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - asset: minion-linux-amd64
+          - asset: imp-linux-amd64
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            binary: target/x86_64-unknown-linux-gnu/release/minion
-          - asset: minion-linux-arm64
+            binary: target/x86_64-unknown-linux-gnu/release/imp
+          - asset: imp-linux-arm64
             runner: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
-            binary: target/aarch64-unknown-linux-gnu/release/minion
-          - asset: minion-darwin-amd64
+            binary: target/aarch64-unknown-linux-gnu/release/imp
+          - asset: imp-darwin-amd64
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            binary: target/x86_64-apple-darwin/release/minion
-          - asset: minion-darwin-arm64
+            binary: target/x86_64-apple-darwin/release/imp
+          - asset: imp-darwin-arm64
             runner: macos-15
             target: aarch64-apple-darwin
-            binary: target/aarch64-apple-darwin/release/minion
-          - asset: minion-windows-amd64
+            binary: target/aarch64-apple-darwin/release/imp
+          - asset: imp-windows-amd64
             runner: windows-2022
             target: x86_64-pc-windows-msvc
-            binary: target/x86_64-pc-windows-msvc/release/minion.exe
-          - asset: minion-windows-arm64
+            binary: target/x86_64-pc-windows-msvc/release/imp.exe
+          - asset: imp-windows-arm64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
-            binary: target/aarch64-pc-windows-msvc/release/minion.exe
+            binary: target/aarch64-pc-windows-msvc/release/imp.exe
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.asset }}
     steps:
@@ -131,7 +131,7 @@ jobs:
           key: ${{ matrix.target }}
 
       # Linux/arm64 is the one cross link. The distro's aarch64 gcc is also the
-      # C compiler the bundled SQLite (`minion-store`) and `aws-lc-sys` (through
+      # C compiler the bundled SQLite (`imp-store`) and `aws-lc-sys` (through
       # rustls) need; qemu lets the arm64 binary be run here to check its stamps,
       # which a bare cross build cannot do.
       - name: Install the aarch64 cross toolchain and qemu
@@ -152,20 +152,20 @@ jobs:
 
       # Build, then run the binary and read both stamps back out of it. The
       # published asset is the built binary renamed; on Windows that is the bytes
-      # of the `.exe` without the suffix, because `minion update` replaces
+      # of the `.exe` without the suffix, because `imp update` replaces
       # `current_exe()`, so the installed file keeps its real name.
       - name: Build, run and stamp-check ${{ matrix.asset }}
         shell: bash
         env:
           VERSION: ${{ needs.gate.outputs.next }}
-          MINION_GIT_SHA: ${{ github.sha }}
+          IMP_GIT_SHA: ${{ github.sha }}
           TARGET: ${{ matrix.target }}
           BIN: ${{ matrix.binary }}
           ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
           # The commit date, in the same `%cs` shape build.rs derives from git.
-          export MINION_GIT_DATE="$(git log -1 --format=%cs)"
+          export IMP_GIT_DATE="$(git log -1 --format=%cs)"
           mkdir -p dist
 
           echo "building ${TARGET} (${VERSION})"
@@ -194,9 +194,9 @@ jobs:
               ;;
           esac
           echo "${ASSET} --version: ${got}"
-          printf '%s\n' "${got}" | grep -q "^minion ${VERSION#v} " \
+          printf '%s\n' "${got}" | grep -q "^imp ${VERSION#v} " \
             || { echo "version stamp mismatch: got '${got}', want version ${VERSION#v}" >&2; exit 1; }
-          printf '%s\n' "${got}" | grep -q "${MINION_GIT_SHA:0:12}" \
+          printf '%s\n' "${got}" | grep -q "${IMP_GIT_SHA:0:12}" \
             || { echo "commit stamp missing from --version: '${got}'" >&2; exit 1; }
 
           ls -l dist
@@ -221,14 +221,14 @@ jobs:
           path: dist
           merge-multiple: true
 
-      # `minion update` verifies the downloaded asset against `checksums.txt`, so
+      # `imp update` verifies the downloaded asset against `checksums.txt`, so
       # the manifest has to cover all six names — a missing entry is a refusal on
       # that platform, not "skip the check".
       - name: Checksums over the six assets
         shell: bash
         run: |
           set -euo pipefail
-          assets="minion-linux-amd64 minion-linux-arm64 minion-darwin-amd64 minion-darwin-arm64 minion-windows-amd64 minion-windows-arm64"
+          assets="imp-linux-amd64 imp-linux-arm64 imp-darwin-amd64 imp-darwin-arm64 imp-windows-amd64 imp-windows-arm64"
           for asset in ${assets}; do
             test -f "dist/${asset}" \
               || { echo "the build did not upload ${asset}" >&2; exit 1; }
@@ -243,7 +243,7 @@ jobs:
         with:
           tag_name: ${{ needs.gate.outputs.next }}
           name: ${{ needs.gate.outputs.next }}
-          # A hex SHA here is what `minion update` ties the binary to; the
+          # A hex SHA here is what `imp update` ties the binary to; the
           # `build-commit:` trailer is the fallback if a mirror reports the
           # branch instead.
           target_commitish: ${{ github.sha }}
@@ -252,12 +252,12 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/minion-linux-amd64
-            dist/minion-linux-arm64
-            dist/minion-darwin-amd64
-            dist/minion-darwin-arm64
-            dist/minion-windows-amd64
-            dist/minion-windows-arm64
+            dist/imp-linux-amd64
+            dist/imp-linux-arm64
+            dist/imp-darwin-amd64
+            dist/imp-darwin-arm64
+            dist/imp-windows-amd64
+            dist/imp-windows-arm64
             dist/checksums.txt
 
       - name: Verify the release is published
@@ -269,7 +269,7 @@ jobs:
           set -euo pipefail
           # action-gh-release creates the release as a draft and unmarks it
           # after uploading. If that finalize fails silently the tag is never
-          # created and /releases/latest returns 404, so `minion update` would
+          # created and /releases/latest returns 404, so `imp update` would
           # never see it. Fail loudly.
           state="$(gh release view "${TAG}" --json isDraft -q .isDraft)"
           if [ "${state}" != "false" ]; then

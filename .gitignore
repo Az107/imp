@@ -1,8 +1,8 @@
 /target
 **/*.rs.bk
 *.pdb
-/minion.db*
-# Secrets written by `minion init`. The default lives outside the repo, but
+/imp.db*
+# Secrets written by `imp init`. The default lives outside the repo, but
 # `--credentials-file ./credentials` is allowed, so never commit it.
 /credentials
 .DS_Store

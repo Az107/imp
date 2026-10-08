@@ -5,84 +5,84 @@
 Rust workspace implementing `SDD.md`. Milestones **M0 through M6 are complete**: config and layered
 credential resolution, an OpenAI-compatible streaming provider with `${session}` header support, the
 agent loop, the read/write/patch/exec tool set, the approval engine, a SQLite store with resumable
-sessions, keyword memory, `http_fetch` with its SSRF guard, `minion init`, the optional System One
+sessions, keyword memory, `http_fetch` with its SSRF guard, `imp init`, the optional System One
 guard for the approval gate, the in-process cron scheduler with job CRUD, run history and catch-up,
 the **MCP client** that consumes external servers as gated tools, and the **MCP server** that
 publishes the agent to another model. M5 landed on branch `m5-mcp-client`, cut from `m4-cron`; M6
 landed on `m6-mcp-server`, cut from `m5-mcp-client`.
 
-**M3 is done.** `remember`/`recall` live in `minion-store/src/memory.rs`,
-`minion-tools/src/memory.rs` and `minion-core/src/memory.rs`; `http_fetch` and its guard are
-`minion-tools/src/http_fetch.rs`, and the `[http_fetch]` config section is
-`HttpFetchConfig` in `minion-core/src/config.rs`. The milestone table in `SDD.md` reads `done`.
+**M3 is done.** `remember`/`recall` live in `imp-store/src/memory.rs`,
+`imp-tools/src/memory.rs` and `imp-core/src/memory.rs`; `http_fetch` and its guard are
+`imp-tools/src/http_fetch.rs`, and the `[http_fetch]` config section is
+`HttpFetchConfig` in `imp-core/src/config.rs`. The milestone table in `SDD.md` reads `done`.
 
 **M3.5 is done.** The guard's policy — eligibility floor, thresholds, the `SystemOneGuard` trait —
-is `minion-core/src/guard.rs`, the engine consults it from `PolicyEngine::check`
-(`minion-core/src/policy.rs`, step 5b), and the `/v1/systemone` client is the `minion-guard` crate.
-`[guard]` is `GuardConfig` in `minion-core/src/config.rs`. Still disabled by default.
+is `imp-core/src/guard.rs`, the engine consults it from `PolicyEngine::check`
+(`imp-core/src/policy.rs`, step 5b), and the `/v1/systemone` client is the `imp-guard` crate.
+`[guard]` is `GuardConfig` in `imp-core/src/config.rs`. Still disabled by default.
 
-**M4 is done.** The scheduler is `minion-cron` (`scheduler.rs`, `schedule.rs`, `jobs.rs`); the job
-and run types plus the `JobStore` boundary are `minion-core/src/job.rs` and the `Clock` trait is
-`minion-core/src/clock.rs`; the SQLite side is `minion-store/src/jobs.rs`; the `cron_*` tools are
-`minion-tools/src/cron.rs`; the subcommand and the service that runs with a session are
-`minion-cli/src/cron.rs`, with the real agent runner and the cron gate in
-`minion-cli/src/setup.rs`. `[cron]` is `CronConfig` in `minion-core/src/config.rs`. The `jobs`,
+**M4 is done.** The scheduler is `imp-cron` (`scheduler.rs`, `schedule.rs`, `jobs.rs`); the job
+and run types plus the `JobStore` boundary are `imp-core/src/job.rs` and the `Clock` trait is
+`imp-core/src/clock.rs`; the SQLite side is `imp-store/src/jobs.rs`; the `cron_*` tools are
+`imp-tools/src/cron.rs`; the subcommand and the service that runs with a session are
+`imp-cli/src/cron.rs`, with the real agent runner and the cron gate in
+`imp-cli/src/setup.rs`. `[cron]` is `CronConfig` in `imp-core/src/config.rs`. The `jobs`,
 `job_runs` and `audit_log` tables were created by the baseline migration and now have writers.
 
-**M5 is done.** The client is `minion-mcp`: `client.rs` wraps one `rmcp` stdio connection, `servers.rs`
-owns the configured set and implements `minion_core::tool::ToolCatalog`, and `tool.rs` is the external
+**M5 is done.** The client is `imp-mcp`: `client.rs` wraps one `rmcp` stdio connection, `servers.rs`
+owns the configured set and implements `imp_core::tool::ToolCatalog`, and `tool.rs` is the external
 tool's `Tool` implementation. `[mcp.client.servers.*]` is `McpConfig` / `McpClientConfig` /
-`McpServerConfig` in `minion-core/src/config.rs`; the live catalogue seam is `ToolCatalog` and the
-registry in `minion-core/src/tool.rs`; the per-server approval fallback is `ToolPolicy` in
-`minion-core/src/policy.rs`; the subcommand is `minion-cli/src/mcp.rs` and the wiring is in
+`McpServerConfig` in `imp-core/src/config.rs`; the live catalogue seam is `ToolCatalog` and the
+registry in `imp-core/src/tool.rs`; the per-server approval fallback is `ToolPolicy` in
+`imp-core/src/policy.rs`; the subcommand is `imp-cli/src/mcp.rs` and the wiring is in
 `setup.rs`, `run.rs` and `repl.rs`. `src/bin/mcp_stub_server.rs` is a real MCP server used as the test
 fixture, so the tests exercise a process boundary rather than a mock.
 
-**M6 is done.** The server is `minion-cli::mcp_serve`: `Runtime` assembles the shared pieces (store,
-read-only tool subset, the non-interactive gate), `MinionServer` is the `rmcp` `ServerHandler`, and
-the exposed tools are ordinary `minion_core::tool::Tool`s dispatched through the same gate. `[mcp.server]`
-is `McpServerSection` in `minion-core/src/config.rs`; the subcommand is `McpAction::Serve` in
+**M6 is done.** The server is `imp-cli::mcp_serve`: `Runtime` assembles the shared pieces (store,
+read-only tool subset, the non-interactive gate), `ImpServer` is the `rmcp` `ServerHandler`, and
+the exposed tools are ordinary `imp_core::tool::Tool`s dispatched through the same gate. `[mcp.server]`
+is `McpServerSection` in `imp-core/src/config.rs`; the subcommand is `McpAction::Serve` in
 `cli.rs`, dispatched from `mcp.rs`. `agent_run_command`/`agent_write_file` are `Exposed` wrappers over
 `RunCommand`/`WriteFile`, so the surface adds a name and nothing else. The golden surface lives in
-`crates/minion-cli/src/snapshots/minion__mcp_serve__tests__the_default_surface_is_a_golden.snap`.
+`crates/imp-cli/src/snapshots/imp__mcp_serve__tests__the_default_surface_is_a_golden.snap`.
 
-`minion-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. Both halves
-of MCP exist: `minion-mcp` is the client (§5.10), `minion-cli::mcp_serve` is the server (§5.9).
+`imp-mcp`'s manifest lists real dependencies (`rmcp`), and it now has code behind them. Both halves
+of MCP exist: `imp-mcp` is the client (§5.10), `imp-cli::mcp_serve` is the server (§5.9).
 
-**M7 is done.** The CLI surface of §5.12 is complete: `minion config show|path` (`config_cmd.rs`),
-`minion doctor` (`doctor.rs`), and the global `--quiet/-q`, `--resume <session>`, `--max-iterations`
+**M7 is done.** The CLI surface of §5.12 is complete: `imp config show|path` (`config_cmd.rs`),
+`imp doctor` (`doctor.rs`), and the global `--quiet/-q`, `--resume <session>`, `--max-iterations`
 flags, with the documented exit codes (`main.rs::exit_code`, asserted by a unit test). The audit
 trail now carries the *result* of each call, not just the decision: `RecordingGate` holds an allowed
 row until `ToolGate::record_outcome` finishes it, so one row carries decision + outcome + duration,
-plus the session and turn (`minion-core/src/policy.rs`, `minion-store/src/approvals.rs`).
+plus the session and turn (`imp-core/src/policy.rs`, `imp-store/src/approvals.rs`).
 `/cost` aggregates per conversation through the new `session_usage` table (schema v2). A log sink
-(`minion-cli/src/logging.rs`) masks credentials and `Bearer` tokens before anything is written
+(`imp-cli/src/logging.rs`) masks credentials and `Bearer` tokens before anything is written
 (NFR-9). Packaging is `build.rs` (git SHA + features in `--version`), `install.sh`, and a `Makefile`
 with `make dist`. The NFR numbers are measured in `NFR.md`.
 
 `default_registry` takes a second argument, an `Arc<Store>`, because the memory and cron tools need
 one, and a third, a `CronContext`, carrying the clock and default timezone the `cron_*` tools use.
-This is why `minion-tools` depends on `minion-store` and `minion-cron`; the store is opened *before*
+This is why `imp-tools` depends on `imp-store` and `imp-cron`; the store is opened *before*
 the registry in `setup::build` so the system prompt can still be built from the finished tool list.
 
-Assistant text is rendered as markdown on a terminal (`crates/minion-cli/src/markdown.rs`):
+Assistant text is rendered as markdown on a terminal (`crates/imp-cli/src/markdown.rs`):
 headings, emphasis, code, lists, quotes, rules, and pipe tables. It is rendered per block, so
 nothing already on screen is ever revised.
 
 **M10.3 is done** (branch `m10-small-models`, cut from `feat/update-command` at 77e054c). The
-small-model loop ergonomics live in `minion-core/src/agent.rs` (truncated-call recovery, the per-turn
+small-model loop ergonomics live in `imp-core/src/agent.rs` (truncated-call recovery, the per-turn
 repeat cache, the tool budget, `StopReason::ToolBudget`, `AgentEvent::Notice`),
-`minion-core/src/tool.rs` (`ToolSelection` and the filtered `ToolRegistry`),
-`minion-core/src/config.rs` (`[tools]`, `agent.max_tool_calls_per_turn`, `agent.small_model`,
-`provider.strict_tool_arguments`), `minion-cli/src/setup.rs` (where the selection is applied and the
-numbered rules are appended) and `minion-provider/src/openai.rs` (`to_wire_strict`). See the
+`imp-core/src/tool.rs` (`ToolSelection` and the filtered `ToolRegistry`),
+`imp-core/src/config.rs` (`[tools]`, `agent.max_tool_calls_per_turn`, `agent.small_model`,
+`provider.strict_tool_arguments`), `imp-cli/src/setup.rs` (where the selection is applied and the
+numbered rules are appended) and `imp-provider/src/openai.rs` (`to_wire_strict`). See the
 "Small-model loop rules (M10.3)" section below before touching any of it.
 
 **D45 is on branch `small-model-additions`** (cut from `main` after PR #4 merged). It adds `--lean`
-and the loop/provider hardening: `minion-core/src/tokens.rs` (the estimator),
-`minion-core/src/args.rs` (argument repair), `sanitize_schema` in `minion-core/src/provider.rs`,
-the budget/cap/nudge paths in `minion-core/src/agent.rs`, and the wire changes in
-`minion-provider/src/openai.rs` (`stream_idle_timeout_secs`, `extra_body`, quirks, non-streaming).
+and the loop/provider hardening: `imp-core/src/tokens.rs` (the estimator),
+`imp-core/src/args.rs` (argument repair), `sanitize_schema` in `imp-core/src/provider.rs`,
+the budget/cap/nudge paths in `imp-core/src/agent.rs`, and the wire changes in
+`imp-provider/src/openai.rs` (`stream_idle_timeout_secs`, `extra_body`, quirks, non-streaming).
 See the D45 bullets in "Small-model loop rules" before changing any of it.
 
 ## Commands
@@ -90,26 +90,26 @@ See the D45 bullets in "Small-model loop rules" before changing any of it.
 ```sh
 cargo +1.89.0 build                # whole workspace
 cargo +1.89.0 test --workspace     # all tests; offline, no network, no API key needed
-cargo +1.89.0 test -p minion-core   # one crate
-cargo +1.89.0 test -p minion-cron   # the scheduler: virtual clock, no sleeps, no network
-cargo +1.89.0 test -p minion-mcp    # the MCP client: spawns the stub server, no network
-cargo +1.89.0 test -p minion-cli --bin minion mcp_serve   # the MCP server, over an in-memory pipe
-cargo +1.89.0 test -p minion-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
+cargo +1.89.0 test -p imp-core   # one crate
+cargo +1.89.0 test -p imp-cron   # the scheduler: virtual clock, no sleeps, no network
+cargo +1.89.0 test -p imp-mcp    # the MCP client: spawns the stub server, no network
+cargo +1.89.0 test -p imp-cli --bin imp mcp_serve   # the MCP server, over an in-memory pipe
+cargo +1.89.0 test -p imp-core agent::tests::runs_a_tool_and_feeds_the_result_back   # one test
 cargo +1.89.0 clippy --all-targets -- -D warnings    # lint gate; currently clean
 cargo +1.89.0 fmt --all
-./target/debug/minion --help
-./target/debug/minion --version                       # version, git SHA, features
-./target/debug/minion doctor                          # env / config / db / provider
-./target/debug/minion config show                     # effective config, redacted
+./target/debug/imp --help
+./target/debug/imp --version                       # version, git SHA, features
+./target/debug/imp doctor                          # env / config / db / provider
+./target/debug/imp config show                     # effective config, redacted
 make dist                                             # per-target release tarballs + .sha256
-./install.sh --from target/release/minion --prefix ~/.local
+./install.sh --from target/release/imp --prefix ~/.local
 cargo +1.89.0 build --release --locked --target aarch64-unknown-linux-musl  # see NFR.md for the musl CC
 ```
 
-`cargo test -p minion-mcp` needs no network, but it *does* spawn processes: the tests run
+`cargo test -p imp-mcp` needs no network, but it *does* spawn processes: the tests run
 `target/debug/mcp-stub-server`, the fixture binary in that crate, over a real stdio pipe. That is the
 point — the plumbing (spawning, listing, filtering, surviving a dead server) cannot be tested against
-an in-process mock. A snapshot went stale? `INSTA_UPDATE=always cargo +1.89.0 test -p minion-mcp`
+an in-process mock. A snapshot went stale? `INSTA_UPDATE=always cargo +1.89.0 test -p imp-mcp`
 rewrites `tests/snapshots/*.snap`, and the diff is the review.
 
 **Invoke cargo as `cargo +1.89.0`.** The installed `default` toolchain on this machine is 1.88.0,
@@ -123,29 +123,29 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 
 ## Non-obvious structure
 
-- Package `minion-cli` produces a binary named **`minion`** via an explicit `[[bin]]`. Adding a
+- Package `imp-cli` produces a binary named **`imp`** via an explicit `[[bin]]`. Adding a
   second bin, or relying on the package name, will surprise you.
-- `minion-core` has **no terminal, network, or database dependencies** on purpose: the agent loop
-  is tested against a scripted `MockProvider` in `crates/minion-core/src/agent.rs`. Keep it that
-  way — push I/O into `minion-provider`, `minion-tools`, `minion-guard`, or `minion-cli`.
+- `imp-core` has **no terminal, network, or database dependencies** on purpose: the agent loop
+  is tested against a scripted `MockProvider` in `crates/imp-core/src/agent.rs`. Keep it that
+  way — push I/O into `imp-provider`, `imp-tools`, `imp-guard`, or `imp-cli`.
 - Assistant text goes to **stdout**; tool activity, logs, and errors go to **stderr**. This is what
-  makes `minion run ... > answer.txt` clean. Don't print diagnostics to stdout.
+  makes `imp run ... > answer.txt` clean. Don't print diagnostics to stdout.
 - **Piped output is never rendered.** `run::style_for` checks `IsTerminal` *before* honouring
-  `--markdown`, so `minion run ... > out.md` still yields markdown source. If you make the flag win,
+  `--markdown`, so `imp run ... > out.md` still yields markdown source. If you make the flag win,
   every user piping output gets ASCII tables.
 - **Layout and colour are separate.** `NO_COLOR` and `--no-color` drop the escapes but keep table
   borders and list markers, because column alignment carries meaning and colour does not.
-- Config overlays are deep-merged on `toml::Value` trees, so a project `minion.toml` only restates
+- Config overlays are deep-merged on `toml::Value` trees, so a project `imp.toml` only restates
   the keys it changes. **Unknown keys are ignored on purpose** (forward compatibility) — do not add
   `deny_unknown_fields`.
-- Every session gets a `session_id` (`minion_core::new_session_id()`, a v7 UUID). It is expanded
+- Every session gets a `session_id` (`imp_core::new_session_id()`, a v7 UUID). It is expanded
   into any configured header containing `${session}`. Some gateways require this: OpenCode Go
   rejects requests without `x-opencode-session`. The id must stay **stable for the whole
   conversation** — regenerating it per request would break the prompt-cache routing it exists for.
-- `minion init` deliberately runs *before* config loading in `main.rs`, so a broken or missing
+- `imp init` deliberately runs *before* config loading in `main.rs`, so a broken or missing
   config can still be repaired by it. Keep that ordering.
-- **Markdown rendering is a presentation concern and lives in `minion-cli`, not `minion-core`.**
-  `minion-core` still emits raw `TextDelta`. The parser is `pulldown-cmark`; the renderer is ours.
+- **Markdown rendering is a presentation concern and lives in `imp-cli`, not `imp-core`.**
+  `imp-core` still emits raw `TextDelta`. The parser is `pulldown-cmark`; the renderer is ours.
 
 ## Invariants that must not be relaxed
 
@@ -174,7 +174,7 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - **The MCP server is read-only by default.** `expose_exec`/`expose_write` stay `false`;
   `run_command` is never *callable* over MCP by default. The two tools are still listed — the denial
   is a policy decision the audit trail records, not a missing tool (D22) — and `agent_ask`'s inner
-  agent only ever gets the read-only subset of the registry. `minion mcp serve` never starts a REPL
+  agent only ever gets the read-only subset of the registry. `imp mcp serve` never starts a REPL
   (R5): both own stdin/stdout.
 - Cron job runs always use the non-interactive policy and cannot prompt for approval. The gate is
   `setup::build_cron_gate` — no `ApprovalUi`, `interactive = false`, no guard. Don't route a job
@@ -199,7 +199,7 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   every test used a stub that ignored the request body.
 - **Config tests must not read the real user config.** Use `Config::load_with(user, explicit, cwd)`
   and pass `None` for the user path. `Config::load` picks up
-  `~/Library/Application Support/minion/config.toml`, so a developer's own `minion init` breaks tests
+  `~/Library/Application Support/imp/config.toml`, so a developer's own `imp init` breaks tests
   on any machine that has one.
 - **A gateway saying "upstream request failed" is rejecting the request body.** Bisect the fields
   against the live endpoint instead of guessing: capture the exact JSON, replay it, then remove one
@@ -241,7 +241,7 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
 - **Rule order in `PolicyEngine::check` is the security property.** Deny → allow → classifier →
   ReadOnly → non-interactive → default. Reordering lets a later rule skip an earlier refusal.
 - **`ReadOnly` is checked *before* the non-interactive rule; `Network` is not.** D15, and it
-  deliberately does not match `Risk::requires_consent`. A piped `minion run ... > out.md` can read
+  deliberately does not match `Risk::requires_consent`. A piped `imp run ... > out.md` can read
   and recall, but a write or an `http_fetch` still needs `--yes` or an allowlist entry. Use
   `Risk::is_observation()` for the read/write line rather than matching `ReadOnly` — it keeps the
   side that `Network` sits on stated once. If `Network` ever moves to the read side, that helper is
@@ -270,7 +270,7 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   after the `!self.interactive` branch on purpose: before it, a model allow would let a `curl`
   through a pipe that D15 deliberately denies.
 - **`privilege`, `remote-execution` and `destructive` are a floor, not a filter.**
-  `minion_core::guard::is_eligible` runs before any socket is opened, and one ineligible tag poisons
+  `imp_core::guard::is_eligible` runs before any socket is opened, and one ineligible tag poisons
   the whole command — `curl … && sudo …` is ineligible. A command the classifier did not flag is not
   eligible either: the guard resolves a *flagged* prompt and nothing else. Don't "improve" the floor
   by letting the model opine on an ineligible command.
@@ -288,9 +288,9 @@ Toolchain floor is **Rust 1.89 / edition 2024** — the code uses let-chains
   (`guard_uncertain` vs `guard_deny`). FR-47 keeps a human in the middle by design.
 - **Every verdict is audited**, failures included (`guard_error`), through `ApprovalStore::audit`,
   which is best effort and never fails a turn.
-- **`[guard]` is off by default, wired in `minion-cli::setup::build_gate`.** `minion-core` has no
-  network dependency; `minion-guard` is the only crate that opens the socket, behind the
-  `SystemOneGuard` trait. Keep the client there — a `reqwest::Client` in `minion-core` breaks the
+- **`[guard]` is off by default, wired in `imp-cli::setup::build_gate`.** `imp-core` has no
+  network dependency; `imp-guard` is the only crate that opens the socket, behind the
+  `SystemOneGuard` trait. Keep the client there — a `reqwest::Client` in `imp-core` breaks the
   rule that lets the loop be tested against a mock provider.
 
 ## Small-model loop rules (M10.3)
@@ -299,7 +299,7 @@ The point of this milestone is that a 2–4B local model can drive a turn withou
 weakness into a parse error or a runaway. The knobs are `[tools] only`/`hide`,
 `agent.max_tool_calls_per_turn`, `agent.small_model`, and `[provider] strict_tool_arguments`; the
 behaviour is `StopReason::ToolBudget`, `AgentEvent::Notice`, and the per-turn repeat cache in
-`minion-core/src/agent.rs`. Traps that cost time:
+`imp-core/src/agent.rs`. Traps that cost time:
 
 - **The `[tools]` filter is applied in `ToolRegistry::all()`, last, not at registration.** It must
   run *after* `attach_catalog` and after the shadowing pass, or it would miss MCP tools and could let
@@ -337,8 +337,8 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   `apply_history_window`: never an assistant `tool_calls` without its results. A load-time-only trim
   cannot see the tool results that accumulate mid-turn. If the system prompt plus schemas alone exceed
   the budget, the turn fails with an explanation instead of sending a request that will be rejected.
-  `minion_core::tokens` is a heuristic and must stay dependency-free (no tokenizer in `minion-core`).
-- **`repair_arguments` runs only after a normal parse fails.** `minion_core::args::repair_json` strips
+  `imp_core::tokens` is a heuristic and must stay dependency-free (no tokenizer in `imp-core`).
+- **`repair_arguments` runs only after a normal parse fails.** `imp_core::args::repair_json` strips
   fences and trailing commas and must return `None` when nothing changed, so the original parse error
   survives. Never pre-emptively rewrite well-formed JSON.
 - **`nudge_on_empty` fabricates exactly one turn** — one per user turn, subject to `max_iterations`,
@@ -370,7 +370,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
 - **`skipped` and `overlap` are different statuses for different reasons.** `skipped` is a catch-up
   policy decision, `overlap` is a live run colliding with its own next occurrence. `queued` is an
   accepted run waiting for a slot. Don't collapse them — `/cron` and the audit trail read them.
-- **The cron expression is a five-field Vixie expression, and `minion_cron::schedule::expression`
+- **The cron expression is a five-field Vixie expression, and `imp_cron::schedule::expression`
   is the only place that is true.** The `cron` crate is six-field Quartz with `1` = Sunday, so the
   parser prefixes `0 ` and rewrites the day-of-week field. Any new caller must go through that
   function, not `Schedule::from_str`; a direct call would silently fire a day late. See D18.
@@ -378,7 +378,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   which is why the runner creates the session and the scheduler adopts it in a statement separate
   from the run's terminal status: an adoption that fails must not roll back the record that the run
   finished. `cron_end_to_end.rs` has a test for exactly that.
-- **Job timestamps are written with `minion_core::job::stamp`**, fixed-width RFC 3339 with
+- **Job timestamps are written with `imp_core::job::stamp`**, fixed-width RFC 3339 with
   milliseconds and a `Z`. `due_jobs` compares `next_run_at <= ?` as *text*, so mixing formats would
   make the comparison a lexicographic guess. Use `stamp`/`parse_stamp`, never `to_rfc3339()`.
 - **Catch-up replays occurrences without the overlap check.** A replayed occurrence never ran, so
@@ -386,12 +386,12 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   burst. Adding the overlap check there would silently drop `run_all` occurrences after the first.
 - **The scheduler lives and dies with the process** (D5). `cron::start` runs `reconcile()` — which
   closes runs a dead process left `running` — then `catch_up()`, then the tick loop. Jobs do not run
-  while minion is closed (R6), and no daemon is left behind.
+  while imp is closed (R6), and no daemon is left behind.
 - **`--cwd` is both a global flag and a `cron add` flag**, so the subcommand's own definition wins
-  inside `minion cron`. The job's `cwd` is canonicalized before it is stored: a relative path would
+  inside `imp cron`. The job's `cwd` is canonicalized before it is stored: a relative path would
   otherwise be resolved against whatever directory the *scheduler* happened to run in.
-- `minion-cron` has **no network and no database dependency**: the store is behind `minion_core::JobStore`
-  and the prompt behind `minion_cron::JobRunner`. Keep it that way — it is what lets the firing rules
+- `imp-cron` has **no network and no database dependency**: the store is behind `imp_core::JobStore`
+  and the prompt behind `imp_cron::JobRunner`. Keep it that way — it is what lets the firing rules
   be tested against an in-memory fake and a `ManualClock`.
 
 ## MCP client rules (M5)
@@ -430,7 +430,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   was correct only while exactly one message was pushed before the turn. A notice makes that two, and
   the off-by-one duplicated the user's prompt in the database. `reply_start` is now captured from
   `history.len()`.
-- **`minion` closes its MCP connections on the way out.** `Session::shutdown` → `McpServers::shutdown`
+- **`imp` closes its MCP connections on the way out.** `Session::shutdown` → `McpServers::shutdown`
   → `McpClient::close`, called from `run::one_shot` and `repl::interactive`. Without it a REPL exit
   can leave a server process behind, because the transport's kill runs from a spawned task that a
   shutting-down runtime may never schedule. The short sleep in `shutdown` is there for the same reason.
@@ -438,7 +438,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   passed; the library logs an INFO line per service init, cancellation and shutdown, and stderr is the
   channel the REPL uses for tool activity. `-v` leaves it alone so a protocol problem is still
   debuggable.
-- **`minion-cli::setup::recording` wraps every gate in a `RecordingGate`.** §7 asks for an audit row
+- **`imp-cli::setup::recording` wraps every gate in a `RecordingGate`.** §7 asks for an audit row
   per tool decision, and the engine only wrote one where a guard verdict was involved — so an allowed
   `read_file`, or any external call at all, left no trace. It is a decorator on purpose: the rule order
   in `PolicyEngine::check` is the security property, and wrapping records without touching it.
@@ -448,7 +448,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
 - **`mcp serve` is a terminal mode.** It owns stdin/stdout for the protocol and returns `ExitCode`
   when the peer closes; there is no path from it to `repl::interactive`. That *is* R5 — not a flag
   that has to be checked, but a control flow that cannot reach the REPL.
-- **The surface is a `ToolRegistry`, and the gate is the same engine.** `MinionServer::dispatch`
+- **The surface is a `ToolRegistry`, and the gate is the same engine.** `ImpServer::dispatch`
   resolves a tool, calls `gate.check(policy_name(name), tool.risk(), args, subject)` and then
   `invoke`, exactly as `Agent::dispatch` does with a model in front of it. If you add a tool to the
   surface, give it a risk class and a schema; do not add a call path that skips `dispatch`.
@@ -507,14 +507,14 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
 ## Packaging rules (M7)
 
 - **`--version` is assembled in `version.rs` from stamps `build.rs` writes.** It prints
-  `<version> (<git sha> <commit date>) [features: cron,guard,mcp,update]`, and `minion update` parses
+  `<version> (<git sha> <commit date>) [features: cron,guard,mcp,update]`, and `imp update` parses
   exactly that line back out of a downloaded binary, so the shape is a contract, not cosmetics: M7
   shipped a second shape (`(<sha>; features: …)`) and merging the two milestones left one.
   Never hard-code the SHA; a source tarball with no `.git` reports `unknown` on purpose.
 - **`build.rs` must list every path that moves with a commit.** `.git/HEAD` holds a ref *name* on a
   branch, not a commit, so watching it alone leaves the baked SHA stale on every incremental build —
   the release then names the wrong commit. It watches `.git/HEAD`, `.git/refs` (a directory: cargo
-  re-scans it) and `.git/packed-refs`, plus `MINION_GIT_SHA`/`MINION_GIT_DATE`/`GITHUB_SHA` so the
+  re-scans it) and `.git/packed-refs`, plus `IMP_GIT_SHA`/`IMP_GIT_DATE`/`GITHUB_SHA` so the
   release workflow can inject the commit. `cli_surface.rs`'s
   `version_reports_the_git_sha_and_enabled_features` compares against `git rev-parse --short=12 HEAD`
   so a stale SHA fails the suite instead of shipping.
@@ -525,7 +525,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
 - **Config and database paths are created `0600`/`0700`.** `write_private_file` and `Store::open`
   tighten permissions *before* content is written; `doctor` warns when a private file is group- or
   world-readable. Keep the secret out of the config file, always.
-- **`make dist` is the release layout** `install.sh` expects: `dist/minion-<version>-<target>.tar.gz`
+- **`make dist` is the release layout** `install.sh` expects: `dist/imp-<version>-<target>.tar.gz`
   plus a `.sha256`. The Linux musl targets need a musl C compiler — see `NFR.md` for the no-root
   recipe used on this host.
 
@@ -538,7 +538,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   implicitly `AND`ed. Don't "simplify" that away.
 - **A `Transaction` must be committed explicitly** — it rolls back on drop. Omitting the `commit()`
   after an upsert makes `remember` report success while `recall` matches nothing, which is exactly
-  the silent failure the FTS triggers exist to prevent. `crates/minion-cli/tests/memory_gate.rs`
+  the silent failure the FTS triggers exist to prevent. `crates/imp-cli/tests/memory_gate.rs`
   and the store tests catch this; if you touch the write path, expect them to fail first.
 - **The namespace is a hash, not a path.** `namespace_for` uses FNV-1a rather than a digest
   dependency, and `the_label_is_sixteen_hex_digits` pins the algorithm. A test asserts known
@@ -547,7 +547,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
 - **A no-match `recall` is a plain answer, not a tool error.** The model asks vague questions; an
   error there reads as a broken tool. Same for a query with nothing searchable in it.
 - `remember` is `Risk::Write` even though it cannot touch the workspace. The class describes what
-  changes, and that is what puts it behind the gate. `crates/minion-cli/tests/memory_gate.rs`
+  changes, and that is what puts it behind the gate. `crates/imp-cli/tests/memory_gate.rs`
   asserts a denied `remember` leaves the database untouched.
 
 ## HTTP rules
@@ -581,8 +581,8 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   check, not a connection-time one, so a resolver that answers differently between the check and the
   connect (DNS rebinding) is not closed by it. Closing that needs a custom `reqwest::dns::Resolve`;
   it is a known limit, not an oversight.
-- **`http_fetch` is why `minion-tools` depends on `reqwest`.** It is the same crate and version
-  `minion-provider` already links, so it adds one edge to `Cargo.lock`, not a second HTTP stack.
+- **`http_fetch` is why `imp-tools` depends on `reqwest`.** It is the same crate and version
+  `imp-provider` already links, so it adds one edge to `Cargo.lock`, not a second HTTP stack.
 - The body is read up to `max_bytes` (clamped per call) and non-UTF-8 is decoded lossily. The result
   the model sees is JSON — `status`, `url`, `redirects`, `headers`, `body`, `truncated` — matching
   §5.5; the tool `metadata` mirrors the status and the kept byte count.
@@ -615,7 +615,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   but a `--no-default-features` build still compiles both subsystems; the cfg-gating across
   `setup.rs`/`run.rs`/`repl.rs` is deferred. Treat the feature list as "how the build was
   configured", not "what was compiled out".
-- **`minion doctor` needs the provider to answer to be fully green.** `/models` is optional in the
+- **`imp doctor` needs the provider to answer to be fully green.** `/models` is optional in the
   OpenAI-compatible world, so a non-auth 4xx counts as reachable; an endpoint that answers nothing
   useful on `/models` is still reported as up. The probe is a reachability and credential check, not
   a capability check.
@@ -626,7 +626,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   wants the compact form needs a decision about how it is gated first (D20).
 - **A `lazy` server's tools are not in `/tools` until the first turn.** Laziness defers the spawn to
   the first turn, and tools cannot be discovered without a connection, so a REPL shows only the
-  built-in tools until someone asks for something. `minion mcp list`/`mcp tools <server>` start it
+  built-in tools until someone asks for something. `imp mcp list`/`mcp tools <server>` start it
   immediately.
 - **The per-server policy is only enforced on the flattened tools.** A server whose `approval` is
   `deny` refuses `mcp__<server>__*`; nothing else can reach it, because `mcp_call` does not exist. If
@@ -637,7 +637,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   `cron_end_to_end.rs` exercises the real SQLite store, but no test waits for a wall clock to pass a
   minute boundary. The manual run that was performed is described under "Manual smoke test".
 - **`/cron` in the REPL and the scheduler's start/stop wiring are manually verified.** The
-  subcommand (`minion cron add|list|remove`) is the tested surface; the REPL path has no automated
+  subcommand (`imp cron add|list|remove`) is the tested surface; the REPL path has no automated
   test, the same limitation as the interactive approval prompt.
 - **`--yes`/`--deny` do not move the MCP surface.** The disabled families are deny *rules*, which are
   rule 1 and beat the default a flag would set, and the read-only tools are allowed before the
@@ -645,7 +645,7 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   `expose_write`. Passing `--yes` to `mcp serve` is therefore inert rather than dangerous, but it is
   also not a way to enable anything.
 - **`mcp serve` does not run the scheduler.** A job created over MCP (`cron_add`) is stored in the
-  session database and runs the next time a process that *does* start a scheduler — `minion run`, the
+  session database and runs the next time a process that *does* start a scheduler — `imp run`, the
   REPL, or a future `doctor`/daemon — opens it. The server is a protocol endpoint, not a daemon (D22).
 - **`mcp serve` ignores `[mcp.client.servers.*]`.** The server's inner agent is the read-only subset
   of the built-in registry, and external tools are `Risk::Network`, so they would never be offered
@@ -655,14 +655,14 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   tools `agent_write_file`/`agent_run_command`; they do not widen what `agent_ask` can do. That
   matches §5.9's "read-only tool subset", and it means a host that wants a write must call the write
   tool explicitly rather than ask the agent to do it.
-- **M3.5's guard policy is tested, its interactive wiring is not.** `minion-core` unit-tests the
-  floor, the thresholds and the engine (with a fake guard) and `minion-guard` runs the real HTTP
+- **M3.5's guard policy is tested, its interactive wiring is not.** `imp-core` unit-tests the
+  floor, the thresholds and the engine (with a fake guard) and `imp-guard` runs the real HTTP
   client against a fake `/v1/systemone` server inside the real engine, but no test drives a real
-  keystroke through `minion` with the guard enabled — the same limitation as the approval prompt.
+  keystroke through `imp` with the guard enabled — the same limitation as the approval prompt.
 - **The `/v1/systemone` response contract is ours.** The SDD says the model returns calibrated
   numbers; it does not say which field carries one. This implementation reads a top-level `unsafe` in
   `[0, 1]` and treats anything else as unreadable, which prompts. If a real vendor shape differs, only
-  `parse_verdict` in `crates/minion-guard/src/lib.rs` changes.
+  `parse_verdict` in `crates/imp-guard/src/lib.rs` changes.
 - The guard is a **noise filter, not a boundary**: it resolves prompts strictly inside the boundary
   the static rules drew, and it is off by default.
 - **The interactive approval keystroke path is not machine-tested.** The prompt renders correctly and
@@ -691,7 +691,7 @@ Normative, not prose. When implementing, follow it rather than substituting defa
   without confirming first.
 - **Keep IDs stable.** `G*`, `FR-*`, `NFR-*`, `T*`, `R*` are cross-referenced across sections.
   Renumbering breaks references; append instead.
-- §10 milestones are the roadmap. §2 requirements are the acceptance criteria for `minion-core` and
+- §10 milestones are the roadmap. §2 requirements are the acceptance criteria for `imp-core` and
   the tools layer; §5 is the implementation detail.
 
 ## Non-goals for v1 — do not build these
@@ -716,7 +716,7 @@ from the credentials file.
 cannot be driven by piping stdin — that path takes the non-interactive branch. Drive it with
 `pty.fork()` and write one answer per prompt; feeding all lines at once desynchronises the prompts
 and produces a confusing failure. Always rebuild the binary (`cargo build`) before a manual test:
-`cargo test` does not refresh `target/debug/minion`.
+`cargo test` does not refresh `target/debug/imp`.
 
 ### Cron end to end
 
@@ -725,15 +725,15 @@ the REPL and piped stdin rather than a pty. With the same SSE stub as above:
 
 ```sh
 # 1. a job that fires on the next minute boundary
-minion --cwd /tmp/e2e --db /tmp/e2e/minion.db \
+imp --cwd /tmp/e2e --db /tmp/e2e/imp.db \
   cron add --schedule '* * * * *' --prompt 'say hello' --name e2e --timezone UTC
 
 # 2. let the scheduler tick past one occurrence, then leave
-( sleep 70; echo '/quit' ) | minion --cwd /tmp/e2e --db /tmp/e2e/minion.db
+( sleep 70; echo '/quit' ) | imp --cwd /tmp/e2e --db /tmp/e2e/imp.db
 
-# 3. one occurrence passes while minion is closed, then catch up
+# 3. one occurrence passes while imp is closed, then catch up
 sleep 65
-( sleep 12; echo '/quit' ) | minion --cwd /tmp/e2e --db /tmp/e2e/minion.db
+( sleep 12; echo '/quit' ) | imp --cwd /tmp/e2e --db /tmp/e2e/imp.db
 ```
 
 What to check, and what was checked:
@@ -754,14 +754,14 @@ three-line `sqlite3.connect` plus a `SELECT * FROM jobs` / `SELECT * FROM job_ru
 ### MCP client end to end
 
 The client's unit tests spawn the stub server themselves, so this recipe is for the *binary* path: a
-real `minion`, a real server process, a real gate and a real audit row.
+real `imp`, a real server process, a real gate and a real audit row.
 
 ```sh
 # 1. the fixture server is a normal cargo bin
 cargo build                       # produces target/debug/mcp-stub-server
 
 # 2. a config that consumes it, plus one server that cannot start
-cat > /tmp/m5/minion.toml <<'TOML'
+cat > /tmp/m5/imp.toml <<'TOML'
 [provider]
 base_url = "http://127.0.0.1:8099/v1"
 api_key_env = ""
@@ -779,11 +779,11 @@ tool_allow = ["*"]
 TOML
 
 # 3. what the model would be offered, and what tool_allow hides
-minion --config /tmp/m5/minion.toml mcp list
-minion --config /tmp/m5/minion.toml mcp tools stub
+imp --config /tmp/m5/imp.toml mcp list
+imp --config /tmp/m5/imp.toml mcp tools stub
 
 # 4. a turn: the stub provider (the SSE stub above) asks for mcp__stub__echo
-minion --config /tmp/m5/minion.toml --db /tmp/m5/m5.db run "call the echo tool" < /dev/null
+imp --config /tmp/m5/imp.toml --db /tmp/m5/m5.db run "call the echo tool" < /dev/null
 ```
 
 What to check, and what was checked:
@@ -806,12 +806,12 @@ What to check, and what was checked:
 ### MCP server end to end
 
 The automated test drives a real MCP client against a real server over an in-memory pipe
-(`cargo test -p minion-cli --bin minion mcp_serve`), which is the surface to trust. This recipe is for
-the *binary* path: a real `minion mcp serve` process, its own stdin/stdout, the SSE stub as the model.
+(`cargo test -p imp-cli --bin imp mcp_serve`), which is the surface to trust. This recipe is for
+the *binary* path: a real `imp mcp serve` process, its own stdin/stdout, the SSE stub as the model.
 
 ```sh
 # 1. a config whose provider is the SSE stub, with the default read-only surface
-cat > /tmp/m6/minion.toml <<'TOML'
+cat > /tmp/m6/imp.toml <<'TOML'
 [provider]
 base_url = "http://127.0.0.1:8099/v1"
 api_key_env = ""
@@ -829,7 +829,7 @@ TOML
 python3 - <<'PY'
 import json, subprocess, sys
 p = subprocess.Popen(
-    ["minion", "--config", "/tmp/m6/minion.toml", "--db", "/tmp/m6/m6.db", "mcp", "serve"],
+    ["imp", "--config", "/tmp/m6/imp.toml", "--db", "/tmp/m6/m6.db", "mcp", "serve"],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 def rpc(id, method, params=None):
     p.stdin.write((json.dumps({"jsonrpc":"2.0","id":id,"method":method,
@@ -848,7 +848,7 @@ PY
 
 What to check, and what was checked:
 
-- `minion mcp serve` prints the banner on **stderr** before the protocol starts: one line per
+- `imp mcp serve` prints the banner on **stderr** before the protocol starts: one line per
   `expose_*` flag, `surface: read-only` while both exec and write are off. Nothing but protocol ever
   reaches stdout, so the client's JSON parse never sees a log line.
 - `tools/list` returns the nine tools in surface order (the golden snapshot), `agent_run_command` and
@@ -858,7 +858,7 @@ What to check, and what was checked:
 - `tools/call agent_run_command` returns `isError: true` with `refused by a deny rule` in the content,
   and `audit_log` gains a `deny` row for `run_command`. Set `expose_exec = true`, restart, and the
   same call returns the command's output with an `allow` row.
-- `resources/list` and `resources/read minion://config-redacted` work; the config JSON carries no
+- `resources/list` and `resources/read imp://config-redacted` work; the config JSON carries no
   secret even if `[provider.headers]` names one.
 - `ps` shows no child process after the client closes stdin: the server exits when the peer closes.
 

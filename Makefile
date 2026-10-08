@@ -42,15 +42,15 @@ dist:
 	@for target in $(TARGETS); do \
 		echo "== $$target"; \
 		$(CARGO) build --release --locked --target $$target || exit 1; \
-		asset=minion-$(VERSION)-$$target.tar.gz; \
-		tar -czf $(DIST)/$$asset -C target/$$target/release minion; \
+		asset=imp-$(VERSION)-$$target.tar.gz; \
+		tar -czf $(DIST)/$$asset -C target/$$target/release imp; \
 		(cd $(DIST) && sha256sum $$asset > $$asset.sha256); \
 	done
 	@ls -lh $(DIST)
 
 ## install: cargo-install the CLI from this checkout.
 install:
-	$(CARGO) install --path crates/minion-cli --locked
+	$(CARGO) install --path crates/imp-cli --locked
 
 clean:
 	$(CARGO) clean
