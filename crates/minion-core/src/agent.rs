@@ -1408,6 +1408,68 @@ mod tests {
         assert_eq!(history[2].content.as_deref(), Some("a2"));
     }
 
+    #[test]
+    fn trim_to_budget_never_splits_a_tool_call_from_its_result() {
+        let call = |id: &str| ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: "echo".to_string(),
+                arguments: "{\"text\":\"x\"}".to_string(),
+            },
+        };
+        let mut history = vec![
+            Message::system("sys"),
+            Message::user("turn one"),
+            Message::assistant_with_tool_calls(None, vec![call("c1")]),
+            Message::tool_result("c1", "result one"),
+            Message::assistant("done one"),
+            Message::user("turn two"),
+            Message::assistant_with_tool_calls(None, vec![call("c2")]),
+            Message::tool_result("c2", "result two"),
+            Message::assistant("done two"),
+        ];
+
+        // A budget that cannot fit both turns forces the oldest one out.
+        trim_to_budget(&mut history, 1);
+
+        assert_eq!(
+            history.first().map(|message| message.role),
+            Some(Role::System)
+        );
+        assert_eq!(
+            history[1].content.as_deref(),
+            Some("turn two"),
+            "the cut lands on the newest user turn"
+        );
+        // Whatever survives must be a well-formed transcript: every `tool`
+        // message still answers an assistant call that is also present. An
+        // orphan here is exactly the corruption the boundary rule prevents.
+        let mut answerable: Vec<String> = Vec::new();
+        for message in &history {
+            match message.role {
+                Role::Assistant => {
+                    answerable = message
+                        .tool_calls
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|call| call.id)
+                        .collect();
+                }
+                Role::Tool => {
+                    let id = message.tool_call_id.clone().unwrap_or_default();
+                    assert!(
+                        answerable.contains(&id),
+                        "orphaned tool result `{id}` after trimming"
+                    );
+                    answerable.retain(|pending| pending != &id);
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[tokio::test]
     async fn missing_tool_ids_get_unique_fallbacks() {
         let dir = tempfile::tempdir().unwrap();
