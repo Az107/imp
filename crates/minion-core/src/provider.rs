@@ -55,6 +55,78 @@ impl ToolSchema {
     }
 }
 
+/// Strip schema keywords that cost tokens and break strict local decoders.
+///
+/// `schemars` emits `$schema`, `title`, and `format`, and represents an
+/// `Option<T>` as `"type": ["T","null"]`. OpenAI tolerates all of it, but
+/// grammar-based local backends (llama.cpp's GBNF, some MLX paths) compile the
+/// schema and can choke on the extras. Removing them is lossless for tool
+/// calling: `description`, `enum`, `required` and numeric bounds are kept, and a
+/// closed object gets `additionalProperties: false` so a grammar stays tight.
+pub fn sanitize_schema(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            map.remove("$schema");
+            map.remove("title");
+            map.remove("format");
+
+            // `["integer","null"]` -> `"integer"`; absence already means
+            // nullable for an optional argument.
+            if let Some(serde_json::Value::Array(types)) = map.get("type") {
+                let mut non_null = types
+                    .iter()
+                    .filter(|kind| kind.as_str() != Some("null"))
+                    .cloned();
+                if let (Some(only), None) = (non_null.next(), non_null.next()) {
+                    map.insert("type".to_string(), only);
+                }
+            }
+
+            for key in ["properties", "patternProperties", "$defs", "definitions"] {
+                if let Some(serde_json::Value::Object(subschemas)) = map.get_mut(key) {
+                    for subschema in subschemas.values_mut() {
+                        sanitize_schema(subschema);
+                    }
+                }
+            }
+            for key in [
+                "items",
+                "additionalProperties",
+                "not",
+                "if",
+                "then",
+                "else",
+                "contains",
+                "propertyNames",
+            ] {
+                if let Some(subschema) = map.get_mut(key) {
+                    sanitize_schema(subschema);
+                }
+            }
+            for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+                if let Some(serde_json::Value::Array(subschemas)) = map.get_mut(key) {
+                    for subschema in subschemas.iter_mut() {
+                        sanitize_schema(subschema);
+                    }
+                }
+            }
+
+            if map.contains_key("properties") && !map.contains_key("additionalProperties") {
+                map.insert(
+                    "additionalProperties".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sanitize_schema(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Why the model stopped generating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
@@ -202,5 +274,56 @@ mod tests {
         assert_eq!(wire["function"]["strict"], serde_json::json!(true));
         assert_eq!(wire["type"], "function", "the envelope is unchanged");
         assert_eq!(wire["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn sanitize_strips_noise_and_collapses_nullable_types() {
+        let mut schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "ReadFileArgs",
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "format": "path" },
+                "limit": { "type": ["integer", "null"], "minimum": 1 },
+            },
+            "required": ["path"],
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("title").is_none());
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert!(schema["properties"]["path"].get("format").is_none());
+        assert_eq!(schema["properties"]["limit"]["type"], "integer");
+        assert_eq!(schema["properties"]["limit"]["minimum"], 1);
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["required"], serde_json::json!(["path"]));
+    }
+
+    #[test]
+    fn sanitize_leaves_a_map_schema_open() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert_eq!(schema["additionalProperties"]["type"], "string");
+    }
+
+    #[test]
+    fn sanitize_recurses_into_definitions() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": { "op": { "$ref": "#/$defs/Op" } },
+            "$defs": { "Op": { "title": "Op", "enum": ["a", "b"] } },
+        });
+
+        sanitize_schema(&mut schema);
+
+        assert!(schema["$defs"]["Op"].get("title").is_none());
+        assert_eq!(schema["$defs"]["Op"]["enum"], serde_json::json!(["a", "b"]));
     }
 }

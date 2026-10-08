@@ -38,6 +38,10 @@ struct Preset {
     base_url: &'static str,
     api_key_env: Option<&'static str>,
     headers: &'static [(&'static str, &'static str)],
+    /// A backend running on this machine. Local servers commonly omit usage,
+    /// reject unknown request fields and are slow to prefill, so the generated
+    /// config states those assumptions instead of leaving them to a 400.
+    local: bool,
 }
 
 /// Backends offered by `minion init`.
@@ -52,6 +56,7 @@ const PRESETS: &[Preset] = &[
         base_url: "https://api.openai.com/v1",
         api_key_env: Some("OPENAI_API_KEY"),
         headers: &[],
+        local: false,
     },
     Preset {
         name: "openrouter",
@@ -59,6 +64,7 @@ const PRESETS: &[Preset] = &[
         base_url: "https://openrouter.ai/api/v1",
         api_key_env: Some("OPENROUTER_API_KEY"),
         headers: &[],
+        local: false,
     },
     Preset {
         name: "opencode-go",
@@ -66,6 +72,7 @@ const PRESETS: &[Preset] = &[
         base_url: "https://opencode.ai/zen/go/v1",
         api_key_env: Some("OPENCODE_API_KEY"),
         headers: &[("x-opencode-session", "${session}")],
+        local: false,
     },
     Preset {
         name: "opencode-zen",
@@ -73,6 +80,7 @@ const PRESETS: &[Preset] = &[
         base_url: "https://opencode.ai/zen/v1",
         api_key_env: Some("OPENCODE_API_KEY"),
         headers: &[("x-opencode-session", "${session}")],
+        local: false,
     },
     Preset {
         name: "ollama",
@@ -80,6 +88,7 @@ const PRESETS: &[Preset] = &[
         base_url: "http://localhost:11434/v1",
         api_key_env: None,
         headers: &[],
+        local: true,
     },
     Preset {
         name: "vllm",
@@ -87,6 +96,7 @@ const PRESETS: &[Preset] = &[
         base_url: "http://localhost:8000/v1",
         api_key_env: None,
         headers: &[],
+        local: true,
     },
     Preset {
         name: "custom",
@@ -94,6 +104,7 @@ const PRESETS: &[Preset] = &[
         base_url: "",
         api_key_env: None,
         headers: &[],
+        local: false,
     },
 ];
 
@@ -123,6 +134,8 @@ pub struct Plan {
     pub headers: BTreeMap<String, String>,
     /// Workspace root recorded in the config.
     pub workspace_root: String,
+    /// A backend on this machine: emits the local compatibility defaults.
+    pub local: bool,
 }
 
 impl Plan {
@@ -157,6 +170,16 @@ impl Plan {
                 headers.insert(name.clone(), value.clone().into());
             }
             provider.insert("headers".into(), toml::Value::Table(headers));
+        }
+        if self.local {
+            // Local servers usually omit usage and may reject fields they do not
+            // know, and CPU prefill can be slow. State the assumptions rather
+            // than let the first turn discover them as a 400 or a dead stream.
+            provider.insert("supports_usage_in_stream".into(), false.into());
+            provider.insert("stream_idle_timeout_secs".into(), toml::Value::Integer(300));
+            let mut quirks = toml::Table::new();
+            quirks.insert("omit_parallel_tool_calls".into(), true.into());
+            provider.insert("quirks".into(), toml::Value::Table(quirks));
         }
 
         let mut workspace = toml::Table::new();
@@ -368,6 +391,7 @@ async fn build_plan(args: &InitArgs) -> Result<Resolved> {
             api_key_file,
             headers,
             workspace_root,
+            local: preset.map(|preset| preset.local).unwrap_or(false),
         },
         token,
     })
@@ -970,6 +994,7 @@ mod tests {
             api_key_file: None,
             headers: BTreeMap::from([("x-opencode-session".to_string(), "${session}".to_string())]),
             workspace_root: ".".to_string(),
+            local: false,
         }
     }
 
@@ -1014,6 +1039,18 @@ mod tests {
         // Without this, the built-in default (OPENAI_API_KEY) would come back.
         assert_eq!(parsed.provider.api_key_env, "");
         assert!(parsed.api_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_local_backend_records_the_compatibility_defaults() {
+        let mut plan = plan();
+        plan.local = true;
+
+        let parsed: Config = toml::from_str(&plan.to_toml()).unwrap();
+
+        assert!(!parsed.provider.supports_usage_in_stream);
+        assert_eq!(parsed.provider.stream_idle_timeout_secs, 300);
+        assert!(parsed.provider.quirks.omit_parallel_tool_calls);
     }
 
     #[test]

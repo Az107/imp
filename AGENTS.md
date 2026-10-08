@@ -78,6 +78,13 @@ repeat cache, the tool budget, `StopReason::ToolBudget`, `AgentEvent::Notice`),
 numbered rules are appended) and `minion-provider/src/openai.rs` (`to_wire_strict`). See the
 "Small-model loop rules (M10.3)" section below before touching any of it.
 
+**D45 is on branch `small-model-additions`** (cut from `main` after PR #4 merged). It adds `--lean`
+and the loop/provider hardening: `minion-core/src/tokens.rs` (the estimator),
+`minion-core/src/args.rs` (argument repair), `sanitize_schema` in `minion-core/src/provider.rs`,
+the budget/cap/nudge paths in `minion-core/src/agent.rs`, and the wire changes in
+`minion-provider/src/openai.rs` (`stream_idle_timeout_secs`, `extra_body`, quirks, non-streaming).
+See the D45 bullets in "Small-model loop rules" before changing any of it.
+
 ## Commands
 
 ```sh
@@ -317,6 +324,33 @@ behaviour is `StopReason::ToolBudget`, `AgentEvent::Notice`, and the per-turn re
   form still 400s on a compliant provider, and `strict` must sit *inside* the `function` object.
 - **The small-model rules are appended, so a test asserts the prompt `ends_with` them.** If you move
   them earlier "for emphasis", that test is the one telling you a resumed prompt's tail changed.
+
+**D45 additions.** `--lean` fills a profile over the knobs above; the loop gained a token budget, a
+tool-result cap, argument repair, one bounded nudge and provider wire compatibility. Traps:
+
+- **`--lean` is a global flag, not a config layer.** It is applied in `main.rs` after the file and the
+  other flags, and `Config::apply_lean_profile` fills each key *only where it is still at its default*
+  (an explicit `context_tokens`/`max_tokens`/idle timeout is kept). Do not reintroduce a TOML base
+  layer; the precedence is "flag beats file", like every other global.
+- **The token budget is enforced inside `Agent::run`, before every provider call.** `trim_to_budget`
+  drops whole oldest turns and lands the cut on a `user` boundary — the same invariant as
+  `apply_history_window`: never an assistant `tool_calls` without its results. A load-time-only trim
+  cannot see the tool results that accumulate mid-turn. If the system prompt plus schemas alone exceed
+  the budget, the turn fails with an explanation instead of sending a request that will be rejected.
+  `minion_core::tokens` is a heuristic and must stay dependency-free (no tokenizer in `minion-core`).
+- **`repair_arguments` runs only after a normal parse fails.** `minion_core::args::repair_json` strips
+  fences and trailing commas and must return `None` when nothing changed, so the original parse error
+  survives. Never pre-emptively rewrite well-formed JSON.
+- **`nudge_on_empty` fabricates exactly one turn** — one per user turn, subject to `max_iterations`,
+  inserted as a marked `user` message. It is the only place the loop speaks on the user's behalf.
+- **`sanitize_schema` is lossless for tool calling.** It removes `$schema`/`title`/`format`, collapses
+  `["T","null"]` to `T` and closes an object, keeping `description`/`enum`/`required`/bounds. Applied
+  in `OpenAiProvider::body`, gated by `provider.quirks.sanitize_schemas`.
+- **`[provider.extra_body]` cannot shadow a core request key** (`model`, `messages`, `stream`,
+  `tools`, `tool_choice`, `stream_options`); `Config::validate` rejects a collision. Sampling only.
+- **A non-conforming stream is tolerated, an empty one is not.** An object-shaped `arguments`, or one
+  unparseable frame, must not end the turn; a stream that yields no events at all must be an error.
+  The idle timeout is configurable (`provider.stream_idle_timeout_secs`) because local prefill is slow.
 
 ## Cron rules (M4)
 

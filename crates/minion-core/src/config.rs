@@ -18,6 +18,30 @@ use crate::error::{Error, Result};
 /// Application directory name used for config, state, and logs.
 const APP: &str = "minion";
 
+/// Request-body keys `[provider.extra_body]` may not override.
+///
+/// These are built by the agent loop or the provider client; letting a config
+/// shadow one would change the request's meaning rather than its sampling.
+const PROTECTED_BODY_KEYS: &[&str] = &[
+    "model",
+    "messages",
+    "stream",
+    "tools",
+    "tool_choice",
+    "stream_options",
+];
+
+/// The values `--lean` fills in when the user has not chosen their own.
+///
+/// A CLI convenience, not a config layer: the flag overrides the file, exactly
+/// as every other global flag does. It is the small-model profile from
+/// SDD D45 in one switch, and each value stays independently settable.
+const LEAN_CONTEXT_TOKENS: usize = 8192;
+const LEAN_TOOL_RESULT_CHARS: usize = 6000;
+const LEAN_MAX_TOKENS: u32 = 1024;
+const LEAN_MAX_TOOL_CALLS: u32 = 12;
+const LEAN_STREAM_IDLE_SECS: u64 = 300;
+
 /// Fully resolved configuration for one run.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -83,6 +107,14 @@ pub struct ProviderConfig {
     pub supports_usage_in_stream: bool,
     /// Whether to request multiple tool calls per assistant turn.
     pub parallel_tool_calls: bool,
+    /// Idle budget between stream chunks. Slow local prefill can exceed the old
+    /// hardcoded 60s before the first token, so it is configurable.
+    pub stream_idle_timeout_secs: u64,
+    /// Extra keys merged into the request body, for backend-specific sampling
+    /// (`top_p`, `repeat_penalty`, …). Core keys cannot be overridden.
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
+    /// Backend compatibility switches.
+    pub quirks: ProviderQuirks,
     /// Ask the backend to constrain tool arguments to their JSON schema.
     ///
     /// A provider quirk, off by default. When the backend understands it
@@ -117,8 +149,37 @@ impl Default for ProviderConfig {
             max_retries: 3,
             supports_usage_in_stream: true,
             parallel_tool_calls: true,
+            stream_idle_timeout_secs: 120,
+            extra_body: serde_json::Map::new(),
+            quirks: ProviderQuirks::default(),
             strict_tool_arguments: false,
             headers: BTreeMap::new(),
+        }
+    }
+}
+
+/// Compatibility switches for strict or non-conforming backends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderQuirks {
+    /// Strip non-essential schema keywords and collapse nullable unions.
+    pub sanitize_schemas: bool,
+    /// Omit `parallel_tool_calls` even when it is set.
+    pub omit_parallel_tool_calls: bool,
+    /// Omit `tool_choice` entirely.
+    pub omit_tool_choice: bool,
+    /// Serialize `"content": null` on assistant tool-call messages instead of
+    /// omitting the field, for templates that require it.
+    pub empty_assistant_content: bool,
+}
+
+impl Default for ProviderQuirks {
+    fn default() -> Self {
+        Self {
+            sanitize_schemas: true,
+            omit_parallel_tool_calls: false,
+            omit_tool_choice: false,
+            empty_assistant_content: false,
         }
     }
 }
@@ -149,6 +210,21 @@ pub struct AgentSettings {
     pub history_window: usize,
     /// Summarize dropped history instead of discarding it silently.
     pub summarize_on_truncate: bool,
+    /// Token budget for the whole request. `None` disables token trimming.
+    ///
+    /// Covers the system prompt, history and reserved room for the tool
+    /// schemas. This is what keeps a small-context model from overflowing.
+    pub context_tokens: Option<usize>,
+    /// Largest number of characters of any one tool result sent to the model.
+    ///
+    /// `None` leaves results uncapped.
+    pub tool_result_chars: Option<usize>,
+    /// Upper bound on tokens generated per provider response. `None` sends none.
+    pub max_tokens: Option<u32>,
+    /// Give an empty model reply one bounded second chance.
+    pub nudge_on_empty: bool,
+    /// Repair fenced or trailing-comma tool arguments before giving up.
+    pub repair_arguments: bool,
 }
 
 impl Default for AgentSettings {
@@ -161,6 +237,11 @@ impl Default for AgentSettings {
             max_tokens_per_turn: 200_000,
             history_window: 40,
             summarize_on_truncate: true,
+            context_tokens: None,
+            tool_result_chars: None,
+            max_tokens: None,
+            nudge_on_empty: false,
+            repair_arguments: true,
         }
     }
 }
@@ -941,6 +1022,44 @@ impl Config {
         }
     }
 
+    /// Fill the small-model profile in where the user has not chosen a value.
+    ///
+    /// Called by `--lean`. It never clears a setting the user made: an explicit
+    /// `context_tokens`, `max_tokens`, `stream_idle_timeout_secs` and the quirks
+    /// are left as they are, and `max_iterations`/`max_tool_calls_per_turn` are
+    /// only lowered when they are still at their "unset" defaults. The flag is
+    /// applied *after* the config file, so it wins exactly as a global flag
+    /// does — this is not a second config layer (D45).
+    pub fn apply_lean_profile(&mut self) {
+        self.agent.small_model = true;
+        self.agent.nudge_on_empty = true;
+        self.agent.repair_arguments = true;
+        self.agent.context_tokens = self.agent.context_tokens.or(Some(LEAN_CONTEXT_TOKENS));
+        self.agent.tool_result_chars = self
+            .agent
+            .tool_result_chars
+            .or(Some(LEAN_TOOL_RESULT_CHARS));
+        self.agent.max_tokens = self.agent.max_tokens.or(Some(LEAN_MAX_TOKENS));
+        if self.agent.max_tool_calls_per_turn == 0 {
+            self.agent.max_tool_calls_per_turn = LEAN_MAX_TOOL_CALLS;
+        }
+        // `supports_usage_in_stream` defaults on and a local server usually
+        // ignores `stream_options`; only flip it from the built-in default.
+        if self.provider.supports_usage_in_stream
+            && self.provider.stream_idle_timeout_secs
+                == ProviderConfig::default().stream_idle_timeout_secs
+        {
+            self.provider.supports_usage_in_stream = false;
+        }
+        if self.provider.stream_idle_timeout_secs
+            == ProviderConfig::default().stream_idle_timeout_secs
+        {
+            self.provider.stream_idle_timeout_secs = LEAN_STREAM_IDLE_SECS;
+        }
+        self.provider.quirks.sanitize_schemas = true;
+        self.provider.quirks.omit_parallel_tool_calls = true;
+    }
+
     /// Reject configurations that cannot work, before any network call.
     fn validate(&self) -> Result<()> {
         if self.provider.base_url.trim().is_empty() {
@@ -992,6 +1111,37 @@ impl Config {
             return Err(Error::Config(
                 "guard.timeout_secs must be at least 1".to_string(),
             ));
+        }
+        if self.provider.stream_idle_timeout_secs == 0 {
+            return Err(Error::Config(
+                "provider.stream_idle_timeout_secs must be at least 1".to_string(),
+            ));
+        }
+        // Zero is not "unlimited" for these: an absent budget is spelled by
+        // omitting the key, so a zero is a mistake worth surfacing.
+        for (name, value) in [
+            ("agent.context_tokens", self.agent.context_tokens),
+            ("agent.tool_result_chars", self.agent.tool_result_chars),
+        ] {
+            if value == Some(0) {
+                return Err(Error::Config(format!("{name} must be at least 1 when set")));
+            }
+        }
+        if self.agent.max_tokens == Some(0) {
+            return Err(Error::Config(
+                "agent.max_tokens must be at least 1 when set".to_string(),
+            ));
+        }
+        // `extra_body` exists for backend-specific sampling. Letting it shadow a
+        // core request field would silently break the agent loop, so a collision
+        // is rejected rather than merged.
+        for key in self.provider.extra_body.keys() {
+            if PROTECTED_BODY_KEYS.contains(&key.as_str()) {
+                return Err(Error::Config(format!(
+                    "provider.extra_body may not set `{key}`; it is part of the request the \
+                     agent loop builds"
+                )));
+            }
         }
         // Thresholds are probabilities. A NaN fails both range checks, which is
         // the point: an unset threshold must not silently become a comparison
@@ -2209,5 +2359,84 @@ mod tests {
             message.contains("minion init"),
             "message should say how to fix it: {message}"
         );
+    }
+
+    #[test]
+    fn the_lean_flag_fills_the_small_model_defaults() {
+        let mut config = Config::default();
+
+        config.apply_lean_profile();
+
+        assert!(config.agent.small_model);
+        assert_eq!(config.agent.context_tokens, Some(8192));
+        assert_eq!(config.agent.tool_result_chars, Some(6000));
+        assert_eq!(config.agent.max_tokens, Some(1024));
+        assert_eq!(config.agent.max_tool_calls_per_turn, 12);
+        assert!(config.agent.nudge_on_empty);
+        assert_eq!(config.provider.stream_idle_timeout_secs, 300);
+        assert!(!config.provider.supports_usage_in_stream);
+        assert!(config.provider.quirks.omit_parallel_tool_calls);
+    }
+
+    #[test]
+    fn the_lean_flag_keeps_an_explicit_budget() {
+        let mut config = Config::default();
+        config.agent.context_tokens = Some(4096);
+        config.agent.max_tokens = Some(256);
+
+        config.apply_lean_profile();
+
+        assert_eq!(
+            config.agent.context_tokens,
+            Some(4096),
+            "an explicit key wins"
+        );
+        assert_eq!(config.agent.max_tokens, Some(256));
+        // A key the user did not set still comes from the profile.
+        assert_eq!(config.agent.tool_result_chars, Some(6000));
+    }
+
+    #[test]
+    fn extra_body_may_not_shadow_a_core_request_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[provider.extra_body]\nmodel = \"hijacked\"\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
+        assert!(err.to_string().contains("model"), "was: {err}");
+    }
+
+    #[test]
+    fn extra_body_carries_sampling_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[provider.extra_body]\ntop_p = 0.9\nrepeat_penalty = 1.05\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.provider.extra_body["top_p"], serde_json::json!(0.9));
+        assert_eq!(
+            config.provider.extra_body["repeat_penalty"],
+            serde_json::json!(1.05)
+        );
+    }
+
+    #[test]
+    fn a_zero_context_budget_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("minion.toml"),
+            "[agent]\ncontext_tokens = 0\n",
+        );
+
+        let err = Config::load_with(None, None, dir.path()).unwrap_err();
+
+        assert!(matches!(err, Error::Config(_)), "unexpected error: {err}");
     }
 }

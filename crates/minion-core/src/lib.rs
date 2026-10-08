@@ -4,6 +4,7 @@
 //! that the loop can be exercised against a scripted mock provider.
 
 pub mod agent;
+pub mod args;
 pub mod classify;
 pub mod clock;
 pub mod config;
@@ -18,15 +19,17 @@ pub mod policy;
 pub mod provider;
 pub mod session;
 pub mod sha256;
+pub mod tokens;
 pub mod tool;
 pub mod update;
 
-pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome};
+pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome, trim_to_budget};
+pub use args::{parse_tool_arguments, repair_json};
 pub use classify::classify_command;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
     Config, Credentials, CronConfig, GuardConfig, HttpFetchConfig, McpClientConfig, McpConfig,
-    McpServerConfig, MissedRunPolicy, ToolsConfig, UpdateConfig,
+    McpServerConfig, MissedRunPolicy, ProviderQuirks, ToolsConfig, UpdateConfig,
 };
 pub use error::{Error, Result};
 pub use fs::write_private_file;
@@ -41,8 +44,11 @@ pub use policy::{
     ApprovalChoice, ApprovalRequest, ApprovalStore, ApprovalUi, PolicyEngine, RecordingGate,
     ToolGate, ToolPolicy, subject_for,
 };
-pub use provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
+pub use provider::{
+    ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage, sanitize_schema,
+};
 pub use session::new_session_id;
+pub use tokens::{estimate, estimate_message, estimate_messages, estimate_tools};
 pub use tool::{Risk, Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSelection};
 pub use update::{
     Asset, Decision, Download, InstallReport, ReleaseInfo, UpdateSource, Updater, VersionOrder,

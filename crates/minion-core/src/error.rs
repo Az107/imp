@@ -38,8 +38,16 @@ pub enum Error {
     },
 
     /// The model requested a tool that is not registered.
-    #[error("unknown tool `{0}`")]
-    UnknownTool(String),
+    ///
+    /// The names that *would* have resolved are carried so a small model that
+    /// hallucinated an adjacent name can correct itself on the next iteration.
+    #[error("unknown tool `{name}`; available: {available:?}")]
+    UnknownTool {
+        /// The name the model asked for.
+        name: String,
+        /// Tool names that would have resolved.
+        available: Vec<String>,
+    },
 
     /// Tool arguments failed validation.
     #[error("invalid arguments for tool `{tool}`: {message}")]

@@ -41,6 +41,13 @@ pub struct Cli {
     #[arg(long, global = true, conflicts_with = "yes")]
     pub deny: bool,
 
+    /// Small/local-model profile in one switch: `agent.small_model`, a token
+    /// budget, capped tool results and replies, argument repair, one bounded
+    /// nudge, a longer stream timeout and schema/streaming compatibility
+    /// quirks. Fills each setting only where it is still at its default.
+    #[arg(long, global = true)]
+    pub lean: bool,
+
     /// Emit newline-delimited JSON events instead of prose.
     #[arg(long, global = true)]
     pub json: bool,

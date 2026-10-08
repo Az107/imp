@@ -82,6 +82,12 @@ async fn execute(cli: Cli) -> Result<ExitCode> {
         config.agent.max_iterations = iterations;
     }
 
+    // The small-model profile is a global flag, so it is applied here — after
+    // the file and the other flags, exactly as they are (D45).
+    if cli.lean {
+        config.apply_lean_profile();
+    }
+
     // The redaction layer is built from the *resolved* configuration, so the
     // key the process will actually use is the one masked in the logs (NFR-9).
     let secrets = logging::Secrets::from_config(&config).into_shared();
@@ -243,7 +249,13 @@ mod tests {
             3
         );
         assert_eq!(exit_code(&Error::Denied("x".into())), 4);
-        assert_eq!(exit_code(&Error::UnknownTool("x".into())), 5);
+        assert_eq!(
+            exit_code(&Error::UnknownTool {
+                name: "x".into(),
+                available: Vec::new()
+            }),
+            5
+        );
     }
 
     #[test]

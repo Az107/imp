@@ -8,10 +8,12 @@ use futures::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
+use crate::args::parse_tool_arguments;
 use crate::error::{Error, Result};
-use crate::message::{FunctionCall, Message, ToolCall};
+use crate::message::{FunctionCall, Message, Role, ToolCall};
 use crate::policy::ToolGate;
-use crate::provider::{ChatEvent, ChatRequest, FinishReason, Provider, Usage};
+use crate::provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
+use crate::tokens::{estimate_message, estimate_messages, estimate_tools};
 use crate::tool::{ToolCtx, ToolOutput, ToolRegistry};
 
 /// Why a turn ended.
@@ -90,7 +92,7 @@ pub enum AgentEvent {
 }
 
 /// Immutable settings for a single [`Agent`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentOptions {
     /// Model identifier sent to the provider.
     pub model: String,
@@ -106,6 +108,18 @@ pub struct AgentOptions {
     pub include_usage: bool,
     /// Maximum tool calls the model may make within one turn. `0` is unlimited.
     pub max_tool_calls_per_turn: u32,
+    /// Token budget for the whole request. `None` disables trimming.
+    ///
+    /// Covers the system prompt, history and reserved room for the tool
+    /// schemas. Enforced before every provider call, because tool results
+    /// accumulate between iterations.
+    pub context_tokens: Option<usize>,
+    /// Largest number of characters of any one tool result sent to the model.
+    pub tool_result_chars: Option<usize>,
+    /// Ask an empty reply for one more chance instead of ending the turn.
+    pub nudge_on_empty: bool,
+    /// Repair fenced or trailing-comma tool arguments before giving up.
+    pub repair_arguments: bool,
     /// Boundary for every path-taking tool.
     pub workspace_root: PathBuf,
 }
@@ -180,6 +194,8 @@ impl Agent {
         let mut answered: HashMap<String, (bool, String)> = HashMap::new();
         let mut tool_calls_used: u32 = 0;
         let budget = self.options.max_tool_calls_per_turn;
+        // Whether the one bounded nudge for an empty reply has been spent.
+        let mut nudged = false;
 
         // One turn id per `run`, so every audit row this turn writes can be
         // grouped back to it. Generated before the loop so a cancelled turn
@@ -198,10 +214,20 @@ impl Agent {
             }
             iterations += 1;
 
+            // The catalogue is read live, so the schemas are fetched once per
+            // iteration and reused for both budgeting and the request.
+            let schemas = self.tools.schemas();
+            if let Some(context) = self.options.context_tokens
+                && let Some(message) = self.fit_context(history, &schemas, context)
+            {
+                let _ = sink.send(AgentEvent::Failed(message));
+                return outcome(last_text, StopReason::ProviderError, usage, iterations);
+            }
+
             let request = ChatRequest {
                 model: self.options.model.clone(),
                 messages: history.clone(),
-                tools: self.tools.schemas(),
+                tools: schemas,
                 temperature: self.options.temperature,
                 max_tokens: self.options.max_tokens,
                 parallel_tool_calls: self.options.parallel_tool_calls,
@@ -253,6 +279,19 @@ impl Agent {
             }
 
             if calls.is_empty() {
+                if finish == Some(FinishReason::Length) {
+                    let _ = sink.send(AgentEvent::Notice(TRUNCATED_REPLY.to_string()));
+                }
+                // A reply with neither text nor a tool call is a stall. Give a
+                // weak model one bounded second chance before ending the turn.
+                if text.is_empty() && self.options.nudge_on_empty && !nudged {
+                    nudged = true;
+                    let _ = sink.send(AgentEvent::Notice(
+                        "the model returned nothing; asking once more".to_string(),
+                    ));
+                    history.push(Message::user(NUDGE));
+                    continue;
+                }
                 if !text.is_empty() {
                     last_text = Some(text.clone());
                 }
@@ -275,7 +314,10 @@ impl Agent {
                 continue;
             }
 
-            let tool_calls: Vec<ToolCall> = calls.into_values().map(PartialCall::finish).collect();
+            let tool_calls: Vec<ToolCall> = calls
+                .into_iter()
+                .map(|(index, call)| call.finish(index))
+                .collect();
             let content = (!text.is_empty()).then(|| text.clone());
             if !text.is_empty() {
                 last_text = Some(text.clone());
@@ -380,18 +422,19 @@ impl Agent {
         arguments: &str,
         cancel: CancellationToken,
     ) -> Result<ToolOutput> {
-        let tool = self
-            .tools
-            .get(name)
-            .ok_or_else(|| Error::UnknownTool(name.to_string()))?;
-        let args: serde_json::Value = if arguments.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(arguments).map_err(|err| Error::ToolArgs {
-                tool: name.to_string(),
-                message: err.to_string(),
-            })?
+        let Some(tool) = self.tools.get(name) else {
+            let available = self
+                .tools
+                .risks()
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .collect();
+            return Err(Error::UnknownTool {
+                name: name.to_string(),
+                available,
+            });
         };
+        let args = parse_tool_arguments(name, arguments, self.options.repair_arguments)?;
 
         // Ask before running, and before spending the timeout budget. A refusal
         // surfaces to the model as a tool error it can read and react to.
@@ -408,7 +451,13 @@ impl Agent {
         let budget = tool.timeout();
         let started = std::time::Instant::now();
         let result = match tokio::time::timeout(budget, tool.invoke(ctx, args)).await {
-            Ok(result) => result,
+            Ok(Ok(mut output)) => {
+                if let Some(cap) = self.options.tool_result_chars {
+                    cap_output(&mut output, cap);
+                }
+                Ok(output)
+            }
+            Ok(Err(err)) => Err(err),
             Err(_) => Err(Error::Tool {
                 tool: name.to_string(),
                 message: format!("timed out after {budget:?}"),
@@ -422,6 +471,79 @@ impl Agent {
         }
         result
     }
+
+    /// Keep `history` within `budget` tokens, reserving room for the schemas.
+    ///
+    /// Returns a message when the system prompt and the tool schemas alone
+    /// already exceed the budget: trimming cannot help there, so the turn is
+    /// failed with an actionable explanation rather than sent and rejected.
+    fn fit_context(
+        &self,
+        history: &mut Vec<Message>,
+        schemas: &[ToolSchema],
+        budget: usize,
+    ) -> Option<String> {
+        let tools = estimate_tools(schemas);
+        let system = history.first().map(estimate_message).unwrap_or(0);
+        if tools + system > budget {
+            return Some(format!(
+                "context budget of {budget} tokens is smaller than the system prompt ({system}) \
+                 plus the tool schemas ({tools}); raise agent.context_tokens"
+            ));
+        }
+        trim_to_budget(history, budget - tools);
+        None
+    }
+}
+
+/// The one-time correction sent when a model returns an empty turn.
+const NUDGE: &str = "[minion: your previous reply was empty. Either call one of the available \
+                      tools or answer the user in plain text.]";
+
+/// Shown when a text-only reply was cut off by the token limit.
+const TRUNCATED_REPLY: &str = "the model hit its output limit; the reply may be truncated";
+
+/// Drop the oldest whole turns until `history` fits `budget` tokens.
+///
+/// Index 0 (the system prompt) is always kept, and the cut lands on a `user`
+/// message so an assistant `tool_calls` message is never separated from the
+/// results that answer it. The same invariant as the message-count window, but
+/// measured in tokens, which is what a small context actually cares about.
+pub fn trim_to_budget(history: &mut Vec<Message>, budget: usize) {
+    if history.len() <= 1 {
+        return;
+    }
+    loop {
+        if estimate_messages(history) <= budget {
+            return;
+        }
+        // The next `user` message at or beyond index 2 begins the second turn,
+        // so messages [1..cut) are the oldest complete turn.
+        let next_user = history[1..]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, message)| message.role == Role::User)
+            .map(|(offset, _)| offset + 1);
+        match next_user {
+            Some(cut) => {
+                history.drain(1..cut);
+            }
+            // Only the newest turn is left; trimming further would orphan it.
+            None => return,
+        }
+    }
+}
+
+/// Clamp a tool result to `cap` characters, noting what was dropped.
+fn cap_output(output: &mut ToolOutput, cap: usize) {
+    let chars = output.content.chars().count();
+    if chars <= cap {
+        return;
+    }
+    let kept: String = output.content.chars().take(cap).collect();
+    output.content = format!("{kept}\n… [truncated, {} characters omitted]", chars - cap);
+    output.truncated = true;
 }
 
 fn outcome(text: Option<String>, stop: StopReason, usage: Usage, iterations: u32) -> TurnOutcome {
@@ -442,9 +564,9 @@ struct PartialCall {
 }
 
 impl PartialCall {
-    fn finish(self) -> ToolCall {
+    fn finish(self, index: usize) -> ToolCall {
         ToolCall {
-            id: self.id.unwrap_or_else(|| "call_unknown".to_string()),
+            id: self.id.unwrap_or_else(|| format!("call_{index}")),
             kind: "function".to_string(),
             function: FunctionCall {
                 name: self.name.unwrap_or_default(),
@@ -634,6 +756,7 @@ mod tests {
                 include_usage: false,
                 max_tool_calls_per_turn: 0,
                 workspace_root: workspace.to_path_buf(),
+                ..AgentOptions::default()
             },
         )
     }
@@ -717,6 +840,7 @@ mod tests {
                 include_usage: false,
                 max_tool_calls_per_turn: budget,
                 workspace_root: workspace.to_path_buf(),
+                ..AgentOptions::default()
             },
         )
     }
@@ -971,6 +1095,7 @@ mod tests {
                 include_usage: false,
                 max_tool_calls_per_turn: 0,
                 workspace_root: dir.path().to_path_buf(),
+                ..AgentOptions::default()
             },
         );
         let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1259,5 +1384,183 @@ mod tests {
             call_key("edit_file", "{\"a\":1}"),
             "the tool name is part of the key"
         );
+    }
+
+    #[test]
+    fn trim_to_budget_keeps_the_system_prompt_and_newest_turn() {
+        let mut history = vec![
+            Message::system("sys"),
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+
+        trim_to_budget(&mut history, 1);
+
+        assert_eq!(history[0].content.as_deref(), Some("sys"));
+        assert_eq!(
+            history.len(),
+            3,
+            "only the system prompt and newest turn survive"
+        );
+        assert_eq!(history[1].content.as_deref(), Some("two"));
+        assert_eq!(history[2].content.as_deref(), Some("a2"));
+    }
+
+    #[tokio::test]
+    async fn missing_tool_ids_get_unique_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            Script::Events(vec![
+                ChatEvent::ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: Some("echo".to_string()),
+                    arguments: "{\"text\":\"a\"}".to_string(),
+                },
+                ChatEvent::ToolCallDelta {
+                    index: 1,
+                    id: None,
+                    name: Some("echo".to_string()),
+                    arguments: "{\"text\":\"b\"}".to_string(),
+                },
+                done(FinishReason::ToolCalls),
+            ]),
+            Script::Events(vec![done(FinishReason::Stop)]),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Echo);
+        let agent = agent(provider, tools, dir.path());
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut history = vec![Message::user("go")];
+
+        agent
+            .run(&mut history, &sink, CancellationToken::new())
+            .await;
+
+        let ids: Vec<String> = history
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "fallback ids must not collide");
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_retried_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(MockProvider::new(vec![
+            Script::Events(vec![done(FinishReason::Stop)]),
+            Script::Events(vec![
+                ChatEvent::TextDelta("late".to_string()),
+                done(FinishReason::Stop),
+            ]),
+        ]));
+        let options = AgentOptions {
+            model: "mock".to_string(),
+            max_iterations: 4,
+            nudge_on_empty: true,
+            workspace_root: dir.path().to_path_buf(),
+            ..AgentOptions::default()
+        };
+        let agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), options);
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut history = vec![Message::user("hi")];
+
+        let outcome = agent
+            .run(&mut history, &sink, CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.text.as_deref(), Some("late"));
+        assert_eq!(provider.request_count(), 2, "the nudge costs one retry");
+    }
+
+    #[tokio::test]
+    async fn long_tool_results_are_capped_for_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = "x".repeat(200);
+        let provider = MockProvider::new(vec![
+            Script::Events(vec![
+                tool_call("echo", &format!("{{\"text\":\"{long}\"}}")),
+                done(FinishReason::ToolCalls),
+            ]),
+            Script::Events(vec![done(FinishReason::Stop)]),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Echo);
+        let options = AgentOptions {
+            model: "mock".to_string(),
+            max_iterations: 4,
+            tool_result_chars: Some(20),
+            workspace_root: dir.path().to_path_buf(),
+            ..AgentOptions::default()
+        };
+        let agent = Agent::new(Arc::new(provider), Arc::new(tools), options);
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut history = vec![Message::user("go")];
+
+        agent
+            .run(&mut history, &sink, CancellationToken::new())
+            .await;
+
+        let result = history[2].content.clone().unwrap_or_default();
+        assert!(result.contains("truncated"), "unexpected result: {result}");
+        assert!(result.chars().count() < 200);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_but_repairable_call_is_salvaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            Script::Events(vec![
+                tool_call("echo", "{\"text\":\"pong\",}"),
+                done(FinishReason::ToolCalls),
+            ]),
+            Script::Events(vec![done(FinishReason::Stop)]),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Echo);
+        let options = AgentOptions {
+            model: "mock".to_string(),
+            max_iterations: 4,
+            repair_arguments: true,
+            workspace_root: dir.path().to_path_buf(),
+            ..AgentOptions::default()
+        };
+        let agent = Agent::new(Arc::new(provider), Arc::new(tools), options);
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut history = vec![Message::user("go")];
+
+        agent
+            .run(&mut history, &sink, CancellationToken::new())
+            .await;
+
+        assert_eq!(history[2].content.as_deref(), Some("pong"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_lists_the_alternatives() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider::new(vec![
+            Script::Events(vec![
+                tool_call("ecoh", "{\"text\":\"x\"}"),
+                done(FinishReason::ToolCalls),
+            ]),
+            Script::Events(vec![done(FinishReason::Stop)]),
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Echo);
+        let agent = agent(provider, tools, dir.path());
+        let (sink, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut history = vec![Message::user("go")];
+
+        agent
+            .run(&mut history, &sink, CancellationToken::new())
+            .await;
+
+        let result = history[2].content.clone().unwrap_or_default();
+        assert!(result.contains("echo"), "unexpected result: {result}");
     }
 }

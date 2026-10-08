@@ -133,6 +133,7 @@ fn agent(provider: Arc<ScriptedProvider>, store: Arc<Store>, root: &std::path::P
             include_usage: false,
             max_tool_calls_per_turn: 0,
             workspace_root: root.to_path_buf(),
+            ..AgentOptions::default()
         },
     )
 }

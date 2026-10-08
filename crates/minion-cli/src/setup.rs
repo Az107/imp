@@ -74,6 +74,13 @@ struct ProviderSpec {
     usage_in_stream: bool,
     strict_tool_arguments: bool,
     headers: Vec<(String, String)>,
+    stream: bool,
+    stream_idle_timeout: Duration,
+    sanitize_schemas: bool,
+    omit_parallel_tool_calls: bool,
+    omit_tool_choice: bool,
+    empty_assistant_content: bool,
+    extra_body: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ProviderSpec {
@@ -85,6 +92,13 @@ impl ProviderSpec {
             .with_strict_tool_arguments(self.strict_tool_arguments)
             .with_headers(self.headers.clone())
             .with_session_id(session_id.to_string())
+            .with_stream(self.stream)
+            .with_stream_idle_timeout(self.stream_idle_timeout)
+            .with_sanitize_schemas(self.sanitize_schemas)
+            .with_omit_parallel_tool_calls(self.omit_parallel_tool_calls)
+            .with_omit_tool_choice(self.omit_tool_choice)
+            .with_empty_assistant_content(self.empty_assistant_content)
+            .with_extra_body(self.extra_body.clone())
     }
 }
 
@@ -197,6 +211,13 @@ pub async fn build(
         usage_in_stream: config.provider.supports_usage_in_stream,
         strict_tool_arguments: config.provider.strict_tool_arguments,
         headers: config.request_headers(),
+        stream: config.provider.stream,
+        stream_idle_timeout: Duration::from_secs(config.provider.stream_idle_timeout_secs),
+        sanitize_schemas: config.provider.quirks.sanitize_schemas,
+        omit_parallel_tool_calls: config.provider.quirks.omit_parallel_tool_calls,
+        omit_tool_choice: config.provider.quirks.omit_tool_choice,
+        empty_assistant_content: config.provider.quirks.empty_assistant_content,
+        extra_body: config.provider.extra_body.clone(),
     };
 
     let workspace_root = config.workspace_root(cwd)?;
@@ -282,10 +303,14 @@ pub async fn build(
         model: config.provider.model.clone(),
         max_iterations: config.agent.max_iterations,
         temperature: config.provider.temperature,
-        max_tokens: None,
+        max_tokens: config.agent.max_tokens,
         parallel_tool_calls: Some(config.provider.parallel_tool_calls),
         include_usage: config.provider.supports_usage_in_stream,
         max_tool_calls_per_turn: config.agent.max_tool_calls_per_turn,
+        context_tokens: config.agent.context_tokens,
+        tool_result_chars: config.agent.tool_result_chars,
+        nudge_on_empty: config.agent.nudge_on_empty,
+        repair_arguments: config.agent.repair_arguments,
         workspace_root: workspace_root.clone(),
     };
 
@@ -573,10 +598,14 @@ impl JobAgentRunner {
             model: self.config.provider.model.clone(),
             max_iterations: self.config.agent.max_iterations,
             temperature: self.config.provider.temperature,
-            max_tokens: None,
+            max_tokens: self.config.agent.max_tokens,
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
             max_tool_calls_per_turn: self.config.agent.max_tool_calls_per_turn,
+            context_tokens: self.config.agent.context_tokens,
+            tool_result_chars: self.config.agent.tool_result_chars,
+            nudge_on_empty: self.config.agent.nudge_on_empty,
+            repair_arguments: self.config.agent.repair_arguments,
             workspace_root: workspace,
         };
         let agent = Agent::new(
