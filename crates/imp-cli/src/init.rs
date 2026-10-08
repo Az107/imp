@@ -816,7 +816,6 @@ mod termios {
     /// Termios handle type, aliased so the struct field above reads the same on
     /// every platform.
     pub type Termios = libc::termios;
-
     /// Turn off terminal echo, returning the previous settings.
     pub fn disable_echo() -> Result<Option<Termios>> {
         // SAFETY: `Termios` is a plain C struct with no invalid bit patterns, and
@@ -844,6 +843,15 @@ mod termios {
             }
         }
     }
+}
+
+/// Windows has no terminal echo to suppress, but the field above still names
+/// `termios::Termios`, so the type has to exist there too. It is a unit stub;
+/// [`EchoGuard::disable`](EchoGuard) never captures one.
+#[cfg(not(unix))]
+mod termios {
+    /// A stand-in for the Unix termios handle.
+    pub type Termios = ();
 }
 
 impl Drop for EchoGuard {
