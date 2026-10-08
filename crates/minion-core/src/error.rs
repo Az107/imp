@@ -63,6 +63,12 @@ pub enum Error {
     #[error("denied by policy: {0}")]
     Denied(String),
 
+    /// The operation declined to proceed — a self-update that failed
+    /// verification, a prompt that was cancelled, or anything else that stopped
+    /// on purpose rather than failing. Exit code 4.
+    #[error("refused: {0}")]
+    Refused(String),
+
     /// The turn was cancelled by the user or a shutdown signal.
     #[error("operation cancelled")]
     Cancelled,

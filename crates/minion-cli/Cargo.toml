@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Optional capabilities (§9). Both default on, and `minion --version` reports
+# which were enabled, so a stripped build says so instead of letting an operator
+# discover a missing subcommand by trying it.
+default = ["mcp", "cron"]
+mcp = []
+cron = []
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
@@ -19,8 +27,20 @@ minion-mcp = { version = "0.1.0", path = "../minion-mcp" }
 minion-provider = { version = "0.1.0", path = "../minion-provider" }
 minion-store = { version = "0.1.0", path = "../minion-store" }
 minion-tools = { version = "0.1.0", path = "../minion-tools" }
+minion-update = { version = "0.1.0", path = "../minion-update" }
 pulldown-cmark = "0.13.4"
-rmcp = { version = "3.5.0", features = ["server", "transport-async-rw"] }
+# `server` for the stdio MCP server (M6); `transport-streamable-http-server`
+# adds the Streamable HTTP surface `[mcp.server] transport = "http"` serves
+# (M10.1), which needs an HTTP listener of our own.
+rmcp = { version = "3.5.0", features = [
+    "server",
+    "transport-async-rw",
+    "transport-streamable-http-server",
+] }
+# The HTTP listener for the Streamable HTTP transport. axum is a thin layer over
+# the hyper/tower crates the workspace already builds; `tokio` is the server
+# runtime adapter, and default features are off to keep the surface small.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 rustyline = "18.0.1"
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync", "io-std", "io-util"] }

@@ -45,5 +45,23 @@ expression: catalogue
     "parameters": {
       "type": "object"
     }
+  },
+  {
+    "description": "Stand-in for a minion peer: answers a brief with JSON, like the real server.",
+    "name": "mcp__stub__agent_ask",
+    "parameters": {
+      "properties": {
+        "max_tokens": {
+          "type": "integer"
+        },
+        "prompt": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    }
   }
 ]

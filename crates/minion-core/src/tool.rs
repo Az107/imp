@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
-use crate::provider::ToolSchema;
+use crate::provider::{ToolSchema, Usage};
 
 /// How dangerous a tool is.
 ///
@@ -88,6 +88,33 @@ impl ToolOutput {
     pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = metadata;
         self
+    }
+
+    /// Token usage a tool reports having spent *elsewhere*, or `None`.
+    ///
+    /// A delegating tool (a peer call, M10.2) spends tokens on a backend that is
+    /// not this turn's provider, so the loop cannot see them in the stream. The
+    /// tool puts them in its `metadata` under `usage` —
+    /// `{"prompt_tokens":…, "completion_tokens":…, "total_tokens":…}` — and the
+    /// loop folds them into the turn's usage, which is what `/cost` reads.
+    ///
+    /// Advisory only (R8): a missing, non-object or non-numeric value is
+    /// `None`, never an error, so a tool that forgets to report simply does not
+    /// count.
+    pub fn reported_usage(&self) -> Option<Usage> {
+        let usage = self.metadata.get("usage")?.as_object()?;
+        let field = |name: &str| -> u32 {
+            usage
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .min(u32::MAX as u64) as u32
+        };
+        Some(Usage {
+            prompt_tokens: field("prompt_tokens"),
+            completion_tokens: field("completion_tokens"),
+            total_tokens: field("total_tokens"),
+        })
     }
 }
 
@@ -204,11 +231,49 @@ pub trait ToolCatalog: Send + Sync {
     fn tools(&self) -> Vec<Arc<dyn Tool>>;
 }
 
+/// Which of the offered tools are advertised and resolvable.
+///
+/// This narrows the surface a model is shown. It is deliberately *not* a
+/// permission mechanism: `only` and `hide` change what is offered, never what
+/// the approval gate decides. A hidden tool is also unresolvable by name, so a
+/// model that calls one anyway gets the same "unknown tool" error as any other
+/// name that does not exist — hiding can only ever take a capability away, so
+/// it can never grant one. With 11 built-ins plus an MCP server's worth of
+/// tools, a 2–4B local model chooses badly; this is how an operator trims the
+/// catalogue without touching `[policy]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolSelection {
+    /// When non-empty, only these names are admitted. Empty admits everything.
+    pub only: Vec<String>,
+    /// Names always removed, even if they appear in [`only`](Self::only).
+    pub hide: Vec<String>,
+}
+
+impl ToolSelection {
+    /// Whether `name` survives the filter.
+    ///
+    /// `hide` wins over `only`: a name in both lists is hidden. The negative
+    /// rule taking precedence matches the way deny rules already beat allow
+    /// rules, so a mistake fails closed.
+    pub fn admits(&self, name: &str) -> bool {
+        if self.hide.iter().any(|hidden| hidden == name) {
+            return false;
+        }
+        self.only.is_empty() || self.only.iter().any(|allowed| allowed == name)
+    }
+
+    /// Whether the filter would change anything.
+    pub fn is_unrestricted(&self) -> bool {
+        self.only.is_empty() && self.hide.is_empty()
+    }
+}
+
 /// The set of tools currently offered to the model.
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<Arc<dyn Tool>>,
     catalogs: Vec<Arc<dyn ToolCatalog>>,
+    selection: ToolSelection,
 }
 
 impl ToolRegistry {
@@ -223,6 +288,16 @@ impl ToolRegistry {
         self
     }
 
+    /// Add a tool that is already shared.
+    ///
+    /// The same ordering rule as [`register`](Self::register), for a tool the
+    /// caller keeps a handle on — a peer delegation tool, whose connection the
+    /// session has to close on the way out (M10.2).
+    pub fn register_arc(&mut self, tool: Arc<dyn Tool>) -> &mut Self {
+        self.tools.push(tool);
+        self
+    }
+
     /// Build a registry from an explicit set of tools, in the given order.
     ///
     /// This is how a *subset* of the registered tools is assembled — the MCP
@@ -233,7 +308,24 @@ impl ToolRegistry {
         Self {
             tools,
             catalogs: Vec::new(),
+            selection: ToolSelection::default(),
         }
+    }
+
+    /// Restrict the advertised and resolvable surface.
+    ///
+    /// A hidden tool is absent from [`schemas`](Self::schemas) *and*
+    /// unresolvable by [`get`](Self::get), so a model that names it is answered
+    /// exactly as it would be for a typo. Because the filter only ever removes
+    /// entries, it cannot widen what the gate would allow.
+    pub fn select(&mut self, selection: ToolSelection) -> &mut Self {
+        self.selection = selection;
+        self
+    }
+
+    /// The current selection, for callers that want to report it.
+    pub fn selection(&self) -> &ToolSelection {
+        &self.selection
     }
 
     /// Attach a runtime source of tools, consulted after every registered one.
@@ -242,11 +334,14 @@ impl ToolRegistry {
         self
     }
 
-    /// Every tool, registered ones first, one entry per name.
+    /// Every tool, registered ones first, one entry per name, filtered by the
+    /// current selection.
     ///
     /// This is where "never shadow" is enforced rather than documented: a name
     /// already taken is skipped, so a registered tool always wins and two
-    /// catalogs cannot overwrite each other.
+    /// catalogs cannot overwrite each other. The selection is applied last: a
+    /// hidden name is removed even when a catalog also offers it, so hiding a
+    /// built-in cannot be undone by a server that happens to use the same name.
     fn all(&self) -> Vec<Arc<dyn Tool>> {
         let mut seen: Vec<&'static str> = self.tools.iter().map(|tool| tool.name()).collect();
         let mut all = self.tools.clone();
@@ -259,6 +354,7 @@ impl ToolRegistry {
                 all.push(tool);
             }
         }
+        all.retain(|tool| self.selection.admits(tool.name()));
         all
     }
 
@@ -294,7 +390,7 @@ impl ToolRegistry {
 
     /// Whether no tool is on offer.
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty() && self.catalogs.iter().all(|c| c.tools().is_empty())
+        self.all().is_empty()
     }
 }
 
@@ -434,5 +530,94 @@ mod tests {
         catalog.set(Vec::new());
         assert!(registry.get("mcp__files__read").is_none());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn only_admits_just_its_names() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named {
+            name: "read_file",
+            risk: Risk::ReadOnly,
+        });
+        registry.register(Named {
+            name: "run_command",
+            risk: Risk::Execute,
+        });
+        registry.select(ToolSelection {
+            only: vec!["read_file".to_string()],
+            hide: Vec::new(),
+        });
+
+        assert_eq!(schema_names(&registry), vec!["read_file"]);
+        assert!(registry.get("run_command").is_none());
+    }
+
+    #[test]
+    fn hide_wins_over_only_and_removes_the_name_everywhere() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named {
+            name: "read_file",
+            risk: Risk::ReadOnly,
+        });
+        registry.register(Named {
+            name: "run_command",
+            risk: Risk::Execute,
+        });
+        // A name in both lists is hidden: the negative rule fails closed.
+        registry.select(ToolSelection {
+            only: vec!["read_file".to_string(), "run_command".to_string()],
+            hide: vec!["run_command".to_string()],
+        });
+
+        assert_eq!(schema_names(&registry), vec!["read_file"]);
+        assert!(
+            registry.get("run_command").is_none(),
+            "a hidden tool must be unresolvable, not merely unadvertised"
+        );
+    }
+
+    /// Hiding is a *narrowing* operation: it removes a tool from the surface
+    /// without touching the risk class the gate keys on. The registry has no
+    /// say in policy, so there is no code path from `hide` to a permission.
+    #[test]
+    fn hiding_never_changes_a_tools_risk_class() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Named {
+            name: "run_command",
+            risk: Risk::Execute,
+        });
+        assert_eq!(registry.risks(), vec![("run_command", Risk::Execute)]);
+
+        registry.select(ToolSelection {
+            only: Vec::new(),
+            hide: vec!["run_command".to_string()],
+        });
+
+        assert!(registry.risks().is_empty());
+        // The tool is gone, not softened: a call to it is answered as unknown.
+        assert!(registry.get("run_command").is_none());
+    }
+
+    /// The selection reaches tools a *catalog* publishes too, so an MCP server's
+    /// tools are trimmable by the same config.
+    #[test]
+    fn the_selection_filters_catalog_tools_as_well() {
+        let mut registry = ToolRegistry::new();
+        let catalog = Arc::new(Swappable::default());
+        catalog.set(vec![named("mcp__files__read"), named("mcp__files__write")]);
+        registry.attach_catalog(catalog);
+        registry.select(ToolSelection {
+            only: vec!["mcp__files__read".to_string()],
+            hide: Vec::new(),
+        });
+
+        assert_eq!(schema_names(&registry), vec!["mcp__files__read"]);
+    }
+
+    #[test]
+    fn an_unrestricted_selection_admits_everything() {
+        let selection = ToolSelection::default();
+        assert!(selection.is_unrestricted());
+        assert!(selection.admits("anything"));
     }
 }

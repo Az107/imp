@@ -40,6 +40,16 @@ fn tools() -> Vec<Tool> {
     let secret: JsonObject =
         serde_json::from_value(serde_json::json!({ "type": "object" })).expect("a literal object");
 
+    let agent_ask: JsonObject = serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "prompt": { "type": "string" },
+            "max_tokens": { "type": "integer" }
+        },
+        "required": ["prompt"]
+    }))
+    .expect("a literal object");
+
     vec![
         Tool::new("echo", "Echo the `text` argument back.", echo),
         // Same name as a built-in tool, on purpose.
@@ -53,6 +63,12 @@ fn tools() -> Vec<Tool> {
             "secret",
             "A tool a config may hide with tool_allow.",
             secret,
+        ),
+        // What a peer exposes: this is the tool `peer__<name>_ask` calls (M10.2).
+        Tool::new(
+            "agent_ask",
+            "Stand-in for a minion peer: answers a brief with JSON, like the real server.",
+            agent_ask,
         ),
     ]
 }
@@ -94,6 +110,36 @@ impl ServerHandler for Stub {
                 "the stub server refused this call",
             )]),
             "secret" => CallToolResult::success(vec![ContentBlock::text("secret reached")]),
+            "agent_ask" => {
+                let prompt = arguments
+                    .get("prompt")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if prompt.contains("explode") {
+                    return Ok(CallToolResponse::from(CallToolResult::error(vec![
+                        ContentBlock::text("the stub peer could not answer the brief"),
+                    ])));
+                }
+                // A deliberately large answer, so the caller's size cap can be
+                // exercised without a real model.
+                let text = if prompt.contains("huge") {
+                    "x".repeat(9_000)
+                } else {
+                    format!("brief received: {prompt}")
+                };
+                let answer = serde_json::json!({
+                    "session_id": "stub-session",
+                    "stop": "completed",
+                    "text": text,
+                    "iterations": 1,
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 22,
+                        "total_tokens": 33
+                    }
+                });
+                CallToolResult::success(vec![ContentBlock::text(answer.to_string())])
+            }
             other => CallToolResult::error(vec![ContentBlock::text(format!(
                 "the stub server has no tool `{other}`"
             ))]),

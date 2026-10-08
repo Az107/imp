@@ -20,7 +20,7 @@ use minion_core::provider::Provider;
 use minion_core::tool::ToolRegistry;
 use minion_cron::RunReport;
 use minion_guard::HttpSystemOneGuard;
-use minion_mcp::{McpServers, OnStart};
+use minion_mcp::{McpServers, OnStart, PeerAsk, peer_policies, peer_tools};
 use minion_provider::OpenAiProvider;
 use minion_store::{NewSession, SessionRow, Store};
 use minion_tools::{CronContext, ToolConfig, default_registry};
@@ -59,6 +59,9 @@ pub struct Session {
     /// The external servers this session consumes, shared so a turn can retry
     /// one that was down and the catalogue follows.
     mcp: Arc<McpServers>,
+    /// The peer delegation tools, kept so their connections close on the way
+    /// out. A stdio peer is a child process; an HTTP one is a socket.
+    peers: Vec<Arc<PeerAsk>>,
 }
 
 /// The parameters a provider was built from, kept to rebuild it later.
@@ -69,6 +72,7 @@ struct ProviderSpec {
     max_retries: u32,
     request_timeout: Duration,
     usage_in_stream: bool,
+    strict_tool_arguments: bool,
     headers: Vec<(String, String)>,
 }
 
@@ -78,6 +82,7 @@ impl ProviderSpec {
             .with_max_retries(self.max_retries)
             .with_request_timeout(Some(self.request_timeout))
             .with_usage_in_stream(self.usage_in_stream)
+            .with_strict_tool_arguments(self.strict_tool_arguments)
             .with_headers(self.headers.clone())
             .with_session_id(session_id.to_string())
     }
@@ -92,6 +97,7 @@ impl Session {
             self.options.clone(),
         )
         .with_gate(self.gate.clone())
+        .with_session(self.session_id.clone())
     }
 
     /// Point this session at a different conversation.
@@ -157,9 +163,12 @@ impl Session {
         self.mcp.refresh(OnStart::All).await
     }
 
-    /// Close the external servers on the way out.
+    /// Close the external servers and any peer connection on the way out.
     pub async fn shutdown(&self) {
         self.mcp.shutdown().await;
+        for peer in &self.peers {
+            peer.close().await;
+        }
     }
 
     /// The text of the first user message, used to derive a title.
@@ -186,6 +195,7 @@ pub async fn build(
         max_retries: config.provider.max_retries,
         request_timeout: Duration::from_secs(config.provider.request_timeout_secs),
         usage_in_stream: config.provider.supports_usage_in_stream,
+        strict_tool_arguments: config.provider.strict_tool_arguments,
         headers: config.request_headers(),
     };
 
@@ -204,6 +214,22 @@ pub async fn build(
 
     let mut registry = default_registry(&tool_config(config), store.clone(), cron_context(config));
     registry.attach_catalog(mcp.clone());
+    // One delegation tool per peer, `peer__<name>_ask` (M10.2). Registered
+    // rather than catalogued: its name and schema come from config, so it is on
+    // offer from the moment the session exists. The handles are kept so their
+    // connections close with the session.
+    let peers: Vec<Arc<PeerAsk>> = peer_tools(&config.peers)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
+    for peer in &peers {
+        registry.register_arc(peer.clone());
+    }
+    // The `[tools]` selection trims what the model is offered. It is applied to
+    // the finished registry — catalogs included — and never touches the gate:
+    // `tools::ToolSelection` only removes entries, so it cannot widen a
+    // permission the policy engine would refuse.
+    registry.select(config.tools.selection());
     let tools = Arc::new(registry);
 
     let mcp_notices = mcp.refresh(OnStart::Eager).await;
@@ -259,8 +285,14 @@ pub async fn build(
         max_tokens: None,
         parallel_tool_calls: Some(config.provider.parallel_tool_calls),
         include_usage: config.provider.supports_usage_in_stream,
+        max_tool_calls_per_turn: config.agent.max_tool_calls_per_turn,
         workspace_root: workspace_root.clone(),
     };
+
+    // The families a per-server (or per-peer) policy names. Both go into the same
+    // list, so the longest matching prefix still decides (D21).
+    let mut families = mcp.policy_families();
+    families.extend(peer_policies(&config.peers));
 
     // Whether anyone can answer a prompt. `--yes` forces the permissive path;
     // a non-TTY still cannot be prompted, so it falls back to `noninteractive`.
@@ -273,7 +305,7 @@ pub async fn build(
             tty,
             cli.yes,
             cli.deny,
-            mcp.policy_families(),
+            families.clone(),
         ),
         &store,
     );
@@ -289,7 +321,7 @@ pub async fn build(
                 config,
                 &store,
                 &workspace_root.display().to_string(),
-                mcp.policy_families(),
+                families,
             ),
             &store,
         ),
@@ -312,6 +344,7 @@ pub async fn build(
         spec,
         gate,
         mcp,
+        peers,
     };
     if resume.is_none() {
         session.persist_all().await?;
@@ -543,6 +576,7 @@ impl JobAgentRunner {
             max_tokens: None,
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
+            max_tool_calls_per_turn: self.config.agent.max_tool_calls_per_turn,
             workspace_root: workspace,
         };
         let agent = Agent::new(
@@ -550,7 +584,8 @@ impl JobAgentRunner {
             self.tools.clone(),
             options,
         )
-        .with_gate(self.gate.clone());
+        .with_gate(self.gate.clone())
+        .with_session(session_id.clone());
 
         let (sender, mut events) = mpsc::unbounded_channel();
         // Drain to a buffer rather than the renderer: a job's output must not
@@ -660,8 +695,29 @@ pub fn system_prompt(config: &Config, root: &Path, tools: &ToolRegistry) -> Stri
         }
     }
 
+    // M10.3: a small local model imitates "never/always" far better than a
+    // paragraph of prose. Opt-in, so a large model is not handed a list it does
+    // not need and a custom persona keeps its own voice.
+    if config.agent.small_model {
+        prompt.push_str(SMALL_MODEL_RULES);
+    }
+
     prompt
 }
+
+/// Imperative rules appended for a small local model (`agent.small_model`).
+///
+/// Each is a "never"/"always" a 2–4B model can imitate, and each maps to real
+/// loop behaviour: one tool per turn keeps the transcript short enough to parse,
+/// not re-reading a file avoids the repeat the loop otherwise absorbs, and
+/// stopping when it can answer is what ends the turn at all.
+const SMALL_MODEL_RULES: &str = "\n\nRules (follow exactly):\
+\n1. Call at most one tool per turn.\
+\n2. Never read a file you have already read in this conversation.\
+\n3. Never repeat a tool call with the same arguments.\
+\n4. Stop as soon as you can answer, then reply in plain text with no tool call.\
+\n5. Keep tool arguments short; never paste a whole file into an argument.\
+\n6. If a tool fails, change your approach instead of retrying the same call.";
 
 fn builtin_persona() -> String {
     "You are minion, a minimalist Unix-native agent. Work in small, verifiable steps, \
@@ -813,6 +869,48 @@ mod tests {
         let prompt = system_prompt(&config, Path::new("/tmp/ws"), &tools().await);
 
         assert!(prompt.contains("minion"));
+    }
+
+    /// M10.3: a small-model prompt carries short numbered rules; a normal one
+    /// is left exactly as it was.
+    #[tokio::test]
+    async fn the_small_model_rules_are_appended_only_when_asked() {
+        let tools = tools().await;
+        let plain = system_prompt(&config(), Path::new("/tmp/ws"), &tools);
+        assert!(
+            !plain.contains("Rules (follow exactly)"),
+            "the rules must be opt-in: {plain}"
+        );
+
+        let mut config = config();
+        config.agent.small_model = true;
+        let prompted = system_prompt(&config, Path::new("/tmp/ws"), &tools);
+
+        assert!(prompted.contains("Rules (follow exactly)"));
+        assert!(prompted.contains("1. Call at most one tool per turn."));
+        assert!(prompted.contains("Never read a file you have already read"));
+        assert!(prompted.contains("Stop as soon as you can answer"));
+        assert!(
+            prompted.ends_with("retrying the same call."),
+            "the rules go last so they are the freshest thing in context"
+        );
+    }
+
+    /// The `[tools]` selection reaches the prompt: a hidden tool is not
+    /// advertised, so a weak model never sees the name to choose it.
+    #[tokio::test]
+    async fn the_prompt_advertises_only_the_selected_tools() {
+        let mut tools = tools().await;
+        tools.select(minion_core::ToolSelection {
+            only: vec!["read_file".to_string()],
+            hide: Vec::new(),
+        });
+
+        let prompt = system_prompt(&config(), Path::new("/tmp/ws"), &tools);
+
+        assert!(prompt.contains("- read_file"));
+        assert!(!prompt.contains("- run_command"), "was: {prompt}");
+        assert!(!prompt.contains("- http_fetch"), "was: {prompt}");
     }
 
     #[test]

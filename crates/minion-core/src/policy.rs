@@ -63,10 +63,35 @@ pub struct AuditEntry {
     pub tool: String,
     /// Risk class, as a string.
     pub risk: &'static str,
-    /// Which rule decided: `auto`, `allow_session`, `allow_always`, `deny_rule`, `noninteractive`, or `prompt`.
+    /// Which rule decided: `allow` or `deny` (or a guard verdict, e.g.
+    /// `guard_allow`), for the row the gate writes.
     pub decision: &'static str,
     /// What was decided about.
     pub subject: String,
+    /// Conversation the call belonged to, when the gate was told one.
+    pub session_id: Option<String>,
+    /// Provider round-trip the call belonged to, when the gate was told one.
+    pub turn_id: Option<String>,
+    /// How the call ended: `ok`, `error`, or `denied`.
+    pub outcome: Option<String>,
+    /// Wall-clock milliseconds the tool spent.
+    pub duration_ms: Option<u64>,
+}
+
+impl AuditEntry {
+    /// Fill in the conversation and turn a decision belonged to.
+    pub fn with_context(mut self, session_id: Option<String>, turn_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self.turn_id = turn_id;
+        self
+    }
+
+    /// Fill in how the call ended and how long it took.
+    pub fn with_outcome(mut self, outcome: &str, duration_ms: u64) -> Self {
+        self.outcome = Some(outcome.to_string());
+        self.duration_ms = Some(duration_ms);
+        self
+    }
 }
 
 /// Asks the user. Implemented by the CLI; the engine never touches a terminal.
@@ -104,6 +129,20 @@ pub trait ToolGate: Send + Sync {
         args: &Value,
         subject: Option<&str>,
     ) -> Result<()>;
+
+    /// Note the conversation and provider round-trip the following `check`
+    /// calls belong to.
+    ///
+    /// A gate that keeps an audit trail uses this to stamp each row with its
+    /// session and turn; the default does nothing, because a gate that only
+    /// decides has no trail to stamp.
+    async fn begin_turn(&self, _session_id: &str, _turn_id: &str) {}
+
+    /// Note how a call that `check` already allowed actually ended.
+    ///
+    /// The default does nothing. A gate that wrote a row on `check` uses this
+    /// to finish it with the outcome and the wall-clock time.
+    async fn record_outcome(&self, _tool: &str, _ok: bool, _duration_ms: u64) {}
 }
 
 /// The text a rule is matched against when the tool did not name one.
@@ -135,15 +174,36 @@ pub fn subject_for(tool: &str, args: &Value) -> String {
 /// the one way to add a record per call without touching it. A recording
 /// failure is swallowed by [`ApprovalStore::audit`], so it can never fail the
 /// call it describes.
+///
+/// A refusal is a finished decision, so it is written on `check` with
+/// `outcome = denied`. An allow is not finished until the tool has run, so the
+/// row is held and written by [`ToolGate::record_outcome`], which is how a
+/// single row ends up carrying both the decision and its result (§7).
 pub struct RecordingGate {
     inner: Arc<dyn ToolGate>,
     store: Arc<dyn ApprovalStore>,
+    /// The conversation and turn the next decisions belong to.
+    context: Mutex<AuditContext>,
+    /// The last allowed decision, waiting for its outcome.
+    pending: Mutex<Option<AuditEntry>>,
+}
+
+/// Where a run of decisions belongs, as last reported by `begin_turn`.
+#[derive(Debug, Clone, Default)]
+struct AuditContext {
+    session_id: Option<String>,
+    turn_id: Option<String>,
 }
 
 impl RecordingGate {
     /// Wrap `inner`, recording into `store`.
     pub fn new(inner: Arc<dyn ToolGate>, store: Arc<dyn ApprovalStore>) -> Self {
-        Self { inner, store }
+        Self {
+            inner,
+            store,
+            context: Mutex::new(AuditContext::default()),
+            pending: Mutex::new(None),
+        }
     }
 
     /// Wrap `inner` in the `Arc<dyn ToolGate>` an [`crate::Agent`] takes.
@@ -167,16 +227,57 @@ impl ToolGate for RecordingGate {
             Some(value) if !value.is_empty() => value.to_string(),
             _ => subject_for(tool, args),
         };
-        self.store
-            .audit(AuditEntry {
-                tool: tool.to_string(),
-                risk: risk.as_str(),
-                decision: if outcome.is_ok() { "allow" } else { "deny" },
-                subject,
-            })
-            .await;
+        let context = self
+            .context
+            .lock()
+            .map(|ctx| ctx.clone())
+            .unwrap_or_default();
+        let entry = AuditEntry {
+            tool: tool.to_string(),
+            risk: risk.as_str(),
+            decision: if outcome.is_ok() { "allow" } else { "deny" },
+            subject,
+            session_id: context.session_id,
+            turn_id: context.turn_id,
+            outcome: None,
+            duration_ms: None,
+        };
+
+        if outcome.is_ok() {
+            // Hold it until the tool reports how it went.
+            if let Ok(mut pending) = self.pending.lock() {
+                *pending = Some(entry);
+            }
+        } else {
+            // A refusal is complete the moment it is made.
+            self.store.audit(entry.with_outcome("denied", 0)).await;
+        }
 
         outcome
+    }
+
+    async fn begin_turn(&self, session_id: &str, turn_id: &str) {
+        if let Ok(mut context) = self.context.lock() {
+            context.session_id = Some(session_id.to_string());
+            context.turn_id = Some(turn_id.to_string());
+        }
+    }
+
+    async fn record_outcome(&self, tool: &str, ok: bool, duration_ms: u64) {
+        // Take only a pending row for this tool: a decision that was never
+        // allowed has nothing pending, and a stale row for another tool must
+        // not be credited to this call.
+        let entry = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+            .filter(|entry| entry.tool == tool);
+        if let Some(entry) = entry {
+            self.store
+                .audit(entry.with_outcome(if ok { "ok" } else { "error" }, duration_ms))
+                .await;
+        }
     }
 }
 
@@ -489,6 +590,10 @@ impl ToolGate for PolicyEngine {
                             GuardBand::Deny => "guard_deny",
                         },
                         subject: subject.clone(),
+                        session_id: None,
+                        turn_id: None,
+                        outcome: None,
+                        duration_ms: None,
                     })
                     .await;
                     tracing::debug!(
@@ -510,6 +615,10 @@ impl ToolGate for PolicyEngine {
                         risk: risk.as_str(),
                         decision: "guard_error",
                         subject: subject.clone(),
+                        session_id: None,
+                        turn_id: None,
+                        outcome: None,
+                        duration_ms: None,
                     })
                     .await;
                     tracing::warn!(error = %err, "system one guard failed; prompting instead");
@@ -1354,15 +1463,17 @@ mod tests {
 
     // ------------------------------------------------------- recording gate
 
-    /// §7: every decision gets a row, allowed ones included. Without this a
-    /// successful call — every external MCP call among them — left no trace.
+    /// §7: every decision gets a row, allowed ones included, and an allowed
+    /// row carries its result. Without this a successful call — every external
+    /// MCP call among them — left no trace.
     #[tokio::test]
-    async fn every_decision_is_recorded() {
+    async fn every_decision_is_recorded_with_its_outcome() {
         let store = Arc::new(MemoryStore::default());
         let gate = RecordingGate::arc(
             Arc::new(engine(false)),
             store.clone() as Arc<dyn ApprovalStore>,
         );
+        gate.begin_turn("sess-1", "turn-1").await;
 
         gate.check(
             "read_file",
@@ -1372,6 +1483,12 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            store.audits.lock().unwrap().is_empty(),
+            "an allow is held until the tool has run"
+        );
+        gate.record_outcome("read_file", true, 7).await;
+
         gate.check(
             "mcp__files__write",
             Risk::Network,
@@ -1386,9 +1503,64 @@ mod tests {
         assert_eq!(audits[0].tool, "read_file");
         assert_eq!(audits[0].decision, "allow");
         assert_eq!(audits[0].subject, "a", "the subject the rules saw");
+        assert_eq!(audits[0].outcome.as_deref(), Some("ok"));
+        assert_eq!(audits[0].duration_ms, Some(7));
+        assert_eq!(audits[0].session_id.as_deref(), Some("sess-1"));
+        assert_eq!(audits[0].turn_id.as_deref(), Some("turn-1"));
         assert_eq!(audits[1].tool, "mcp__files__write");
         assert_eq!(audits[1].decision, "deny");
         assert_eq!(audits[1].risk, "network");
+        assert_eq!(audits[1].outcome.as_deref(), Some("denied"));
+    }
+
+    /// A tool that failed still leaves a row, with `error` for its outcome.
+    #[tokio::test]
+    async fn a_failed_tool_is_recorded_as_an_error() {
+        let store = Arc::new(MemoryStore::default());
+        let gate = RecordingGate::arc(
+            Arc::new(engine(false)),
+            store.clone() as Arc<dyn ApprovalStore>,
+        );
+
+        gate.check(
+            "read_file",
+            Risk::ReadOnly,
+            &serde_json::json!({ "path": "a" }),
+            None,
+        )
+        .await
+        .unwrap();
+        gate.record_outcome("read_file", false, 3).await;
+
+        let audits = store.audits.lock().unwrap().clone();
+        assert_eq!(audits[0].outcome.as_deref(), Some("error"));
+        assert_eq!(audits[0].duration_ms, Some(3));
+    }
+
+    /// An outcome for a tool that was never allowed must not be credited to a
+    /// different call's row.
+    #[tokio::test]
+    async fn an_outcome_for_another_tool_does_not_finish_a_row() {
+        let store = Arc::new(MemoryStore::default());
+        let gate = RecordingGate::arc(
+            Arc::new(engine(false)),
+            store.clone() as Arc<dyn ApprovalStore>,
+        );
+
+        gate.check(
+            "read_file",
+            Risk::ReadOnly,
+            &serde_json::json!({ "path": "a" }),
+            None,
+        )
+        .await
+        .unwrap();
+        gate.record_outcome("write_file", true, 9).await;
+
+        assert!(
+            store.audits.lock().unwrap().is_empty(),
+            "the pending row was for read_file, not write_file"
+        );
     }
 
     /// The decorator is transparent: it cannot turn a refusal into an allow.

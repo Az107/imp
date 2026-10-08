@@ -17,14 +17,16 @@ pub mod message;
 pub mod policy;
 pub mod provider;
 pub mod session;
+pub mod sha256;
 pub mod tool;
+pub mod update;
 
 pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome};
 pub use classify::classify_command;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{
     Config, Credentials, CronConfig, GuardConfig, HttpFetchConfig, McpClientConfig, McpConfig,
-    McpServerConfig, MissedRunPolicy,
+    McpServerConfig, MissedRunPolicy, ToolsConfig, UpdateConfig,
 };
 pub use error::{Error, Result};
 pub use fs::write_private_file;
@@ -41,4 +43,8 @@ pub use policy::{
 };
 pub use provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
 pub use session::new_session_id;
-pub use tool::{Risk, Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry};
+pub use tool::{Risk, Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSelection};
+pub use update::{
+    Asset, Decision, Download, InstallReport, ReleaseInfo, UpdateSource, Updater, VersionOrder,
+    compare_versions, is_commit, parse_checksums, platform_asset, url_is_permitted,
+};

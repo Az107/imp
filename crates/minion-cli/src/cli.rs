@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 
 /// A minimal, Unix-native AI agent harness.
 #[derive(Debug, Parser)]
-#[command(name = "minion", version, about, long_about = None)]
+#[command(name = "minion", version = crate::version::VERSION, about, long_about = None)]
 pub struct Cli {
     /// Model to use, overriding the config file.
     #[arg(long, global = true)]
@@ -66,6 +66,18 @@ pub struct Cli {
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
+    /// Reduce output to results and errors: no banner, and warnings only.
+    #[arg(long, short, global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+
+    /// Resume a stored conversation, by id, unique prefix, or list position.
+    #[arg(long, global = true, value_name = "SESSION")]
+    pub resume: Option<String>,
+
+    /// Maximum provider round-trips per turn, overriding the config.
+    #[arg(long = "max-iterations", global = true, value_name = "N")]
+    pub max_iterations: Option<u32>,
+
     /// Subcommand. With none, minion starts an interactive session.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -83,6 +95,12 @@ pub enum Command {
     /// Configure the model backend and write a config file (§5.1.1).
     Init(InitArgs),
 
+    /// Inspect the effective configuration (§5.12).
+    Config(ConfigArgs),
+
+    /// Check the environment, config, database and provider reachability.
+    Doctor,
+
     /// Inspect and manage stored conversations.
     Session(SessionArgs),
 
@@ -91,6 +109,30 @@ pub enum Command {
 
     /// Inspect the external MCP servers minion consumes (§5.10, §5.12).
     Mcp(McpArgs),
+
+    /// Check a release channel and replace the installed binary (§9).
+    Update(UpdateArgs),
+}
+
+/// Arguments for `minion update`.
+///
+/// `--yes` is the global consent flag, so it is not repeated here; without it,
+/// and without a terminal, nothing is installed.
+#[derive(Debug, Clone, clap::Args)]
+pub struct UpdateArgs {
+    /// Only report what is available. Writes nothing, and exits `1` when an
+    /// update is available.
+    #[arg(long)]
+    pub check: bool,
+
+    /// Reinstall even when the installed version is already current.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Restore the most recent `minion.old-*` binary beside the target, instead
+    /// of contacting the release channel.
+    #[arg(long, conflicts_with = "check")]
+    pub rollback: bool,
 }
 
 /// Arguments for `minion mcp`.
@@ -265,4 +307,25 @@ pub struct InitArgs {
     /// Probe the backend first, and write nothing if it is unreachable.
     #[arg(long)]
     pub check: bool,
+}
+
+/// Arguments for `minion config`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ConfigArgs {
+    /// The action to perform.
+    #[command(subcommand)]
+    pub action: ConfigAction,
+}
+
+/// Read-only configuration views (§5.12). `config init` aliases `minion init`.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum ConfigAction {
+    /// Print the effective configuration, secrets redacted.
+    Show,
+
+    /// Print the paths minion reads and writes.
+    Path,
+
+    /// Alias for `minion init`.
+    Init(InitArgs),
 }

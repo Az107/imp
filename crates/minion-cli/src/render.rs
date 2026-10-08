@@ -61,6 +61,10 @@ impl Renderer {
                 self.end_line();
                 eprintln!("{}", self.fail(&format!("provider error: {message}")));
             }
+            AgentEvent::Notice(message) => {
+                self.end_line();
+                eprintln!("{}", self.dim(&format!("… {message}")));
+            }
         }
     }
 
@@ -103,6 +107,9 @@ impl Renderer {
             }
             AgentEvent::Failed(message) => {
                 serde_json::json!({ "type": "error", "message": message })
+            }
+            AgentEvent::Notice(message) => {
+                serde_json::json!({ "type": "notice", "message": message })
             }
         };
         println!("{value}");

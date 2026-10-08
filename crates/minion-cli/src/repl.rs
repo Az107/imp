@@ -45,17 +45,19 @@ pub async fn interactive(
     let interrupt = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_interrupt_swapper(interrupt.clone());
 
-    println!(
-        "minion {} · {} · {} · policy: {}",
-        env!("CARGO_PKG_VERSION"),
-        state.options.model,
-        state.workspace_root.display(),
-        decision_name(config.policy.default)
-    );
-    println!(
-        "session {} · /help for commands, /quit to exit",
-        short_id(&state.session_id)
-    );
+    if !cli.quiet {
+        println!(
+            "minion {} · {} · {} · policy: {}",
+            env!("CARGO_PKG_VERSION"),
+            state.options.model,
+            state.workspace_root.display(),
+            decision_name(config.policy.default)
+        );
+        println!(
+            "session {} · /help for commands, /quit to exit",
+            short_id(&state.session_id)
+        );
+    }
 
     let mut usage = Usage::default();
 
@@ -123,6 +125,15 @@ pub async fn interactive(
         let agent = state.agent();
         let outcome = agent.run(&mut state.history, &sender, cancel).await;
         usage.absorb(outcome.usage);
+        // Persist this turn's usage against the conversation, so `/cost` can
+        // report the whole session rather than just this process (§7).
+        if let Err(err) = state
+            .store
+            .record_usage(&state.session_id, outcome.usage)
+            .await
+        {
+            eprintln!("minion: could not record token usage: {err}");
+        }
 
         drop(sender);
         let _ = rendering.await;
@@ -253,10 +264,17 @@ async fn handle_slash(
             }
             None => println!("{}", state.options.model),
         },
-        "cost" => println!(
-            "prompt {} · completion {} · total {} tokens this session",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        ),
+        "cost" => {
+            let total = state.store.session_usage(&state.session_id).await?;
+            println!(
+                "session: prompt {} · completion {} · total {} tokens over {} turn(s)",
+                total.prompt_tokens, total.completion_tokens, total.total_tokens, total.turns
+            );
+            println!(
+                "this process: prompt {} · completion {} · total {} tokens",
+                usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+            );
+        }
         "session" => {
             println!("{}", state.session_id);
             let note = "This is the conversation id substituted into any ${session} header.";

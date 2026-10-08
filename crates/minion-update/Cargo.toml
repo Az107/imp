@@ -1,0 +1,23 @@
+[package]
+name = "minion-update"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+minion-core = { version = "0.1.0", path = "../minion-core" }
+# The update channel is the second crate that opens a socket, and it links the
+# same reqwest build the rest of the workspace uses, so it adds an edge rather
+# than a second HTTP stack. `rustls` and `http2` are the features already in the
+# tree; adding another feature set here would duplicate the dependency.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["sync", "time", "macros", "rt", "rt-multi-thread", "net", "io-util"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

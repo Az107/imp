@@ -13,12 +13,16 @@ use minion_core::message::{Message, Role};
 use rusqlite::{Connection, OptionalExtension};
 
 pub mod approvals;
+pub mod audit;
 pub mod jobs;
 pub mod memory;
 pub mod migrate;
+pub mod usage;
 
+pub use audit::AuditRow;
 pub use memory::{MemoryEntry, Written};
 pub use migrate::SCHEMA_VERSION;
+pub use usage::SessionUsage;
 
 /// A session as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,5 +651,56 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "a transcript should stay private");
         }
+    }
+
+    /// NFR-6: the store runs in WAL mode, which is what lets a reader see
+    /// committed data while a writer is mid-transaction and what survives a
+    /// `SIGKILL` without losing a committed turn.
+    #[tokio::test]
+    async fn the_store_runs_in_wal_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("minion.db")).await.unwrap();
+
+        let mode: String = store
+            .blocking(|conn| {
+                conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                    .map_err(|err| Error::Store(err.to_string()))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    /// NFR-6: a committed message is on disk, so a process that dies and a
+    /// fresh one that reopens the file find the same transcript.
+    #[tokio::test]
+    async fn a_committed_message_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("minion.db");
+        let session_id = minion_core::new_session_id();
+        {
+            let store = Store::open(&path).await.unwrap();
+            store
+                .create_session(NewSession {
+                    id: session_id.clone(),
+                    cwd: "/tmp".to_string(),
+                    model: None,
+                    provider: None,
+                })
+                .await
+                .unwrap();
+            store
+                .append_messages(&session_id, &[Message::user("durable?")])
+                .await
+                .unwrap();
+            // Drop the connection the way a crashed process would.
+        }
+
+        let reopened = Store::open(&path).await.unwrap();
+        let messages = reopened.load_messages(&session_id).await.unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_deref(), Some("durable?"));
     }
 }

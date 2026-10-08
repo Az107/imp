@@ -26,13 +26,31 @@ impl ToolSchema {
     /// Serializing [`ToolSchema`] directly produces a flattened object that
     /// compliant providers reject with a 400.
     pub fn to_wire(&self) -> serde_json::Value {
+        self.to_wire_strict(false)
+    }
+
+    /// The wire shape, optionally asking the backend to constrain the arguments
+    /// to the schema.
+    ///
+    /// When `strict`, the function carries `"strict": true`. That is what
+    /// OpenAI-style strict function calling and Ollama's structured outputs read
+    /// to force the arguments to validate; a backend that does not understand
+    /// the field sees exactly today's request, since the flag is simply absent
+    /// (M10.3, `[provider] strict_tool_arguments`). It is a hint to the backend,
+    /// not a check of our own: the arguments are still parsed and validated by
+    /// the tool layer, strict or not.
+    pub fn to_wire_strict(&self, strict: bool) -> serde_json::Value {
+        let mut function = serde_json::json!({
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        });
+        if strict {
+            function["strict"] = serde_json::json!(true);
+        }
         serde_json::json!({
             "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": self.parameters,
-            },
+            "function": function,
         })
     }
 }
@@ -144,4 +162,45 @@ pub trait Provider: Send + Sync {
         request: ChatRequest,
         cancel: CancellationToken,
     ) -> BoxStream<'static, Result<ChatEvent>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema() -> ToolSchema {
+        ToolSchema {
+            name: "read_file".to_string(),
+            description: "read".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    #[test]
+    fn the_wire_shape_is_the_function_envelope() {
+        let wire = schema().to_wire();
+        assert_eq!(wire["type"], "function");
+        assert_eq!(wire["function"]["name"], "read_file");
+        assert!(wire.get("name").is_none(), "the flat form must not leak");
+    }
+
+    #[test]
+    fn strict_is_absent_unless_asked_for() {
+        assert!(
+            schema()
+                .to_wire()
+                .get("function")
+                .unwrap()
+                .get("strict")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn strict_adds_the_flag_inside_the_function_envelope() {
+        let wire = schema().to_wire_strict(true);
+        assert_eq!(wire["function"]["strict"], serde_json::json!(true));
+        assert_eq!(wire["type"], "function", "the envelope is unchanged");
+        assert_eq!(wire["function"]["name"], "read_file");
+    }
 }

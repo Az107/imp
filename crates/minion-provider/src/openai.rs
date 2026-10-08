@@ -11,7 +11,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use minion_core::error::{Error, Result};
-use minion_core::provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
+use minion_core::provider::{ChatEvent, ChatRequest, FinishReason, Provider, Usage};
 
 use crate::sse::SseDecoder;
 
@@ -58,6 +58,7 @@ pub struct OpenAiProvider {
     max_retries: u32,
     request_timeout: Option<Duration>,
     supports_usage_in_stream: bool,
+    strict_tool_arguments: bool,
     headers: Vec<(String, String)>,
     session_id: Option<String>,
 }
@@ -76,6 +77,7 @@ impl OpenAiProvider {
             max_retries: 3,
             request_timeout: Some(Duration::from_secs(120)),
             supports_usage_in_stream: true,
+            strict_tool_arguments: false,
             headers: Vec::new(),
             session_id: None,
         }
@@ -99,6 +101,18 @@ impl OpenAiProvider {
     /// providers reject unknown request fields.
     pub fn with_usage_in_stream(mut self, supported: bool) -> Self {
         self.supports_usage_in_stream = supported;
+        self
+    }
+
+    /// Ask the backend to constrain tool arguments to their JSON schema.
+    ///
+    /// A provider quirk (M10.3). When the backend understands `strict` — OpenAI
+    /// function calling, Ollama's structured outputs, a llama.cpp built with
+    /// `--jinja` and a grammar — each advertised function carries it. When the
+    /// backend does not, the field is simply absent from the request, which is
+    /// what "unchanged behaviour" means here.
+    pub fn with_strict_tool_arguments(mut self, strict: bool) -> Self {
+        self.strict_tool_arguments = strict;
         self
     }
 
@@ -203,8 +217,11 @@ impl OpenAiProvider {
         if !request.tools.is_empty() {
             // Each entry must be the nested `{type, function}` shape, not the
             // flattened struct: providers reject the flat form with a 400.
-            let tools: Vec<serde_json::Value> =
-                request.tools.iter().map(ToolSchema::to_wire).collect();
+            let tools: Vec<serde_json::Value> = request
+                .tools
+                .iter()
+                .map(|tool| tool.to_wire_strict(self.strict_tool_arguments))
+                .collect();
             object.insert("tools".to_string(), serde_json::json!(tools));
             object.insert("tool_choice".to_string(), serde_json::json!("auto"));
         }
@@ -603,6 +620,59 @@ mod tests {
             entry.get("name").is_none(),
             "the flat form must not leak alongside the envelope"
         );
+    }
+
+    #[test]
+    fn strict_tool_arguments_are_off_by_default() {
+        let provider = OpenAiProvider::new("http://localhost/v1", "k");
+        let request = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![minion_core::provider::ToolSchema {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }],
+            temperature: None,
+            max_tokens: None,
+            parallel_tool_calls: None,
+            include_usage: false,
+        };
+
+        let body = provider.body(&request);
+
+        assert!(
+            body["tools"][0]["function"].get("strict").is_none(),
+            "the default request must be unchanged: {body}"
+        );
+    }
+
+    #[test]
+    fn the_strict_quirk_marks_every_function() {
+        let provider =
+            OpenAiProvider::new("http://localhost/v1", "k").with_strict_tool_arguments(true);
+        let request = ChatRequest {
+            model: "m".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![minion_core::provider::ToolSchema {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }],
+            temperature: None,
+            max_tokens: None,
+            parallel_tool_calls: None,
+            include_usage: false,
+        };
+
+        let body = provider.body(&request);
+
+        assert_eq!(
+            body["tools"][0]["function"]["strict"],
+            serde_json::json!(true)
+        );
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
     }
 
     #[test]
