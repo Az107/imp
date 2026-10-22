@@ -26,6 +26,7 @@ use crate::config::Decision;
 use crate::error::{Error, Result};
 use crate::glob::glob_match;
 use crate::guard::{GuardBand, GuardThresholds, SystemOneGuard, is_eligible};
+use crate::read_only::AutoCommands;
 use crate::tool::Risk;
 
 /// What the user chose at a prompt.
@@ -333,6 +334,9 @@ pub struct PolicyEngine {
     /// The optional System One guard and the thresholds a verdict is judged by
     /// (SDD §5.6). `None` means the prompt is never delegated to a model.
     guard: Option<(Arc<dyn SystemOneGuard>, GuardThresholds)>,
+    /// The opt-in read-only-command shortcut and its runtime switch (D48).
+    /// `None` means no shell command is auto-approved by classification.
+    auto: Option<Arc<AutoCommands>>,
     session: Mutex<Vec<SessionAllow>>,
 }
 
@@ -357,6 +361,7 @@ impl PolicyEngine {
             ui: None,
             store: None,
             guard: None,
+            auto: None,
             session: Mutex::new(Vec::new()),
         }
     }
@@ -396,6 +401,17 @@ impl PolicyEngine {
     /// the result does not depend on the order the servers were configured in.
     pub fn with_tool_policies(mut self, policies: Vec<ToolPolicy>) -> Self {
         self.policies = policies;
+        self
+    }
+
+    /// Attach the opt-in read-only-command shortcut (SDD §5.6, D48).
+    ///
+    /// When its mode is `read-only`, a `run_command` the classifier recognises
+    /// as an observation is allowed without a prompt. It is consulted after deny
+    /// rules, allow rules and the classifier, and only when the classifier
+    /// flagged nothing, so it can only shorten a path to a prompt.
+    pub fn with_auto_commands(mut self, auto: Arc<AutoCommands>) -> Self {
+        self.auto = Some(auto);
         self
     }
 
@@ -511,6 +527,26 @@ impl ToolGate for PolicyEngine {
         } else {
             Vec::new()
         };
+
+        // 3b. An opt-in shortcut for commands that only observe (D48).
+        //
+        // `run_command` is `Risk::Execute`, so a `git status` would otherwise
+        // prompt like an `rm`. The classifier recognises the provably read-only
+        // ones, and when the operator has turned the shortcut on they run
+        // without a prompt. It sits here — after deny (1), allow (2) and the
+        // classifier (3), and only when nothing was flagged — so it can shorten
+        // the path to a prompt but never bypass a refusal. Like the `ReadOnly`
+        // rule below it deliberately runs before the non-interactive branch: a
+        // read is allowed unattended (D15), and `--deny` sets the fallback, not
+        // this rule.
+        if tool == "run_command"
+            && flags.is_empty()
+            && let Some(auto) = &self.auto
+            && auto.read_only()
+            && auto.matches(&subject)
+        {
+            return Ok(());
+        }
 
         // 4. Reading is free, and no one is there to ask about anything else.
         //
@@ -864,6 +900,126 @@ mod tests {
 
         assert!(err.to_string().contains("non-interactive"), "was: {err}");
         assert!(ui.asked().is_empty());
+    }
+
+    // ------------------------------------------------ read-only command shortcut
+
+    fn auto_on() -> Arc<AutoCommands> {
+        AutoCommands::new(true, Vec::new())
+    }
+
+    /// D48: a recognised read-only command needs no consent, even unattended,
+    /// which is the whole point of the shortcut.
+    #[tokio::test]
+    async fn a_read_only_command_runs_without_a_prompt_even_unattended() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Deny));
+        let engine = engine(false)
+            .with_ui(ui.clone())
+            .with_auto_commands(auto_on());
+
+        engine
+            .check("run_command", Risk::Execute, &command("git status"), None)
+            .await
+            .expect("a read-only command observes, so no terminal is required");
+
+        assert!(ui.asked().is_empty());
+    }
+
+    /// The shortcut is off unless the operator turned it on, so the default
+    /// behaviour is unchanged.
+    #[tokio::test]
+    async fn the_shortcut_is_off_by_default() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Deny));
+        let engine = engine(true)
+            .with_ui(ui.clone())
+            .with_auto_commands(AutoCommands::new(false, Vec::new()));
+
+        let err = engine
+            .check("run_command", Risk::Execute, &command("ls -la"), None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("refused"), "was: {err}");
+        assert_eq!(ui.asked().len(), 1, "an ordinary `ls` still prompts");
+    }
+
+    /// Only a recognised command is exempt; a mutating one still needs consent.
+    #[tokio::test]
+    async fn a_mutating_command_still_needs_consent() {
+        let ui = Arc::new(ScriptedUi::returning(ApprovalChoice::Deny));
+        let engine = engine(false).with_ui(ui).with_auto_commands(auto_on());
+
+        let err = engine
+            .check("run_command", Risk::Execute, &command("rm notes.txt"), None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("non-interactive"), "was: {err}");
+    }
+
+    /// Deny is rule 1; the shortcut is rule 3b and cannot resurrect a refusal.
+    #[tokio::test]
+    async fn a_deny_rule_beats_the_read_only_shortcut() {
+        let engine = PolicyEngine::new(
+            Vec::new(),
+            vec![("run_command".into(), "git *".into())],
+            Decision::Ask,
+            Decision::Deny,
+            "/workspace",
+            true,
+        )
+        .with_auto_commands(auto_on());
+
+        let err = engine
+            .check("run_command", Risk::Execute, &command("git status"), None)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("deny rule"), "was: {err}");
+    }
+
+    /// `--deny` moves the fallback, not this rule: a read is still free
+    /// unattended, exactly as `read_file` is (D15).
+    #[tokio::test]
+    async fn a_read_only_command_runs_under_a_deny_fallback() {
+        let engine = PolicyEngine::new(
+            Vec::new(),
+            Vec::new(),
+            Decision::Deny,
+            Decision::Deny,
+            "/workspace",
+            false,
+        )
+        .with_auto_commands(auto_on());
+
+        engine
+            .check(
+                "run_command",
+                Risk::Execute,
+                &command("grep -r TODO src"),
+                None,
+            )
+            .await
+            .expect("a read is allowed before the fallback is consulted");
+    }
+
+    /// A command that uses shell syntax the classifier cannot reason about is
+    /// never exempt, even with the shortcut on.
+    #[tokio::test]
+    async fn shell_syntax_is_never_exempt() {
+        let engine = engine(false).with_auto_commands(auto_on());
+
+        let err = engine
+            .check(
+                "run_command",
+                Risk::Execute,
+                &command("ls; rm -rf build"),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("non-interactive"), "was: {err}");
     }
 
     /// Widening the read side must not let a deny rule be skipped. Deny is rule

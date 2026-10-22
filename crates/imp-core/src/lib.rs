@@ -17,6 +17,7 @@ pub mod memory;
 pub mod message;
 pub mod policy;
 pub mod provider;
+pub mod read_only;
 pub mod session;
 pub mod sha256;
 pub mod tokens;
@@ -47,6 +48,7 @@ pub use policy::{
 pub use provider::{
     ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage, sanitize_schema,
 };
+pub use read_only::{AutoCommands, AutoMode, is_read_only_command};
 pub use session::new_session_id;
 pub use tokens::{estimate, estimate_message, estimate_messages, estimate_tools};
 pub use tool::{Risk, Tool, ToolCatalog, ToolCtx, ToolOutput, ToolRegistry, ToolSelection};
