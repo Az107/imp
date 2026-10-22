@@ -12,6 +12,7 @@ use imp_core::config::{Config, Decision};
 use imp_core::error::{Error, Result};
 use imp_core::message::{Message, Role};
 use imp_core::provider::Usage;
+use imp_core::read_only::{AutoCommands, AutoMode};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use tokio::sync::Mutex;
@@ -239,6 +240,10 @@ async fn handle_slash(
                 );
             }
         }
+        "auto" => {
+            let message = auto_command(argument, &state.auto)?;
+            println!("{} {}", theme.success("auto:"), theme.bold(&message));
+        }
         "new" => {
             state.reset().await?;
             println!(
@@ -396,6 +401,41 @@ async fn handle_slash(
     Ok(false)
 }
 
+/// Resolve `/auto [mode]` against the session switch.
+///
+/// With no argument it toggles the read-only-command shortcut. `on`/`read-only`
+/// and `off` are explicit. `full` is reserved for a future System One mode and
+/// is refused rather than silently ignored.
+fn auto_command(argument: Option<&str>, auto: &AutoCommands) -> Result<String> {
+    match argument {
+        None => {
+            let next = if auto.read_only() {
+                AutoMode::Off
+            } else {
+                AutoMode::ReadOnly
+            };
+            auto.set_mode(next);
+        }
+        Some("on") | Some("read-only") | Some("readonly") => auto.set_mode(AutoMode::ReadOnly),
+        Some("off") => auto.set_mode(AutoMode::Off),
+        Some("full") => {
+            return Err(Error::Config(
+                "full auto is not implemented yet; `/auto` enables read-only commands".to_string(),
+            ));
+        }
+        Some(other) => {
+            return Err(Error::Config(format!(
+                "unknown mode `{other}` — use /auto, /auto on, or /auto off"
+            )));
+        }
+    }
+    Ok(match auto.mode() {
+        AutoMode::ReadOnly => "read-only commands run without approval".to_string(),
+        AutoMode::Off => "read-only commands need approval again".to_string(),
+        AutoMode::Full => "full (reserved)".to_string(),
+    })
+}
+
 /// A grouped, coloured `/help`.
 fn print_help(theme: Theme) {
     let head = |title: &str| println!("{}", theme.accent(title));
@@ -422,6 +462,8 @@ fn print_help(theme: Theme) {
     row("/cost", "token usage for this session");
     row("/session", "the id sent to the provider as ${session}");
     row("/where", "the database path");
+    head("Approval");
+    row("/auto [on|off]", "run read-only commands without approval");
     head("Other");
     row("/help", "this message");
     row("/quit", "exit (or press Ctrl-C twice)");
@@ -558,7 +600,8 @@ impl InterruptGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::InterruptGuard;
+    use super::{InterruptGuard, auto_command};
+    use imp_core::read_only::{AutoCommands, AutoMode};
 
     #[test]
     fn one_interrupt_arms_and_the_next_exits() {
@@ -579,5 +622,36 @@ mod tests {
             "after a submitted line, the next press warns again"
         );
         assert!(guard.on_interrupt());
+    }
+
+    #[test]
+    fn auto_toggles_and_sets_explicitly() {
+        let auto = AutoCommands::new(false, Vec::new());
+
+        auto_command(None, &auto).unwrap();
+        assert_eq!(auto.mode(), AutoMode::ReadOnly);
+
+        auto_command(None, &auto).unwrap();
+        assert_eq!(auto.mode(), AutoMode::Off);
+
+        auto_command(Some("read-only"), &auto).unwrap();
+        assert_eq!(auto.mode(), AutoMode::ReadOnly);
+
+        auto_command(Some("off"), &auto).unwrap();
+        assert_eq!(auto.mode(), AutoMode::Off);
+    }
+
+    #[test]
+    fn full_auto_is_refused_for_now() {
+        let auto = AutoCommands::new(false, Vec::new());
+        let err = auto_command(Some("full"), &auto).unwrap_err();
+        assert!(err.to_string().contains("not implemented"), "was: {err}");
+        assert_eq!(auto.mode(), AutoMode::Off, "a refused mode changes nothing");
+    }
+
+    #[test]
+    fn an_unknown_auto_mode_is_refused() {
+        let auto = AutoCommands::new(false, Vec::new());
+        assert!(auto_command(Some("maybe"), &auto).is_err());
     }
 }
