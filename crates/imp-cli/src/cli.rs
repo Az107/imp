@@ -90,6 +90,10 @@ pub struct Cli {
     )]
     pub continue_session: bool,
 
+    /// Do not print the conversation when resuming one.
+    #[arg(long = "no-history", global = true)]
+    pub no_history: bool,
+
     /// Maximum provider round-trips per turn, overriding the config.
     #[arg(long = "max-iterations", global = true, value_name = "N")]
     pub max_iterations: Option<u32>,

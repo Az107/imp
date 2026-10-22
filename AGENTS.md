@@ -529,6 +529,16 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   plus a `.sha256`. The Linux musl targets need a musl C compiler — see `NFR.md` for the no-root
   recipe used on this host.
 
+## Terminal presentation rules (D47)
+
+- **Every escape and every glyph comes from `imp-cli/src/style.rs`.** The palette is 16-colour SGR (`style::code`), the glyph table is `style::glyph`, and the runtime decision is `Theme`. `NO_COLOR`, `--no-color`, `[ui].color` and `--json` are resolved in one function (`style::colour`); a new sink that writes its own escape has opted out of all four. Keep `--json` a hard no.
+- **Colour is never the only signal.** `Theme::risk` appends `!` to a consent-requiring class when colour is off, and every glyph has an ASCII fallback; `[ui].icons = "none"` must leave the output readable. Do not add a mark whose meaning exists only as a hue.
+- **The theme is built per stream.** Conversation output (stdout) uses `style::stdout_theme`, tool activity and approvals (stderr) use `style::stderr_theme`; `run::style_for` takes both the flag and the config so `[ui].color` is honoured. `--no-color` and `NO_COLOR` beat `[ui].color = "always"`, and `style::stdout_theme_default`/`stderr_theme_default` exist for `imp init`, which runs before a config is loaded.
+- **Tool lines carry risk and duration.** `AgentEvent::ToolStarted` has `risk`; `ToolFinished` has `duration_ms: Option<u64>` — `None` means the call never ran (a repeat answer or a budget refusal) and is the only case that omits the time. Add the fields at every construction site; the matches are exhaustive.
+- **The spinner is on by default and erase-only.** `render::Activity` owns one stderr mark via `\r`, serialised against the renderer by a mutex and stopped by the first event. It must stay gated on `[ui].spinner` **and** a TTY **and** not `--json`/`--quiet`. It never revises printed output — the scrollback rule of D2 still holds.
+- **A resumed conversation prints its history, and the approval prompt collapses.** `--resume`/`--continue`/`session resume` print the non-system, non-tool turns on start unless `--no-history`/`--quiet`, shaped like the live REPL (`›` prompts, bare replies, tool calls indented); the approval questionnaire is erased and replaced by one `▸ tool · approved (once)` line once answered, on a terminal only (a redirected stderr keeps the full prompt). The erase counts newline-terminated lines and whether the answer ended in `\n` — do not assume the user pressed Enter.
+- **`[ui]` is cosmetic.** `imp_core::config::UiConfig` has no security meaning; the gate, `doctor` and the system prompt do not read it. A new `[ui]` key must not become a policy switch.
+
 ## Memory rules
 
 - **`recall` quotes every search term.** Model-written text reaches FTS5's `MATCH` directly, and

@@ -4,15 +4,19 @@
 //! terminal. Everything here goes to stderr, leaving stdout clean for the
 //! conversation, and a non-interactive process never reaches this at all.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use imp_core::error::{Error, Result};
 use imp_core::policy::{ApprovalChoice, ApprovalRequest, ApprovalUi};
 
+use crate::style::{Glyph, Theme};
+
 /// Asks on stderr and reads one line from stdin.
-pub struct TerminalUi;
+pub struct TerminalUi {
+    theme: Theme,
+}
 
 /// A UI that always refuses, for when nothing can be asked.
 pub struct DenyUi;
@@ -30,38 +34,94 @@ impl ApprovalUi for DenyUi {
 #[async_trait]
 impl ApprovalUi for TerminalUi {
     async fn request(&self, request: &ApprovalRequest) -> Result<ApprovalChoice> {
-        // rusty's line editor owns stdin, so read directly rather than through it.
-        let stdin = std::io::stdin();
-        let mut line = String::new();
-
+        let theme = self.theme;
         let mut stderr = std::io::stderr();
-        writeln!(stderr)?;
-        writeln!(stderr, "  ⚠  {} wants to run", request.tool)?;
-        writeln!(stderr, "     {}", request.summary)?;
-        writeln!(
-            stderr,
-            "     risk: {}{}",
-            request.risk.as_str(),
+
+        // The prompt is built as whole lines so the whole block can be erased
+        // once it is answered and replaced by a single decision line.
+        let mut block: Vec<String> = Vec::new();
+        block.push(String::new());
+        block.push(format!(
+            "  {} {}",
+            theme.warn(theme.glyph(Glyph::Warn)),
+            theme.bold(&format!("{} wants to run", request.tool))
+        ));
+        block.push(format!("     {}", request.summary));
+        block.push(format!(
+            "     {} {}{}",
+            theme.dim("risk:"),
+            theme.risk(request.risk),
             if request.flags.is_empty() {
                 String::new()
             } else {
                 format!(" · flagged: {}", request.flags.join(", "))
             }
-        )?;
+        ));
         if request.tool == "run_command" {
-            let pattern = &request.pattern;
-            writeln!(stderr, "     always would allow any `{pattern}` command")?;
+            block.push(format!(
+                "     {}",
+                theme.dim(&format!(
+                    "always would allow any `{}` command",
+                    request.pattern
+                ))
+            ));
         }
-        write!(stderr, "     [o]nce  [s]ession  [a]lways  [d]eny > ")?;
+        block.push(format!(
+            "     {}",
+            theme.dim("[o]nce  [s]ession  [a]lways  [d]eny")
+        ));
+
+        for line in &block {
+            writeln!(stderr, "{line}")?;
+        }
+        let glyph = theme.glyph(Glyph::Prompt);
+        write!(stderr, "{} ", if glyph.is_empty() { ">" } else { glyph })?;
         stderr.flush()?;
 
-        if stdin.lock().read_line(&mut line)? == 0 {
+        // rusty's line editor owns stdin, so read directly rather than through it.
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        let answered = stdin.lock().read_line(&mut line)? != 0;
+        let choice = if answered {
+            parse_choice(&line)
+        } else {
             // EOF: treating it as consent would be the dangerous default.
-            writeln!(stderr, "     no answer; refusing")?;
-            return Ok(ApprovalChoice::Deny);
-        }
+            ApprovalChoice::Deny
+        };
 
-        Ok(parse_choice(&line))
+        // Collapse the questionnaire into one line, so the scrollback keeps the
+        // decision and not the prompt. Cursor movement is only safe on a
+        // terminal; a redirected stderr keeps the full prompt instead.
+        if std::io::stderr().is_terminal() {
+            // The block lines are newline-terminated; the prompt line is closed
+            // by the user's Enter and left open by an EOF or a mid-line Ctrl-D.
+            let newline = line.ends_with('\n');
+            let up = block.len() + usize::from(newline);
+            let _ = write!(stderr, "\x1b[{up}A\x1b[J");
+        }
+        let (mark, verdict) = match choice {
+            ApprovalChoice::Once => (
+                theme.success(theme.glyph(Glyph::Done)),
+                theme.success("approved (once)"),
+            ),
+            ApprovalChoice::Session => (
+                theme.success(theme.glyph(Glyph::Done)),
+                theme.success("approved (this session)"),
+            ),
+            ApprovalChoice::Always => (
+                theme.success(theme.glyph(Glyph::Done)),
+                theme.success("approved (always)"),
+            ),
+            ApprovalChoice::Deny if answered => {
+                (theme.error(theme.glyph(Glyph::Fail)), theme.error("denied"))
+            }
+            ApprovalChoice::Deny => (
+                theme.error(theme.glyph(Glyph::Fail)),
+                theme.error("refused (no answer)"),
+            ),
+        };
+        writeln!(stderr, "  {mark} {} · {verdict}", theme.bold(&request.tool))?;
+        Ok(choice)
     }
 }
 
@@ -82,9 +142,9 @@ pub fn parse_choice(line: &str) -> ApprovalChoice {
 }
 
 /// The UI to use, given whether anyone can answer.
-pub fn ui_for(interactive: bool) -> Arc<dyn ApprovalUi> {
+pub fn ui_for(interactive: bool, theme: Theme) -> Arc<dyn ApprovalUi> {
     if interactive {
-        Arc::new(TerminalUi)
+        Arc::new(TerminalUi { theme })
     } else {
         Arc::new(DenyUi)
     }

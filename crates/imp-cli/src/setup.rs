@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::approval;
 use crate::cli::Cli;
+use crate::style::Theme;
 
 /// Everything one interactive or one-shot run needs.
 pub struct Session {
@@ -350,6 +351,7 @@ pub async fn build(
             cli.yes,
             cli.deny,
             families.clone(),
+            crate::style::stderr_theme(cli, config),
         ),
         &store,
     );
@@ -430,6 +432,7 @@ pub(crate) fn cron_context(config: &Config) -> CronContext {
 /// `--yes` replaces the default decision rather than the whole engine, so deny
 /// rules and the command classifier keep applying: it means "do not ask me",
 /// not "do whatever you like".
+#[allow(clippy::too_many_arguments)]
 fn build_gate(
     config: &Config,
     store: &Arc<Store>,
@@ -438,6 +441,7 @@ fn build_gate(
     yes: bool,
     deny: bool,
     policies: Vec<imp_core::policy::ToolPolicy>,
+    theme: Theme,
 ) -> Arc<PolicyEngine> {
     let allow = config
         .policy
@@ -477,7 +481,7 @@ fn build_gate(
         scope.to_string(),
         tty,
     )
-    .with_ui(approval::ui_for(tty))
+    .with_ui(approval::ui_for(tty, theme))
     .with_store(store.approvals())
     .with_tool_policies(policies);
 
@@ -830,7 +834,7 @@ fn tool_calls_are_paired(history: &[Message]) -> bool {
 }
 
 /// Render a session for `/sessions`.
-pub fn describe_session(row: &SessionRow) -> String {
+pub fn describe_session(row: &SessionRow, theme: Theme) -> String {
     let title = row
         .title
         .clone()
@@ -838,10 +842,10 @@ pub fn describe_session(row: &SessionRow) -> String {
     let model = row.model.clone().unwrap_or_else(|| "-".to_string());
     format!(
         "{}  {}  {}  {}",
-        &row.id[..8.min(row.id.len())],
-        row.updated_at,
-        model,
-        title
+        theme.info(&row.id[..8.min(row.id.len())]),
+        theme.dim(&row.updated_at),
+        theme.dim(&model),
+        theme.bold(&title)
     )
 }
 

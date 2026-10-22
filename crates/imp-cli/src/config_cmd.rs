@@ -8,6 +8,7 @@ use imp_core::error::Result;
 
 use crate::cli::{Cli, ConfigAction, ConfigArgs};
 use crate::logging::{Secrets, redact};
+use crate::style;
 
 /// Run a `imp config` subcommand. `config init` is handled in `main`, before
 /// configuration is loaded, exactly like `imp init`.
@@ -39,6 +40,7 @@ fn show(cli: &Cli, config: &Config) -> Result<ExitCode> {
 
 /// Print the paths imp reads and writes, and how they are protected.
 fn path(cli: &Cli, config: &Config, cwd: &Path) -> Result<ExitCode> {
+    let theme = style::stdout_theme(cli, config);
     let project = cwd.join("imp.toml");
     let database = cli.db.clone().unwrap_or_else(|| config.database_path());
     let credentials = default_credentials_path();
@@ -78,13 +80,17 @@ fn path(cli: &Cli, config: &Config, cwd: &Path) -> Result<ExitCode> {
         let exists = path.exists();
         let note = if exists {
             match mode_of(path) {
-                Some(mode) => format!("  ({mode:04o})"),
+                Some(mode) => theme.dim(&format!("  ({mode:04o})")),
                 None => String::new(),
             }
         } else {
-            "  (missing)".to_string()
+            theme.warn("  (missing)")
         };
-        println!("{name:<16} {}{note}", path.display());
+        println!(
+            "{} {}{note}",
+            theme.bold(&format!("{name:<16}")),
+            theme.info(&path.display().to_string()),
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

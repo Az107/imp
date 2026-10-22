@@ -99,6 +99,8 @@ pub struct Config {
     pub update: UpdateConfig,
     /// Logging settings.
     pub logging: LoggingConfig,
+    /// Terminal presentation (`[ui]`). Cosmetic only.
+    pub ui: UiConfig,
 }
 
 /// Settings for the OpenAI-compatible endpoint.
@@ -976,6 +978,64 @@ impl Default for LoggingConfig {
             redact_env: true,
         }
     }
+}
+
+/// Terminal presentation settings (`[ui]`).
+///
+/// Cosmetic only: nothing here changes what the agent is allowed to do, and
+/// `--json` ignores all of it. The defaults preserve the plain behaviour a pipe
+/// or a screen reader expects — colour follows the terminal, glyphs are the
+/// Unicode set, and motion is off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// When to emit ANSI colour: `auto` (a terminal), `always`, or `never`.
+    pub color: ColorChoice,
+    /// Which glyph set to draw: `auto` (Unicode), `ascii`, or `none`.
+    pub icons: IconChoice,
+    /// Draw a transient activity line while a turn is working. On by default,
+    /// but only ever drawn on a terminal and never under `--json`/`--quiet`.
+    pub spinner: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            color: ColorChoice::Auto,
+            icons: IconChoice::Auto,
+            spinner: true,
+        }
+    }
+}
+
+/// When ANSI colour is allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorChoice {
+    /// Colour when the stream is a terminal, and never when it is a pipe.
+    #[default]
+    Auto,
+    /// Always colour, even through a pipe (for `less -R` and friends).
+    Always,
+    /// Never colour. Layout is kept; `NO_COLOR` and `--no-color` do the same.
+    Never,
+}
+
+/// Which glyph set the decorative marks use.
+///
+/// Kept separate from colour so a terminal that renders Unicode but refuses
+/// colour can still show structure, and a screen reader or a legacy encoding
+/// can degrade to ASCII or to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IconChoice {
+    /// The Unicode dingbats the SDD's examples draw.
+    #[default]
+    Auto,
+    /// ASCII fallbacks for terminals or fonts without the glyphs.
+    Ascii,
+    /// No decorative marks at all; wording carries the meaning.
+    None,
 }
 
 /// Log rendering format.
@@ -2754,5 +2814,40 @@ mod tests {
         let config = Config::load_with(None, None, dir.path()).unwrap();
 
         assert_eq!(config.provider.model, "current");
+    }
+
+    /// `[ui]` is cosmetic and deep-merged like everything else: a partial
+    /// section keeps the other defaults, and an unknown key is ignored.
+    #[test]
+    fn the_ui_section_is_parsed_and_defaults_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("imp.toml"),
+            "[ui]\nicons = \"ascii\"\nspinner = true\nsomething_new = 1\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.ui.icons, IconChoice::Ascii);
+        assert!(config.ui.spinner);
+        assert_eq!(
+            config.ui.color,
+            ColorChoice::Auto,
+            "an unset key keeps its default"
+        );
+
+        let default = Config::default();
+        assert_eq!(default.ui.color, ColorChoice::Auto);
+        assert_eq!(default.ui.icons, IconChoice::Auto);
+        assert!(default.ui.spinner, "motion is on by default");
+    }
+
+    /// A bad enum value is a startup error, not a silent fallback.
+    #[test]
+    fn an_unknown_ui_colour_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("imp.toml"), "[ui]\ncolor = \"rainbow\"\n");
+
+        assert!(Config::load_with(None, None, dir.path()).is_err());
     }
 }

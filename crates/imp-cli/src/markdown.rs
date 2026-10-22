@@ -14,6 +14,8 @@
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use crate::style::{code, heading_code};
+
 /// How output should be drawn.
 ///
 /// `enabled` and `color` are separate on purpose. Layout — table borders, list
@@ -29,6 +31,8 @@ pub struct Style {
     pub color: bool,
     /// Wrap width in columns.
     pub width: usize,
+    /// Which glyph set list bullets and quote bars use.
+    pub icons: imp_core::config::IconChoice,
 }
 
 impl Style {
@@ -38,6 +42,7 @@ impl Style {
             enabled: false,
             color: false,
             width: 80,
+            icons: imp_core::config::IconChoice::Auto,
         }
     }
 
@@ -47,7 +52,14 @@ impl Style {
             enabled: true,
             color,
             width: width.max(20),
+            icons: imp_core::config::IconChoice::Auto,
         }
+    }
+
+    /// Replace the glyph set.
+    pub fn with_icons(mut self, icons: imp_core::config::IconChoice) -> Self {
+        self.icons = icons;
+        self
     }
 
     /// Wrap a fragment in a style, returning it unchanged when colour is off.
@@ -56,30 +68,18 @@ impl Style {
     /// `ESC[m`/`ESC[0m` would double the size of every line for no visual gain.
     fn paint(&self, code: &str, text: &str) -> String {
         if self.color && !code.is_empty() {
-            format!("{code}{text}\x1b[0m")
+            format!("{code}{text}{}", crate::style::code::RESET)
         } else {
             text.to_string()
         }
     }
 
     fn dim(&self, text: &str) -> String {
-        self.paint("\x1b[2m", text)
+        self.paint(code::DIM, text)
     }
 
     fn rule(&self, width: usize) -> String {
         self.dim(&"─".repeat(width.max(1)))
-    }
-}
-
-/// Bold plus a colour that steps through the palette with the heading level.
-fn heading_code(level: u8) -> &'static str {
-    match level {
-        1 => "\x1b[1;97m",
-        2 => "\x1b[1;96m",
-        3 => "\x1b[1;95m",
-        4 => "\x1b[1;94m",
-        5 => "\x1b[1;93m",
-        _ => "\x1b[1;92m",
     }
 }
 
@@ -490,7 +490,7 @@ fn render_block_into(block: &Block, style: &Style, indent: usize, out: &mut Stri
             }
             for line in text.trim_end_matches('\n').split('\n') {
                 out.push_str(&pad);
-                out.push_str(&style.paint("\x1b[36m", line));
+                out.push_str(&style.paint(code::CYAN, line));
                 out.push('\n');
             }
         }
@@ -503,7 +503,12 @@ fn render_block_into(block: &Block, style: &Style, indent: usize, out: &mut Stri
                 let marker = if *ordered {
                     format!("{}. ", start + offset as u64)
                 } else {
-                    "• ".to_string()
+                    let bullet = crate::style::glyph(style.icons, crate::style::Glyph::Bullet);
+                    if bullet.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{bullet} ")
+                    }
                 };
                 let marker_width = marker.chars().count();
                 let mut first = true;
@@ -515,7 +520,7 @@ fn render_block_into(block: &Block, style: &Style, indent: usize, out: &mut Stri
                     for (index, line) in sub.trim_end_matches('\n').split('\n').enumerate() {
                         if index == 0 {
                             out.push_str(&pad);
-                            out.push_str(&style.paint("\x1b[1m", &marker));
+                            out.push_str(&style.paint(code::BOLD, &marker));
                         } else {
                             out.push_str(&pad);
                             out.push_str(&" ".repeat(marker_width));
@@ -527,7 +532,7 @@ fn render_block_into(block: &Block, style: &Style, indent: usize, out: &mut Stri
                 }
                 if first {
                     out.push_str(&pad);
-                    out.push_str(&style.paint("\x1b[1m", &marker));
+                    out.push_str(&style.paint(code::BOLD, &marker));
                     out.push('\n');
                 }
             }
@@ -537,9 +542,15 @@ fn render_block_into(block: &Block, style: &Style, indent: usize, out: &mut Stri
             for block in inner {
                 render_block_into(block, style, 0, &mut sub);
             }
+            let bar = crate::style::glyph(style.icons, crate::style::Glyph::Quote);
+            let bar = if bar.is_empty() {
+                String::new()
+            } else {
+                style.dim(&format!("{bar} "))
+            };
             for line in sub.trim_end_matches('\n').split('\n') {
                 out.push_str(&pad);
-                out.push_str(&style.dim("▎ "));
+                out.push_str(&bar);
                 out.push_str(line);
                 out.push('\n');
             }
@@ -712,24 +723,24 @@ fn write_inlines(inlines: &[Inline], line: &mut LineWriter<'_>) {
                 }
             }
             Inline::Code(text) => {
-                line.codes.push("\x1b[36m");
+                line.codes.push(code::CYAN);
                 for word in text.split_whitespace() {
                     line.word(word);
                 }
                 line.codes.pop();
             }
             Inline::Strong(inner) => {
-                line.codes.push("\x1b[1m");
+                line.codes.push(code::BOLD);
                 write_inlines(inner, line);
                 line.codes.pop();
             }
             Inline::Emphasis(inner) => {
-                line.codes.push("\x1b[3m");
+                line.codes.push(code::ITALIC);
                 write_inlines(inner, line);
                 line.codes.pop();
             }
             Inline::Strike(inner) => {
-                line.codes.push("\x1b[9m");
+                line.codes.push(code::STRIKE);
                 write_inlines(inner, line);
                 line.codes.pop();
             }
@@ -743,10 +754,10 @@ fn render_inlines_inline(inlines: &[Inline], style: &Style) -> String {
     for inline in inlines {
         match inline {
             Inline::Text(text) => out.push_str(text),
-            Inline::Code(text) => out.push_str(&style.paint("\x1b[36m", text)),
-            Inline::Strong(inner) => out.push_str(&style.paint("\x1b[1m", &plain_of(inner))),
-            Inline::Emphasis(inner) => out.push_str(&style.paint("\x1b[3m", &plain_of(inner))),
-            Inline::Strike(inner) => out.push_str(&style.paint("\x1b[9m", &plain_of(inner))),
+            Inline::Code(text) => out.push_str(&style.paint(code::CYAN, text)),
+            Inline::Strong(inner) => out.push_str(&style.paint(code::BOLD, &plain_of(inner))),
+            Inline::Emphasis(inner) => out.push_str(&style.paint(code::ITALIC, &plain_of(inner))),
+            Inline::Strike(inner) => out.push_str(&style.paint(code::STRIKE, &plain_of(inner))),
         }
     }
     out
